@@ -313,6 +313,9 @@ impl StratumServer {
 		let rc_close = rc.clone();
 		let client_ref_close = client_ref.clone();
 
+		//TODO: Set a timer for the client to always push *something* to them every 30 seconds or
+		//so, as otherwise stratum clients time out.
+
 		current_thread::spawn(rx.for_each(move |line| -> future::FutureResult<(), io::Error> {
 			println!("Got line from {}: {}", client_ref.borrow().client_id, line);
 			let json = match serde_json::from_str::<serde_json::Value>(&line) {
