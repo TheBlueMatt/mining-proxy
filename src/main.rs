@@ -364,6 +364,7 @@ impl PoolHandler {
 									header_nonce: work.0.header_nonce,
 									merkle_rhss: template.merkle_rhss.clone(),
 									coinbase_tx: work.0.coinbase_tx.clone(),
+									user_tag: work.0.user_tag.clone(),
 								}
 							}) {
 								Ok(_) => { println!("Submitted share!"); },

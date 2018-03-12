@@ -104,16 +104,19 @@ pub struct WinningNonce {
 	pub header_version: u32,
 	pub header_time: u32,
 	pub header_nonce: u32,
+	pub user_tag: Vec<u8>,
 	pub coinbase_tx: Transaction,
 }
 impl WinningNonce {
 	pub fn encode(&self, res: &mut bytes::BytesMut) {
 		let tx_enc = network::serialize::serialize(&self.coinbase_tx).unwrap();
-		res.reserve(8 + 4*4 + tx_enc.len());
+		res.reserve(8 + 4*4 + tx_enc.len() + 1 + self.user_tag.len());
 		res.put_u64::<bytes::LittleEndian>(self.template_id);
 		res.put_u32::<bytes::LittleEndian>(self.header_version);
 		res.put_u32::<bytes::LittleEndian>(self.header_time);
 		res.put_u32::<bytes::LittleEndian>(self.header_nonce);
+		res.put_u8(self.user_tag.len() as u8);
+		res.put_slice(&self.user_tag[..]);
 		res.put_u32::<bytes::LittleEndian>(tx_enc.len() as u32);
 		res.put_slice(&tx_enc[..]);
 	}
@@ -409,6 +412,7 @@ impl codec::Decoder for WorkMsgFramer {
 				let header_version = slice_to_le32(get_slice!(4));
 				let header_time = slice_to_le32(get_slice!(4));
 				let header_nonce = slice_to_le32(get_slice!(4));
+				let user_tag = get_slice!(get_slice!(1)[0]).to_vec();
 				let tx_len = slice_to_le32(get_slice!(4));
 				if tx_len > 1000000 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -419,6 +423,7 @@ impl codec::Decoder for WorkMsgFramer {
 						header_version: header_version,
 						header_time: header_time,
 						header_nonce: header_nonce,
+						user_tag: user_tag,
 						coinbase_tx: match network::serialize::deserialize(get_slice!(tx_len)) {
 							Ok(tx) => tx,
 							Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
@@ -544,6 +549,8 @@ pub struct PoolShare {
 
 	pub merkle_rhss: Vec<[u8; 32]>,
 	pub coinbase_tx: Transaction,
+
+	pub user_tag: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -650,6 +657,10 @@ pub enum PoolMessage {
 		signature: Signature,
 		new_host_ports: Vec<String>,
 	},
+	BitcoindAddNode {
+		signature: Signature,
+		bitcoind_add_nodes: Vec<String>,
+	},
 */
 }
 
@@ -691,13 +702,14 @@ impl codec::Encoder for PoolMsgFramer {
 				payout_info.encode_unsigned(res);
 			},
 			PoolMessage::ShareDifficulty { ref difficulty } => {
-				//TODO: CHeck res size!!!
+				res.reserve(1 + 32*2);
 				res.put_u8(4);
 				res.put_slice(&difficulty.share_target[..]);
 				res.put_slice(&difficulty.weak_block_target[..]);
 			},
 			PoolMessage::Share { ref share } => {
-				//TODO: CHeck res size!!!
+				let tx_enc = network::serialize::serialize(&share.coinbase_tx).unwrap();
+				res.reserve(1 + 4*4 + 32 + 1 + share.merkle_rhss.len()*32 + 4 + tx_enc.len() + 1 + share.user_tag.len());
 				res.put_u8(5);
 				res.put_u32::<bytes::LittleEndian>(share.header_version);
 				res.put_slice(&share.header_prevblock);
@@ -708,12 +720,13 @@ impl codec::Encoder for PoolMsgFramer {
 				for rhs in share.merkle_rhss.iter() {
 					res.put_slice(rhs);
 				}
-				let tx_enc = network::serialize::serialize(&share.coinbase_tx).unwrap();
 				res.put_u32::<bytes::LittleEndian>(tx_enc.len() as u32);
 				res.put_slice(&tx_enc[..]);
+				res.put_u8(share.user_tag.len() as u8);
+				res.put_slice(&share.user_tag[..]);
 			},
 			PoolMessage::WeakBlock { ref sketch } => {
-				//TODO: CHeck res size!!!
+				res.reserve(1);
 				res.put_u8(6);
 				sketch.encode(res);
 			},

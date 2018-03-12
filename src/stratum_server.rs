@@ -24,6 +24,7 @@ use serde_json;
 
 use std::cell::RefCell;
 use std::char;
+use std::cmp;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -465,6 +466,9 @@ impl StratumServer {
 								nonce: nonce,
 							}.bitcoin_hash();
 
+							let user_tag_bytes = params[0].as_str().unwrap().as_bytes();
+							let user_tag = user_tag_bytes[0..cmp::min(user_tag_bytes.len(), 255)].to_vec();
+
 							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
 								match job.solutions.unbounded_send(Rc::new((WinningNonce {
 									template_id: job.template.template_id,
@@ -472,6 +476,7 @@ impl StratumServer {
 									header_time: time,
 									header_nonce: nonce,
 									coinbase_tx: coinbase_tx,
+									user_tag: user_tag,
 								}, block_hash))) {
 									Ok(_) => {},
 									Err(_) => { panic!(); },
