@@ -405,12 +405,35 @@ impl codec::Decoder for WorkMsgFramer {
 				Ok(Some(msg))
 			},
 			4 => {
-				// TODO
-				Ok(None)
+				let template_id = slice_to_le64(get_slice!(8));
+				let header_version = slice_to_le32(get_slice!(4));
+				let header_time = slice_to_le32(get_slice!(4));
+				let header_nonce = slice_to_le32(get_slice!(4));
+				let tx_len = slice_to_le32(get_slice!(4));
+				if tx_len > 1000000 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
+				let msg = WorkMessage::WinningNonce {
+					nonces: WinningNonce {
+						template_id: template_id,
+						header_version: header_version,
+						header_time: header_time,
+						header_nonce: header_nonce,
+						coinbase_tx: match network::serialize::deserialize(get_slice!(tx_len)) {
+							Ok(tx) => tx,
+							Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
+						},
+					}
+				};
+				advance_bytes!();
+				Ok(Some(msg))
 			},
 			5 => {
-				// TODO
-				Ok(None)
+				let msg = WorkMessage::TransactionDataRequest {
+					template_id: slice_to_le64(get_slice!(8)),
+				};
+				advance_bytes!();
+				Ok(Some(msg))
 			},
 			6 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
@@ -483,7 +506,7 @@ pub struct PoolPayoutInfo {
 
 impl PoolPayoutInfo {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
-		res.reserve(12 + self.remaining_payout.len() + 1);
+		res.reserve(14 + self.coinbase_postfix.len() + self.remaining_payout.len());
 		res.put_u64::<bytes::LittleEndian>(self.timestamp);
 		res.put_u16::<bytes::LittleEndian>(self.self_payout_ratio_per_1000);
 
@@ -647,30 +670,34 @@ impl codec::Encoder for PoolMsgFramer {
 	type Error = io::Error;
 
 	fn encode(&mut self, msg: PoolMessage, res: &mut bytes::BytesMut) -> Result<(), io::Error> {
-		//TODO: CHeck res size!!!
 		match msg {
 			PoolMessage::ProtocolSupport { max_version, min_version, flags } => {
+				res.reserve(1 + 2*3);
 				res.put_u8(1);
 				res.put_u16::<bytes::LittleEndian>(max_version);
 				res.put_u16::<bytes::LittleEndian>(min_version);
 				res.put_u16::<bytes::LittleEndian>(flags);
 			},
 			PoolMessage::ProtocolVersion { selected_version, ref auth_key } => {
+				res.reserve(1 + 2 + 33);
 				res.put_u8(2);
 				res.put_u16::<bytes::LittleEndian>(selected_version);
 				res.put_slice(&auth_key.serialize());
 			},
 			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
+				res.reserve(1 + 2 + 33);
 				res.put_u8(3);
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				payout_info.encode_unsigned(res);
 			},
 			PoolMessage::ShareDifficulty { ref difficulty } => {
+				//TODO: CHeck res size!!!
 				res.put_u8(4);
 				res.put_slice(&difficulty.share_target[..]);
 				res.put_slice(&difficulty.weak_block_target[..]);
 			},
 			PoolMessage::Share { ref share } => {
+				//TODO: CHeck res size!!!
 				res.put_u8(5);
 				res.put_u32::<bytes::LittleEndian>(share.header_version);
 				res.put_slice(&share.header_prevblock);
@@ -686,10 +713,12 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_slice(&tx_enc[..]);
 			},
 			PoolMessage::WeakBlock { ref sketch } => {
+				//TODO: CHeck res size!!!
 				res.put_u8(6);
 				sketch.encode(res);
 			},
 			PoolMessage::WeakBlockStateReset { } => {
+				res.reserve(1);
 				res.put_u8(7);
 			}
 		}
