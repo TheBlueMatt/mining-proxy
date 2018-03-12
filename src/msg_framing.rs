@@ -50,6 +50,29 @@ pub struct BlockTemplate {
 	pub appended_coinbase_outputs: Vec<TxOut>,
 	pub coinbase_locktime: u32,
 }
+fn le32_into_slice(u: u16, v: &mut [u8]) {
+	assert_eq!(v.len(), 2);
+	v[0] = ((u >> 8*0) & 0xff) as u8;
+	v[1] = ((u >> 8*1) & 0xff) as u8;
+}
+fn push_compact_size(u: usize, v: &mut bytes::BytesMut) {
+	match u {
+		0...253 => {
+			v.reserve(1);
+			v.put_u8(u as u8);
+		},
+		253...0x10000 => {
+			v.reserve(3);
+			v.put_u8(253);
+			v.put_u16::<bytes::LittleEndian>(u as u16);
+		},
+		_ => {
+			v.reserve(5);
+			v.put_u8(254);
+			v.put_u32::<bytes::LittleEndian>(u as u32);
+		},
+	}
+}
 impl BlockTemplate {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(850); // Round upper bound assuming 2, 33-byte-sPK outputs
@@ -70,17 +93,21 @@ impl BlockTemplate {
 		res.put_u32::<bytes::LittleEndian>(self.coinbase_version);
 		res.put_u8(self.coinbase_prefix.len() as u8);
 		res.put_slice(&self.coinbase_prefix[..]);
+
+		res.put_u16::<bytes::LittleEndian>(0);
+		let remaining_len_pos = res.len();
+
 		res.put_u32::<bytes::LittleEndian>(self.coinbase_input_sequence);
-		res.put_u8(self.appended_coinbase_outputs.len() as u8);
+		push_compact_size(self.appended_coinbase_outputs.len(), res);
 		for txout in self.appended_coinbase_outputs.iter() {
-			if res.remaining_mut() < 8 + 2 + txout.script_pubkey.len() + 8 {
-				res.reserve(8 + 2 + txout.script_pubkey.len() + 8);
-			}
+			res.reserve(8 + 5 + txout.script_pubkey.len() + 4);
 			res.put_u64::<bytes::LittleEndian>(txout.value);
-			res.put_u16::<bytes::LittleEndian>(txout.script_pubkey.len() as u16);
+			push_compact_size(txout.script_pubkey.len(), res);
 			res.put_slice(&txout.script_pubkey[..]);
 		}
 		res.put_u32::<bytes::LittleEndian>(self.coinbase_locktime);
+
+		le32_into_slice((res.len() - remaining_len_pos) as u16, &mut res[remaining_len_pos - 2..remaining_len_pos]);
 	}
 }
 
@@ -350,7 +377,7 @@ impl codec::Decoder for WorkMsgFramer {
 				let header_nbits = slice_to_le32(get_slice!(4));
 
 				let merkle_rhss_count = get_slice!(1)[0] as usize;
-				if merkle_rhss_count > 15 {
+				if merkle_rhss_count > 16 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
 				let mut merkle_rhss = Vec::with_capacity(merkle_rhss_count);
@@ -368,20 +395,19 @@ impl codec::Decoder for WorkMsgFramer {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
 				let coinbase_prefix = get_slice!(coinbase_prefix_len).to_vec();
+
 				let coinbase_input_sequence = slice_to_le32(get_slice!(4));
 
-				let coinbase_output_count = get_slice!(1)[0] as usize;
-				let mut appended_coinbase_outputs = Vec::with_capacity(coinbase_output_count);
-				for _ in 0..coinbase_output_count {
-					let value = slice_to_le64(get_slice!(8));
-					let script_len = slice_to_le16(get_slice!(2));
-					appended_coinbase_outputs.push(TxOut {
-						value: value,
-						script_pubkey: Script::from(get_slice!(script_len).to_vec()),
-					})
+				let remaining_coinbase_tx_len = slice_to_le16(get_slice!(2));
+				if remaining_coinbase_tx_len > 32767 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
-
-				let coinbase_locktime = slice_to_le32(get_slice!(4));
+				let mut coinbase_sketch_data = vec!(0, 0, 0, 0, 0, 0);
+				coinbase_sketch_data.extend_from_slice(get_slice!(remaining_coinbase_tx_len));
+				let coinbase_sketch: Transaction = match network::serialize::deserialize(&coinbase_sketch_data[..]) {
+					Ok(tx) => tx,
+					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+				};
 
 				let msg = WorkMessage::BlockTemplate {
 					signature: signature,
@@ -400,8 +426,8 @@ impl codec::Decoder for WorkMsgFramer {
 						coinbase_version: coinbase_version,
 						coinbase_prefix: coinbase_prefix,
 						coinbase_input_sequence: coinbase_input_sequence,
-						appended_coinbase_outputs: appended_coinbase_outputs,
-						coinbase_locktime: coinbase_locktime,
+						appended_coinbase_outputs: coinbase_sketch.output,
+						coinbase_locktime: coinbase_sketch.lock_time,
 					}
 				};
 				advance_bytes!();
@@ -645,7 +671,7 @@ pub enum PoolMessage {
 	ShareDifficulty {
 		difficulty: PoolDifficulty,
 	},
-	Share {
+	Share { //TODO: This is now signed!
 		share: PoolShare,
 	},
 	WeakBlock {
