@@ -167,6 +167,33 @@ impl TransactionData {
 	}
 }
 
+#[derive(Clone)]
+pub struct BlockTemplateHeader {
+	pub template_id: u64,
+	pub template_variant: u64,
+	pub target: [u8; 32],
+
+	pub header_version: u32,
+	pub header_prevblock: [u8; 32],
+	pub header_merkle_root: [u8; 32],
+	pub header_time: u32,
+	pub header_nbits: u32,
+}
+impl BlockTemplateHeader {
+	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
+		res.reserve(124);
+		res.put_u64::<bytes::LittleEndian>(self.template_id);
+		res.put_u64::<bytes::LittleEndian>(self.template_variant);
+		res.put_slice(&self.target);
+
+		res.put_u32::<bytes::LittleEndian>(self.header_version);
+		res.put_slice(&self.header_prevblock);
+		res.put_slice(&self.header_merkle_root);
+		res.put_u32::<bytes::LittleEndian>(self.header_time);
+		res.put_u32::<bytes::LittleEndian>(self.header_nbits);
+	}
+}
+
 pub struct WorkInfo {
 	pub template: Rc<BlockTemplate>,
 	pub solutions: mpsc::UnboundedSender<Rc<(WinningNonce, Sha256dHash)>>,
@@ -180,6 +207,7 @@ pub enum WorkMessage {
 	},
 	ProtocolVersion {
 		selected_version: u16,
+		flags: u16,
 		auth_key: PublicKey,
 	},
 	BlockTemplate {
@@ -199,6 +227,18 @@ pub enum WorkMessage {
 	CoinbasePrefixPostfix {
 		signature: Signature,
 		coinbase_prefix_postfix: CoinbasePrefixPostfix,
+	},
+	BlockTemplateHeader {
+		signature: Signature,
+		template: BlockTemplateHeader,
+	},
+	WinningNonceHeader {
+		template_id: u64,
+		template_variant: u64,
+		header_version: u32,
+		header_time: u32,
+		header_nonce: u32,
+		user_tag: Vec<u8>,
 	},
 }
 
@@ -240,10 +280,11 @@ impl codec::Encoder for WorkMsgFramer {
 				res.put_u16::<bytes::LittleEndian>(min_version);
 				res.put_u16::<bytes::LittleEndian>(flags);
 			},
-			WorkMessage::ProtocolVersion { selected_version, ref auth_key } => {
+			WorkMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
 				res.reserve(1 + 2 + 33);
 				res.put_u8(2);
 				res.put_u16::<bytes::LittleEndian>(selected_version);
+				res.put_u16::<bytes::LittleEndian>(flags);
 				res.put_slice(&auth_key.serialize());
 			},
 			WorkMessage::BlockTemplate { ref signature, ref template } => {
@@ -273,6 +314,23 @@ impl codec::Encoder for WorkMsgFramer {
 				res.put_u8(7);
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				coinbase_prefix_postfix.encode_unsigned(res);
+			},
+			WorkMessage::BlockTemplateHeader { ref signature, ref template } => {
+				res.reserve(1 + 33);
+				res.put_u8(8);
+				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
+				template.encode_unsigned(res);
+			},
+			WorkMessage::WinningNonceHeader { template_id, template_variant, header_version, header_time, header_nonce, ref user_tag } => {
+				res.reserve(30 + user_tag.len());
+				res.put_u8(9);
+				res.put_u64::<bytes::LittleEndian>(template_id);
+				res.put_u64::<bytes::LittleEndian>(template_variant);
+				res.put_u32::<bytes::LittleEndian>(header_version);
+				res.put_u32::<bytes::LittleEndian>(header_time);
+				res.put_u32::<bytes::LittleEndian>(header_nonce);
+				res.put_u8(user_tag.len() as u8);
+				res.put_slice(&user_tag[..]);
 			},
 		}
 		Ok(())
@@ -343,12 +401,16 @@ impl codec::Decoder for WorkMsgFramer {
 			},
 			2 => {
 				let selected_version = slice_to_le16(get_slice!(2));
+				if selected_version != 1 {
+					// We don't know how to deserialize anything else...
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
 				let msg = WorkMessage::ProtocolVersion {
 					selected_version: selected_version,
+					flags: slice_to_le16(get_slice!(2)),
 					auth_key: match PublicKey::from_slice(&self.secp_ctx, get_slice!(33)) {
 						Ok(key) => key,
 						Err(_) => {
-							println!("Bad key {}", selected_version);
 							return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 						}
 					}
@@ -513,6 +575,54 @@ impl codec::Decoder for WorkMsgFramer {
 						timestamp: timestamp,
 						coinbase_prefix_postfix: get_slice!(prefix_postfix_len).to_vec(),
 					}
+				};
+				advance_bytes!();
+				Ok(Some(msg))
+			},
+			8 => {
+				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
+					Ok(sig) => sig,
+					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				};
+				let template_id = slice_to_le64(get_slice!(8));
+				let template_variant = slice_to_le64(get_slice!(8));
+
+				let mut target = [0; 32];
+				target[..].copy_from_slice(get_slice!(32));
+
+				let header_version = slice_to_le32(get_slice!(4));
+				let mut header_prevblock = [0; 32];
+				header_prevblock[..].copy_from_slice(get_slice!(32));
+				let mut header_merkle_root = [0; 32];
+				header_merkle_root[..].copy_from_slice(get_slice!(32));
+
+				let msg = WorkMessage::BlockTemplateHeader {
+					signature: signature,
+					template: BlockTemplateHeader {
+						template_id: template_id,
+						template_variant: template_variant,
+						target: target,
+
+						header_version: header_version,
+						header_prevblock: header_prevblock,
+						header_merkle_root: header_merkle_root,
+						header_time: slice_to_le32(get_slice!(4)),
+						header_nbits: slice_to_le32(get_slice!(4)),
+					},
+				};
+				advance_bytes!();
+				Ok(Some(msg))
+			},
+			9 => {
+				let msg = WorkMessage::WinningNonceHeader {
+					template_id: slice_to_le64(get_slice!(8)),
+					template_variant: slice_to_le64(get_slice!(8)),
+
+					header_version: slice_to_le32(get_slice!(4)),
+					header_time: slice_to_le32(get_slice!(4)),
+					header_nonce: slice_to_le32(get_slice!(4)),
+
+					user_tag: get_slice!(get_slice!(1)[0]).to_vec(),
 				};
 				advance_bytes!();
 				Ok(Some(msg))

@@ -208,8 +208,11 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 				println!("Received ProtocolSupport");
 				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
 			},
-			WorkMessage::ProtocolVersion { selected_version, ref auth_key } => {
+			WorkMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
 				if selected_version != 1 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				}
+				if flags != 0 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
 				}
 				if us.auth_key.is_none() {
@@ -298,6 +301,14 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 						}
 					}
 				}
+			},
+			WorkMessage::BlockTemplateHeader { .. } => {
+				println!("Received BlockTemplateHeader?");
+				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+			},
+			WorkMessage::WinningNonceHeader { .. } => {
+				println!("Received WinningNonceHeader?");
+				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
 			},
 		}
 		Ok(())
