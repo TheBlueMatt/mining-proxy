@@ -932,7 +932,7 @@ impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> Co
 			} else { false }
 		} {
 			let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
-			current_thread::spawn(timer.sleep(Duration::from_secs(30)).then(move |_| -> future::FutureResult<(), ()> {
+			current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| -> future::FutureResult<(), ()> {
 				Self::make_connection(rc);
 				future::result(Ok(()))
 			}));
@@ -987,7 +987,7 @@ impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> Co
 			},
 			None => {
 				let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
-				current_thread::spawn(timer.sleep(Duration::from_secs(30)).then(move |_| {
+				current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| {
 					Self::make_connection(rc);
 					future::result(Ok(()))
 				}));
