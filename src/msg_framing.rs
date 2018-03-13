@@ -402,7 +402,7 @@ impl codec::Decoder for WorkMsgFramer {
 				if remaining_coinbase_tx_len > 32767 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
-				let mut coinbase_sketch_data = vec!(0, 0, 0, 0, 0, 0);
+				let mut coinbase_sketch_data = vec!(0, 0, 0, 0, 0, 1, 0);
 				coinbase_sketch_data.extend_from_slice(get_slice!(remaining_coinbase_tx_len));
 				let coinbase_sketch: Transaction = match network::serialize::deserialize(&coinbase_sketch_data[..]) {
 					Ok(tx) => tx,
