@@ -93,11 +93,11 @@ impl BlockTemplate {
 		res.put_u32::<bytes::LittleEndian>(self.coinbase_version);
 		res.put_u8(self.coinbase_prefix.len() as u8);
 		res.put_slice(&self.coinbase_prefix[..]);
+		res.put_u32::<bytes::LittleEndian>(self.coinbase_input_sequence);
 
 		res.put_u16::<bytes::LittleEndian>(0);
 		let remaining_len_pos = res.len();
 
-		res.put_u32::<bytes::LittleEndian>(self.coinbase_input_sequence);
 		push_compact_size(self.appended_coinbase_outputs.len(), res);
 		for txout in self.appended_coinbase_outputs.iter() {
 			res.reserve(8 + 5 + txout.script_pubkey.len() + 4);

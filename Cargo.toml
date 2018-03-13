@@ -5,7 +5,7 @@ authors = ["matt"]
 
 [dependencies]
 secp256k1 = "0.8"
-bitcoin = "0.11"
+bitcoin = "0.12"
 bytes = "0.4"
 futures = "0.1"
 tokio = "0.1"

@@ -21,7 +21,6 @@ mod utils;
 use bitcoin::blockdata::transaction::{TxOut,Transaction};
 use bitcoin::blockdata::script::Script;
 use bitcoin::util::address::Address;
-use bitcoin::util::base58::FromBase58;
 use bitcoin::util::hash::Sha256dHash;
 
 use bytes::BufMut;
@@ -47,6 +46,7 @@ use std::fmt;
 use std::io;
 use std::net::ToSocketAddrs;
 use std::rc::Rc;
+use std::str::FromStr;
 
 #[derive(Debug)]
 struct HandleError;
@@ -660,8 +660,8 @@ fn main() {
 				println!("Cannot specify multiple payout addresses");
 				return;
 			}
-			//TODO: bech32, check network magic byte
-			payout_addr = Some(match Address::from_base58check(arg.split_at(17).1) {
+			//TODO: check network magic byte? We're allowed to mine on any net, though...
+			payout_addr = Some(match Address::from_str(arg.split_at(17).1) {
 				Ok(addr) => addr,
 				Err(_) => {
 					println!("Failed to parse payout_address into a Bitcoin address");
