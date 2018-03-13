@@ -103,8 +103,6 @@ impl<Value: 'static> Eventual<Value> {
 }
 
 pub struct JobProviderHandler {
-	have_pool: bool,
-
 	stream: Option<mpsc::UnboundedSender<WorkMessage>>,
 	auth_key: Option<PublicKey>,
 
@@ -118,12 +116,10 @@ pub struct JobProviderHandler {
 }
 
 impl JobProviderHandler {
-	fn new(expected_auth_key: Option<PublicKey>, have_pool: bool) -> (Rc<RefCell<JobProviderHandler>>, mpsc::Receiver<(BlockTemplate, Option<CoinbasePrefixPostfix>, Rc<RefCell<Eventual<TransactionData>>>)>) {
+	fn new(expected_auth_key: Option<PublicKey>) -> (Rc<RefCell<JobProviderHandler>>, mpsc::Receiver<(BlockTemplate, Option<CoinbasePrefixPostfix>, Rc<RefCell<Eventual<TransactionData>>>)>) {
 		let (work_sender, work_receiver) = mpsc::channel(10);
 
 		(Rc::new(RefCell::new(JobProviderHandler {
-			have_pool: have_pool,
-
 			stream: None,
 			auth_key: expected_auth_key,
 
@@ -165,7 +161,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 		match tx.start_send(WorkMessage::ProtocolSupport {
 			max_version: 1,
 			min_version: 1,
-			flags: if us.have_pool { 0 } else { 1 },
+			flags: 0,
 		}) {
 			Ok(_) => {
 				us.stream = Some(tx);
@@ -510,7 +506,7 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				&None => {}
 			}
 
-			let mut self_payout_ratio_per_1000 = 0;
+			let mut self_payout_ratio_per_1000 = 1000;
 			match payout_info {
 				&Some((ref info, _)) => {
 					for output in info.appended_outputs.iter() {
@@ -703,7 +699,7 @@ fn main() {
 
 	current_thread::run(|_| {
 		for host in job_provider_hosts {
-			let (mut handler, mut job_rx) = JobProviderHandler::new(None, !pool_server_hosts.is_empty());
+			let (mut handler, mut job_rx) = JobProviderHandler::new(None);
 			let work_rc = cur_work_rc.clone();
 			let handler_rc = handler.clone();
 			current_thread::spawn(job_rx.for_each(move |job| {
