@@ -194,6 +194,7 @@ impl BlockTemplateHeader {
 	}
 }
 
+#[derive(Clone)]
 pub struct WorkInfo {
 	pub template: Rc<BlockTemplate>,
 	pub solutions: mpsc::UnboundedSender<Rc<(WinningNonce, Sha256dHash)>>,

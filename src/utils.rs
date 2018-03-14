@@ -40,6 +40,19 @@ pub fn target_to_diff_lb(target: &[u8; 32]) -> f64 {
 	return std::f64::INFINITY;
 }
 
+pub fn le64_to_array(u: u64) -> [u8; 8] {
+	let mut v = [0; 8];
+	v[0] = ((u >> 8*0) & 0xff) as u8;
+	v[1] = ((u >> 8*1) & 0xff) as u8;
+	v[2] = ((u >> 8*2) & 0xff) as u8;
+	v[3] = ((u >> 8*3) & 0xff) as u8;
+	v[4] = ((u >> 8*4) & 0xff) as u8;
+	v[5] = ((u >> 8*5) & 0xff) as u8;
+	v[6] = ((u >> 8*6) & 0xff) as u8;
+	v[7] = ((u >> 8*7) & 0xff) as u8;
+	v
+}
+
 #[cfg(test)]
 mod tests {
 	use utils;

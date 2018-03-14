@@ -44,19 +44,6 @@ impl Error for BadMessageError {
 	}
 }
 
-fn le64_to_array(u: u64) -> [u8; 8] {
-	let mut v = [0; 8];
-	v[0] = ((u >> 8*0) & 0xff) as u8;
-	v[1] = ((u >> 8*1) & 0xff) as u8;
-	v[2] = ((u >> 8*2) & 0xff) as u8;
-	v[3] = ((u >> 8*3) & 0xff) as u8;
-	v[4] = ((u >> 8*4) & 0xff) as u8;
-	v[5] = ((u >> 8*5) & 0xff) as u8;
-	v[6] = ((u >> 8*6) & 0xff) as u8;
-	v[7] = ((u >> 8*7) & 0xff) as u8;
-	v
-}
-
 fn extend_vec_from_hex(hex: &str, out: &mut Vec<u8>) -> Result<(), BadMessageError> {
 	let mut b = 0;
 	for (idx, c) in hex.as_bytes().iter().enumerate() {
@@ -425,7 +412,7 @@ impl StratumServer {
 							} else { job.template.header_version };
 
 							let mut script_sig = job.template.coinbase_prefix.clone();
-							script_sig.extend_from_slice(&le64_to_array(client.client_id));
+							script_sig.extend_from_slice(&utils::le64_to_array(client.client_id));
 							match extend_vec_from_hex(params[2].as_str().unwrap(), &mut script_sig) {
 								Ok(_) => {},
 								Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),

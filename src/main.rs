@@ -16,11 +16,15 @@ use msg_framing::*;
 mod stratum_server;
 use stratum_server::*;
 
+mod mining_server;
+use mining_server::*;
+
 mod utils;
 
 use bitcoin::blockdata::transaction::{TxOut,Transaction};
 use bitcoin::blockdata::script::Script;
 use bitcoin::util::address::Address;
+use bitcoin::util::address;
 use bitcoin::util::hash::Sha256dHash;
 
 use bytes::BufMut;
@@ -228,6 +232,8 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			WorkMessage::BlockTemplate { signature, template } => {
 				check_msg_sig!(3, template, signature);
 
+				//TODO: Check that timestamp is reasonable
+
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_id < template.template_id {
 					println!("Received new BlockTemplate");
 					let (txn, txn_tx) = Eventual::new();
@@ -274,6 +280,8 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			},
 			WorkMessage::CoinbasePrefixPostfix { signature, coinbase_prefix_postfix } => {
 				check_msg_sig!(7, coinbase_prefix_postfix, signature);
+
+				//TODO: Check that timestamp is reasonable
 
 				if us.cur_prefix_postfix.is_none() || us.cur_prefix_postfix.as_ref().unwrap().timestamp < coinbase_prefix_postfix.timestamp {
 					println!("Received new CoinbasePrefixPostfix");
@@ -618,10 +626,12 @@ struct JobInfo {
 }
 
 fn main() {
-	println!("USAGE: stratum-proxy (--job_provider=host:port)* (--pool_server=host:port)* --listen_port=port --payout_address=addr");
+	println!("USAGE: stratum-proxy (--job_provider=host:port)* (--pool_server=host:port)* --stratum_listen_bind=IP:port --mining_listen_bind=IP:port --mining_auth_key=base58privkey --payout_address=addr");
 	println!("--job_provider - bitcoind(s) running as mining server(s) to get work from");
 	println!("--pool_server - pool server(s) to get payout address from/submit shares to");
 	println!("--stratum_listen_bind - the address to bind to to announce stratum jobs on");
+	println!("--mining_listen_bind - the address to bind to to announce jobs on natively");
+	println!("--mining_auth_key - the auth key to use to authenticate to native clients");
 	println!("--payout_address - the Bitcoin address on which to receive payment");
 	println!("We always try to keep exactly one connection open per argument, no matter how");
 	println!("many hosts a DNS name may resolve to. We try each hostname until one works.");
@@ -631,6 +641,8 @@ fn main() {
 	let mut job_provider_hosts = Vec::new();
 	let mut pool_server_hosts = Vec::new();
 	let mut stratum_listen_bind = None;
+	let mut mining_listen_bind = None;
+	let mut mining_auth_key = None;
 	let mut payout_addr = None;
 
 	for arg in env::args().skip(1) {
@@ -662,6 +674,36 @@ fn main() {
 					return;
 				}
 			});
+		} else if arg.starts_with("--mining_listen_bind") {
+			if mining_listen_bind.is_some() {
+				println!("Cannot specify multiple listen binds");
+				return;
+			}
+			mining_listen_bind = Some(match arg.split_at(21).1.parse() {
+				Ok(sockaddr) => sockaddr,
+				Err(_) =>{
+					println!("Failed to parse mining_listen_bind into a socket address");
+					return;
+				}
+			});
+		} else if arg.starts_with("--mining_auth_key") {
+			if mining_auth_key.is_some() {
+				println!("Cannot specify multiple auth keys");
+				return;
+			}
+			mining_auth_key = Some(match address::Privkey::from_str(arg.split_at(18).1) {
+				Ok(privkey) => {
+					if !privkey.compressed {
+						println!("Private key must represent a compressed key!");
+						return;
+					}
+					privkey.key
+				},
+				Err(_) =>{
+					println!("Failed to parse mining_auth_key into a private key");
+					return;
+				}
+			});
 		} else if arg.starts_with("--payout_address") {
 			if payout_addr.is_some() {
 				println!("Cannot specify multiple payout addresses");
@@ -685,12 +727,16 @@ fn main() {
 		println!("Need at least some job providers");
 		return;
 	}
-	if stratum_listen_bind.is_none() {
+	if stratum_listen_bind.is_none() && mining_listen_bind.is_none() {
 		println!("Need some listen bind");
 		return;
 	}
 	if payout_addr.is_none() {
 		println!("Need some payout address");
+		return;
+	}
+	if mining_listen_bind.is_some() && mining_auth_key.is_none() {
+		println!("Need some mining_auth_key for mining_listen_bind");
 		return;
 	}
 
@@ -780,20 +826,53 @@ fn main() {
 			ConnectionMaintainer::make_connection(Rc::new(RefCell::new(ConnectionMaintainer::new(host.clone(), handler))));
 		}
 
-		let stratum_server = StratumServer::new(job_rx);
-		match net::TcpListener::bind(&stratum_listen_bind.unwrap()) {
-			Ok(listener) => {
-				current_thread::spawn(listener.incoming().for_each(move |sock| {
-					StratumServer::new_connection(stratum_server.clone(), sock);
-					future::result(Ok(()))
-				}).then(|_| {
-					future::result(Ok(()))
-				}));
-			},
-			Err(_) => {
-				println!("Failed to bind to listen bind addr");
-				return;
+		macro_rules! bind_and_handle {
+			($listen_bind_option: expr, $server: expr, $server_type: tt) => {
+				match $listen_bind_option {
+					Some(listen_bind) => {
+						let server = $server;
+						match net::TcpListener::bind(&listen_bind) {
+							Ok(listener) => {
+								current_thread::spawn(listener.incoming().for_each(move |sock| {
+									$server_type::new_connection(server.clone(), sock);
+									future::result(Ok(()))
+								}).then(|_| {
+									future::result(Ok(()))
+								}));
+							},
+							Err(_) => {
+								println!("Failed to bind to listen bind addr");
+								return;
+							}
+						};
+					},
+					None => {},
+				}
 			}
-		};
+		}
+
+		if stratum_listen_bind.is_some() && mining_listen_bind.is_none() {
+			bind_and_handle!(stratum_listen_bind, StratumServer::new(job_rx), StratumServer);
+		} else if stratum_listen_bind.is_none() && mining_listen_bind.is_some() {
+			bind_and_handle!(mining_listen_bind, MiningServer::new(job_rx, mining_auth_key.unwrap()), MiningServer);
+		} else {
+			let (mut stratum_tx, stratum_rx) = mpsc::channel(5);
+			let (mut mining_tx, mining_rx) = mpsc::channel(5);
+			current_thread::spawn(job_rx.for_each(move |job| {
+				match mining_tx.start_send(job.clone()) {
+					Ok(_) => {},
+					Err(_) => { println!("Dropped new job for native clients as server ran behind!"); },
+				}
+				match stratum_tx.start_send(job) {
+					Ok(_) => {},
+					Err(_) => { println!("Dropped new job for stratum clients as server ran behind!"); },
+				}
+				future::result(Ok(()))
+			}).then(|_| {
+				future::result(Ok(()))
+			}));
+			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx), StratumServer);
+			bind_and_handle!(mining_listen_bind, MiningServer::new(mining_rx, mining_auth_key.unwrap()), MiningServer);
+		}
 	});
 }
