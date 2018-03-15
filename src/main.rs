@@ -232,6 +232,15 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 					println!("Invalid non-final BlockTemplate from work provider");
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
+				match us.cur_prefix_postfix {
+					Some(ref prefix_postfix) => {
+						if prefix_postfix.coinbase_prefix_postfix.len() + template.coinbase_prefix.len() > 42 {
+							println!("Invalid non-final BlockTemplate + CoinbasePrefixPostfix from work provider");
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+						}
+					},
+					None => {}
+				}
 
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_id < template.template_id {
 					println!("Received new BlockTemplate");
@@ -285,6 +294,21 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 				if coinbase_prefix_postfix.timestamp < timestamp - 1000*60*20 || coinbase_prefix_postfix.timestamp > timestamp + 1000*60*1 {
 					println!("Got coinbase_prefix_postfix with unreasonable timestamp ({}, our time is {})", coinbase_prefix_postfix.timestamp, timestamp);
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+
+				match us.cur_template {
+					Some(ref template) => {
+						if coinbase_prefix_postfix.coinbase_prefix_postfix.len() + template.coinbase_prefix.len() > 42 {
+							println!("Invalid non-final CoinbasePrefixPostfix + BlockTemplate from work provider");
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+						}
+					},
+					None => {
+						if coinbase_prefix_postfix.coinbase_prefix_postfix.len() > 42 {
+							println!("Invalid non-final CoinbasePrefixPostfix from work provider");
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+						}
+					}
 				}
 
 				if us.cur_prefix_postfix.is_none() || us.cur_prefix_postfix.as_ref().unwrap().timestamp < coinbase_prefix_postfix.timestamp {
