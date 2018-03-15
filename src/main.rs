@@ -51,6 +51,7 @@ use std::io;
 use std::net::ToSocketAddrs;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 struct HandleError;
@@ -232,7 +233,11 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			WorkMessage::BlockTemplate { signature, template } => {
 				check_msg_sig!(3, template, signature);
 
-				//TODO: Check that timestamp is reasonable
+				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+				if template.template_id < timestamp - 1000*60*20 || template.template_id > timestamp + 1000*60*1 {
+					println!("Got template with unreasonable timestamp ({}, our time is {})", template.template_id, timestamp);
+				}
 
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_id < template.template_id {
 					println!("Received new BlockTemplate");
@@ -281,7 +286,11 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			WorkMessage::CoinbasePrefixPostfix { signature, coinbase_prefix_postfix } => {
 				check_msg_sig!(7, coinbase_prefix_postfix, signature);
 
-				//TODO: Check that timestamp is reasonable
+				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+				if coinbase_prefix_postfix.timestamp < timestamp - 1000*60*20 || coinbase_prefix_postfix.timestamp > timestamp + 1000*60*1 {
+					println!("Got coinbase_prefix_postfix with unreasonable timestamp ({}, our time is {})", coinbase_prefix_postfix.timestamp, timestamp);
+				}
 
 				if us.cur_prefix_postfix.is_none() || us.cur_prefix_postfix.as_ref().unwrap().timestamp < coinbase_prefix_postfix.timestamp {
 					println!("Received new CoinbasePrefixPostfix");
