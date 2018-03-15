@@ -504,17 +504,18 @@ impl codec::Decoder for WorkMsgFramer {
 				if tx_len > 1000000 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
+				let coinbase_tx = match network::serialize::deserialize(get_slice!(tx_len)) {
+					Ok(tx) => tx,
+					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
+				};
 				let msg = WorkMessage::WinningNonce {
 					nonces: WinningNonce {
-						template_id: template_id,
-						header_version: header_version,
-						header_time: header_time,
-						header_nonce: header_nonce,
-						user_tag: user_tag,
-						coinbase_tx: match network::serialize::deserialize(get_slice!(tx_len)) {
-							Ok(tx) => tx,
-							Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
-						},
+						template_id,
+						header_version,
+						header_time,
+						header_nonce,
+						user_tag,
+						coinbase_tx,
 					}
 				};
 				advance_bytes!();
@@ -1019,6 +1020,9 @@ impl codec::Decoder for PoolMsgFramer {
 					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
 				};
 
+				let user_tag_len = get_slice!(1)[0];
+				let user_tag = get_slice!(user_tag_len).to_vec();
+
 				let msg = PoolMessage::Share {
 					share: PoolShare {
 						header_version,
@@ -1029,7 +1033,7 @@ impl codec::Decoder for PoolMsgFramer {
 
 						merkle_rhss,
 						coinbase_tx,
-						user_tag: get_slice!(get_slice!(1)[0]).to_vec(),
+						user_tag,
 					},
 				};
 				advance_bytes!();
