@@ -53,6 +53,19 @@ pub fn le64_to_array(u: u64) -> [u8; 8] {
 	v
 }
 
+pub fn push_bytes_hex(bytes: &[u8], out: &mut String) {
+	for i in 0..bytes.len() {
+		out.push(std::char::from_digit((bytes[i] >> 4) as u32, 16).unwrap());
+		out.push(std::char::from_digit((bytes[i] & 0x0f) as u32, 16).unwrap());
+	}
+}
+
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+	let mut ret = String::with_capacity(bytes.len() * 2);
+	push_bytes_hex(bytes, &mut ret);
+	ret
+}
+
 #[cfg(test)]
 mod tests {
 	use utils;

@@ -1,5 +1,11 @@
-use msg_framing::{CoinbasePrefixPostfix,WorkInfo,WorkMessage,WorkMsgFramer};
-use utils;
+use msg_framing::{BlockTemplate,BlockTemplateHeader,CoinbasePrefixPostfix,WinningNonce,WorkInfo,WorkMessage,WorkMsgFramer};
+use utils
+;
+use bitcoin::blockdata::block::BlockHeader;
+use bitcoin::blockdata::script::Script;
+use bitcoin::blockdata::transaction::{TxIn,Transaction};
+use bitcoin::util::hash::Sha256dHash;
+use bitcoin::network::serialize::BitcoinHash;
 
 use bytes;
 use bytes::BufMut;
@@ -25,6 +31,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::unsync::mpsc;
 
@@ -58,8 +65,42 @@ pub struct MiningServer {
 	jobs: BTreeMap<u64, WorkInfo>,
 }
 
-macro_rules! sign_message {
-	($msg: expr, $msg_type: expr, $server_ref: expr) => {
+fn work_to_coinbase_tx(template: &BlockTemplate, client_id: u64) -> Transaction {
+	let mut script_sig = template.coinbase_prefix.clone();
+	script_sig.extend_from_slice(&utils::le64_to_array(client_id));
+
+	Transaction {
+		version: template.coinbase_version,
+		input: vec!(TxIn {
+			prev_hash: Default::default(),
+			prev_index: 0xffffffff,
+			script_sig: Script::from(script_sig),
+			sequence: template.coinbase_input_sequence,
+		}),
+		output: template.appended_coinbase_outputs.clone(),
+		witness: vec!(),
+		lock_time: template.coinbase_locktime,
+	}
+}
+
+fn work_to_merkle_root(template: &BlockTemplate, coinbase_txid: Sha256dHash) -> [u8; 32] {
+	let mut merkle_lhs = [0; 32];
+	merkle_lhs.copy_from_slice(&coinbase_txid[..]);
+	let mut sha = Sha256::new();
+	for rhs in template.merkle_rhss.iter() {
+		sha.reset();
+		sha.input(&merkle_lhs);
+		sha.input(&rhs[..]);
+		sha.result(&mut merkle_lhs);
+		sha.reset();
+		sha.input(&merkle_lhs);
+		sha.result(&mut merkle_lhs);
+	}
+	merkle_lhs
+}
+
+macro_rules! sign_message_ctx {
+	($msg: expr, $msg_type: expr, $secp_ctx: expr, $auth_key: expr) => {
 		{
 			let mut msg_signed = bytes::BytesMut::with_capacity(1000);
 			msg_signed.put_u8($msg_type);
@@ -72,8 +113,13 @@ macro_rules! sign_message {
 				secp256k1::Message::from_slice(&h).unwrap()
 			};
 
-			$server_ref.secp_ctx.sign(&hash, &$server_ref.auth_key).unwrap()
+			$secp_ctx.sign(&hash, &$auth_key).unwrap()
 		}
+	}
+}
+macro_rules! sign_message {
+	($msg: expr, $msg_type: expr, $server_ref: expr) => {
+		sign_message_ctx!($msg, $msg_type, $server_ref.secp_ctx, $server_ref.auth_key)
 	}
 }
 
@@ -89,6 +135,9 @@ impl MiningServer {
 		}));
 
 		let us_cp = us.clone();
+		//This is dumb, but passing the borrow checker otherwise seems hard:
+		let second_secp_ctx = Secp256k1::new();
+		let auth_key_copy = auth_key;
 		current_thread::spawn(job_providers.for_each(move |job| {
 			let mut self_ref = us_cp.borrow_mut();
 			let our_template_sig = sign_message!(job.template, 3, self_ref);
@@ -97,8 +146,24 @@ impl MiningServer {
 				let mut client = it.borrow_mut();
 				if !client.handshake_complete { return true; }
 				if client.use_header_variants {
-					//TODO
-					false
+					let template_header = BlockTemplateHeader {
+						template_id: job.template.template_id,
+						template_variant: client.client_id,
+						target: job.template.target,
+
+						header_version: job.template.header_version,
+						header_prevblock: job.template.header_prevblock,
+						header_merkle_root: work_to_merkle_root(&*job.template, work_to_coinbase_tx(&*job.template, client.client_id).txid()),
+						header_time: job.template.header_time,
+						header_nbits: job.template.header_nbits,
+					};
+					match client.stream.start_send(WorkMessage::BlockTemplateHeader {
+						signature: sign_message_ctx!(template_header, 8, second_secp_ctx, auth_key_copy),
+						template: template_header,
+					}) {
+						Ok(_) => true,
+						Err(_) => false
+					}
 				} else {
 					match client.stream.start_send(WorkMessage::BlockTemplate {
 						signature: our_template_sig.clone(),
@@ -179,8 +244,9 @@ impl MiningServer {
 						auth_key: PublicKey::from_secret_key(&us.secp_ctx, &us.auth_key).unwrap(),
 					});
 					if !client.use_header_variants {
+						let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 						let prefix_postfix = CoinbasePrefixPostfix {
-							timestamp: 0, //TODO
+							timestamp: time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000,
 							coinbase_prefix_postfix: utils::le64_to_array(client.client_id).to_vec(),
 						};
 
@@ -206,10 +272,31 @@ impl MiningServer {
 					println!("Received BlockTemplate?");
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
 				},
-				WorkMessage::WinningNonce { .. } => {
-					//TODO
-					println!("Received WinningNonce?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+				WorkMessage::WinningNonce { nonces } => {
+					match rc.borrow().jobs.get(&nonces.template_id) {
+						Some(job) => {
+							let block_hash = BlockHeader {
+								version: nonces.header_version,
+								prev_blockhash: Sha256dHash::from(&job.template.header_prevblock[..]),
+								merkle_root: Sha256dHash::from(&work_to_merkle_root(&*job.template, nonces.coinbase_tx.txid())[..]),
+								time: nonces.header_time,
+								bits: job.template.header_nbits,
+								nonce: nonces.header_nonce,
+							}.bitcoin_hash();
+
+							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
+								match job.solutions.unbounded_send(Rc::new((nonces, block_hash))) {
+									Ok(_) => {},
+									Err(_) => { panic!(); },
+								};
+							} else {
+								println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&job.template.target[..]));
+							}
+						},
+						None => {
+							println!("Got WinningNonceHeader for unknown job_id");
+						}
+					}
 				},
 				WorkMessage::TransactionDataRequest { .. } => {
 					//TODO
@@ -228,10 +315,38 @@ impl MiningServer {
 					println!("Received BlockTemplateHeader?");
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
 				},
-				WorkMessage::WinningNonceHeader { .. } => {
-					//TODO
-					println!("Received WinningNonceHeader?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+				WorkMessage::WinningNonceHeader { template_id, template_variant, header_version, header_time, header_nonce, user_tag } => {
+					match rc.borrow().jobs.get(&template_id) {
+						Some(job) => {
+							let block_hash = BlockHeader {
+								version: header_version,
+								prev_blockhash: Sha256dHash::from(&job.template.header_prevblock[..]),
+								merkle_root: Sha256dHash::from(&work_to_merkle_root(&*job.template, work_to_coinbase_tx(&*job.template, template_variant).txid())[..]),
+								time: header_time,
+								bits: job.template.header_nbits,
+								nonce: header_nonce,
+							}.bitcoin_hash();
+
+							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
+								match job.solutions.unbounded_send(Rc::new((WinningNonce {
+									template_id,
+									header_version,
+									header_time,
+									header_nonce,
+									user_tag,
+									coinbase_tx: work_to_coinbase_tx(&*job.template, template_variant),
+								}, block_hash))) {
+									Ok(_) => {},
+									Err(_) => { panic!(); },
+								};
+							} else {
+								println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&job.template.target[..]));
+							}
+						},
+						None => {
+							println!("Got WinningNonceHeader for unknown job_id");
+						}
+					}
 				},
 			}
 			future::result(Ok(()))

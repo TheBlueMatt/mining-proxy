@@ -126,19 +126,6 @@ fn len_to_compact_size(len: u32, out: &mut String) {
 	}
 }
 
-fn push_bytes_hex(bytes: &[u8], out: &mut String) {
-	for i in 0..bytes.len() {
-		out.push(char::from_digit((bytes[i] >> 4) as u32, 16).unwrap());
-		out.push(char::from_digit((bytes[i] & 0x0f) as u32, 16).unwrap());
-	}
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-	let mut ret = String::with_capacity(bytes.len() * 2);
-	push_bytes_hex(bytes, &mut ret);
-	ret
-}
-
 /// Stratum byte-swaps the previous block field, but only in 4-byte chunks....because batshit
 /// insanity
 fn bytes_to_hex_insane_order(bytes: &[u8; 32]) -> String {
@@ -167,7 +154,7 @@ fn job_to_json_string(template: &BlockTemplate, prev_changed: bool) -> String {
 	let coinbase_len = template.coinbase_prefix.len() + 8 + EXTRANONCE2_SIZE;
 	coinbase_prev.push(char::from_digit(((coinbase_len >> 4) & 0x0f) as u32, 16).unwrap());
 	coinbase_prev.push(char::from_digit(((coinbase_len >> 0) & 0x0f) as u32, 16).unwrap());
-	push_bytes_hex(&template.coinbase_prefix[..], &mut coinbase_prev);
+	utils::push_bytes_hex(&template.coinbase_prefix[..], &mut coinbase_prev);
 
 	let mut coinbase_post = String::new();
 	push_le_32_hex(template.coinbase_input_sequence, &mut coinbase_post);
@@ -177,13 +164,13 @@ fn job_to_json_string(template: &BlockTemplate, prev_changed: bool) -> String {
 		push_le_32_hex(output.value as u32, &mut coinbase_post);
 		push_le_32_hex((output.value >> 4*8) as u32, &mut coinbase_post);
 		len_to_compact_size(output.script_pubkey.len() as u32, &mut coinbase_post);
-		push_bytes_hex(&output.script_pubkey[..], &mut coinbase_post);
+		utils::push_bytes_hex(&output.script_pubkey[..], &mut coinbase_post);
 	}
 	push_le_32_hex(template.coinbase_locktime, &mut coinbase_post);
 
 	let mut merkle_rhss = Vec::with_capacity(template.merkle_rhss.len());
 	for rhs in template.merkle_rhss.iter() {
-		merkle_rhss.push(bytes_to_hex(rhs));
+		merkle_rhss.push(utils::bytes_to_hex(rhs));
 	}
 
 	json!({
@@ -402,7 +389,7 @@ impl StratumServer {
 						Ok(nonce) => nonce,
 					};
 
-					match rc.borrow_mut().jobs.get(&job_id) {
+					match rc.borrow().jobs.get(&job_id) {
 						Some(job) => {
 							let version = if params.len() >= 6 {
 								match hex_to_be32(params[5].as_str().unwrap()) {
@@ -470,9 +457,8 @@ impl StratumServer {
 								};
 								send_response!(serde_json::Value::Null, true);
 							} else {
-								println!("Got work that missed target (hashed to {}, which is greater than {})", bytes_to_hex(&block_hash[..]), bytes_to_hex(&job.template.target[..]));
+								println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&job.template.target[..]));
 								send_response!(serde_json::Value::Null, false);
-
 							}
 						},
 						None => {
