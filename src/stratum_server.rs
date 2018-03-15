@@ -151,12 +151,13 @@ fn job_to_json_string(template: &BlockTemplate, prev_changed: bool) -> String {
 	coinbase_prev.push_str("01");
 	coinbase_prev.push_str("0000000000000000000000000000000000000000000000000000000000000000ffffffff");
 	// Add size of extranonce + 8 bytes for client id
-	let coinbase_len = template.coinbase_prefix.len() + 8 + EXTRANONCE2_SIZE;
+	let coinbase_len = template.coinbase_prefix.len() + 8 + EXTRANONCE2_SIZE + template.coinbase_postfix.len();
 	coinbase_prev.push(char::from_digit(((coinbase_len >> 4) & 0x0f) as u32, 16).unwrap());
 	coinbase_prev.push(char::from_digit(((coinbase_len >> 0) & 0x0f) as u32, 16).unwrap());
 	utils::push_bytes_hex(&template.coinbase_prefix[..], &mut coinbase_prev);
 
 	let mut coinbase_post = String::new();
+	utils::push_bytes_hex(&template.coinbase_postfix[..], &mut coinbase_post);
 	push_le_32_hex(template.coinbase_input_sequence, &mut coinbase_post);
 	coinbase_post.push(char::from_digit(((template.appended_coinbase_outputs.len() >> 4) & 0x0f) as u32, 16).unwrap());
 	coinbase_post.push(char::from_digit(((template.appended_coinbase_outputs.len() >> 0) & 0x0f) as u32, 16).unwrap());

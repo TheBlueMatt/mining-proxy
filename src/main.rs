@@ -225,6 +225,12 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 				if template.template_id < timestamp - 1000*60*20 || template.template_id > timestamp + 1000*60*1 {
 					println!("Got template with unreasonable timestamp ({}, our time is {})", template.template_id, timestamp);
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+
+				if !template.coinbase_postfix.is_empty() || template.coinbase_prefix.len() > 42 {
+					println!("Invalid non-final BlockTemplate from work provider");
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_id < template.template_id {
@@ -278,6 +284,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 				if coinbase_prefix_postfix.timestamp < timestamp - 1000*60*20 || coinbase_prefix_postfix.timestamp > timestamp + 1000*60*1 {
 					println!("Got coinbase_prefix_postfix with unreasonable timestamp ({}, our time is {})", coinbase_prefix_postfix.timestamp, timestamp);
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 
 				if us.cur_prefix_postfix.is_none() || us.cur_prefix_postfix.as_ref().unwrap().timestamp < coinbase_prefix_postfix.timestamp {
@@ -456,6 +463,18 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 					None => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
 				}
 
+				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+				if payout_info.timestamp < timestamp - 1000*60*20 || payout_info.timestamp > timestamp + 1000*60*1 {
+					println!("Got payout_info with unreasonable timestamp ({}, our time is {})", payout_info.timestamp, timestamp);
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+
+				if payout_info.coinbase_postfix.len() > 42 {
+					println!("Pool sent payout_info larger than 42 bytes");
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+
 				if us.cur_payout_info.is_none() || us.cur_payout_info.as_ref().unwrap().timestamp < payout_info.timestamp {
 					println!("Received new payout info!");
 					let cur_difficulty = us.cur_difficulty.clone();
@@ -565,7 +584,8 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 						&None => {}
 					}
 
-					template.coinbase_prefix.extend_from_slice(&info.coinbase_postfix[..]);
+					if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
+					template.coinbase_postfix.extend_from_slice(&info.coinbase_postfix[..]);
 				},
 				&None => {}
 			}

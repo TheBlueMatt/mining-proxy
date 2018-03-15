@@ -52,6 +52,7 @@ pub struct MiningServer {
 fn work_to_coinbase_tx(template: &BlockTemplate, client_id: u64) -> Transaction {
 	let mut script_sig = template.coinbase_prefix.clone();
 	script_sig.extend_from_slice(&utils::le64_to_array(client_id));
+	script_sig.extend_from_slice(&template.coinbase_postfix[..]);
 
 	Transaction {
 		version: template.coinbase_version,

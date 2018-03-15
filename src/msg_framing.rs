@@ -34,6 +34,7 @@ pub struct BlockTemplate {
 
 	pub coinbase_version: u32,
 	pub coinbase_prefix: Vec<u8>,
+	pub coinbase_postfix: Vec<u8>,
 	pub coinbase_input_sequence: u32,
 	pub appended_coinbase_outputs: Vec<TxOut>,
 	pub coinbase_locktime: u32,
@@ -81,6 +82,8 @@ impl BlockTemplate {
 		res.put_u32::<bytes::LittleEndian>(self.coinbase_version);
 		res.put_u8(self.coinbase_prefix.len() as u8);
 		res.put_slice(&self.coinbase_prefix[..]);
+		res.put_u8(self.coinbase_postfix.len() as u8);
+		res.put_slice(&self.coinbase_postfix[..]);
 		res.put_u32::<bytes::LittleEndian>(self.coinbase_input_sequence);
 
 		res.put_u16::<bytes::LittleEndian>(0);
@@ -447,6 +450,12 @@ impl codec::Decoder for WorkMsgFramer {
 				}
 				let coinbase_prefix = get_slice!(coinbase_prefix_len).to_vec();
 
+				let coinbase_postfix_len = get_slice!(1)[0] as usize;
+				if coinbase_postfix_len > 92 || coinbase_prefix_len + coinbase_postfix_len > 92 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
+				let coinbase_postfix = get_slice!(coinbase_postfix_len).to_vec();
+
 				let coinbase_input_sequence = slice_to_le32(get_slice!(4));
 
 				let remaining_coinbase_tx_len = slice_to_le16(get_slice!(2));
@@ -463,20 +472,21 @@ impl codec::Decoder for WorkMsgFramer {
 				let msg = WorkMessage::BlockTemplate {
 					signature: signature,
 					template: BlockTemplate {
-						template_id: template_id,
-						target: target,
+						template_id,
+						target,
 
-						header_version: header_version,
-						header_prevblock: header_prevblock,
-						header_time: header_time,
-						header_nbits: header_nbits,
+						header_version,
+						header_prevblock,
+						header_time,
+						header_nbits,
 
-						merkle_rhss: merkle_rhss,
-						coinbase_value_remaining: coinbase_value_remaining,
+						merkle_rhss,
+						coinbase_value_remaining,
 
-						coinbase_version: coinbase_version,
-						coinbase_prefix: coinbase_prefix,
-						coinbase_input_sequence: coinbase_input_sequence,
+						coinbase_version,
+						coinbase_prefix,
+						coinbase_postfix,
+						coinbase_input_sequence,
 						appended_coinbase_outputs: coinbase_sketch.output,
 						coinbase_locktime: coinbase_sketch.lock_time,
 					}
@@ -767,10 +777,10 @@ pub enum PoolMessage {
 		signature: Signature,
 		payout_info: PoolPayoutInfo,
 	},
-	ShareDifficulty {
+	ShareDifficulty { //TODO: This is now signed!
 		difficulty: PoolDifficulty,
 	},
-	Share { //TODO: This is now signed!
+	Share {
 		share: PoolShare,
 	},
 	WeakBlock {
