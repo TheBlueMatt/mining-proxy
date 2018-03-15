@@ -424,6 +424,31 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 
 	fn handle_message(&mut self, msg: PoolMessage) -> Result<(), io::Error> {
 		let mut us = self.borrow_mut();
+
+		macro_rules! check_msg_sig {
+			($msg_type: expr, $msg: expr, $signature: expr) => {
+				{
+					let mut msg_signed = bytes::BytesMut::with_capacity(1000);
+					msg_signed.put_u8($msg_type);
+					$msg.encode_unsigned(&mut msg_signed);
+					let hash = {
+						let mut sha = Sha256::new();
+						sha.input(&msg_signed[..]);
+						let mut h = [0; 32];
+						sha.result(&mut h);
+						secp256k1::Message::from_slice(&h).unwrap()
+					};
+
+					match us.auth_key {
+						Some(pubkey) => match us.secp_ctx.verify(&hash, &$signature, &pubkey) {
+							Ok(()) => {},
+							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
+						},
+						None => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
+					}
+				}
+			}
+		}
 		match msg {
 			PoolMessage::ProtocolSupport { .. } => {
 				println!("Received ProtocolSupport");
@@ -444,24 +469,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 				println!("Received ProtocolVersion, using version {}", selected_version);
 			},
 			PoolMessage::PayoutInfo { signature, payout_info } => {
-				let mut msg_signed = bytes::BytesMut::with_capacity(100);
-				msg_signed.put_u8(3);
-				payout_info.encode_unsigned(&mut msg_signed);
-				let hash = {
-					let mut sha = Sha256::new();
-					sha.input(&msg_signed[..]);
-					let mut h = [0; 32];
-					sha.result(&mut h);
-					secp256k1::Message::from_slice(&h).unwrap()
-				};
-
-				match us.auth_key {
-					Some(pubkey) => match us.secp_ctx.verify(&hash, &signature, &pubkey) {
-						Ok(()) => {},
-						Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
-					},
-					None => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
-				}
+				check_msg_sig!(3, payout_info, signature);
 
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
@@ -488,7 +496,9 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 					us.cur_payout_info = Some(payout_info);
 				}
 			},
-			PoolMessage::ShareDifficulty { difficulty } => {
+			PoolMessage::ShareDifficulty { signature, difficulty } => {
+				check_msg_sig!(4, difficulty, signature);
+
 				println!("Received new difficulty!");
 				us.cur_difficulty = Some(difficulty);
 				if us.cur_payout_info.is_some() {

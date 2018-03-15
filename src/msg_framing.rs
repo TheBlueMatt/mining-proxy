@@ -643,7 +643,6 @@ pub struct PoolPayoutInfo {
 	pub remaining_payout: Script,
 	pub appended_outputs: Vec<TxOut>,
 }
-
 impl PoolPayoutInfo {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(14 + self.coinbase_postfix.len() + self.remaining_payout.len());
@@ -672,6 +671,13 @@ impl PoolPayoutInfo {
 pub struct PoolDifficulty {
 	pub share_target: [u8; 32],
 	pub weak_block_target: [u8; 32],
+}
+impl PoolDifficulty {
+	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
+		res.reserve(2*32);
+		res.put_slice(&self.share_target[..]);
+		res.put_slice(&self.weak_block_target[..]);
+	}
 }
 
 #[derive(Clone)]
@@ -777,7 +783,8 @@ pub enum PoolMessage {
 		signature: Signature,
 		payout_info: PoolPayoutInfo,
 	},
-	ShareDifficulty { //TODO: This is now signed!
+	ShareDifficulty {
+		signature: Signature,
 		difficulty: PoolDifficulty,
 	},
 	Share {
@@ -831,16 +838,16 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_slice(&auth_key.serialize());
 			},
 			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
-				res.reserve(1 + 2 + 33);
+				res.reserve(1 + 33);
 				res.put_u8(3);
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				payout_info.encode_unsigned(res);
 			},
-			PoolMessage::ShareDifficulty { ref difficulty } => {
-				res.reserve(1 + 32*2);
+			PoolMessage::ShareDifficulty { ref signature, ref difficulty } => {
+				res.reserve(1 + 33 + 32*2);
 				res.put_u8(4);
-				res.put_slice(&difficulty.share_target[..]);
-				res.put_slice(&difficulty.weak_block_target[..]);
+				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
+				difficulty.encode_unsigned(res);
 			},
 			PoolMessage::Share { ref share } => {
 				let tx_enc = network::serialize::serialize(&share.coinbase_tx).unwrap();
@@ -965,15 +972,20 @@ impl codec::Decoder for PoolMsgFramer {
 				Ok(Some(msg))
 			},
 			4 => {
+				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
+					Ok(sig) => sig,
+					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				};
 				let mut share_target = [0; 32];
 				share_target.copy_from_slice(get_slice!(32));
 				let mut weak_block_target = [0; 32];
 				weak_block_target.copy_from_slice(get_slice!(32));
 
 				let msg = PoolMessage::ShareDifficulty {
+					signature,
 					difficulty: PoolDifficulty {
-						share_target: share_target,
-						weak_block_target: weak_block_target,
+						share_target,
+						weak_block_target,
 					}
 				};
 				advance_bytes!();

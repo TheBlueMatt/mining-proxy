@@ -3,6 +3,14 @@ name = "mining-proxy"
 version = "0.0.1"
 authors = ["matt"]
 
+[[bin]]
+name = "mining-proxy"
+path = "src/main.rs"
+
+[[bin]]
+name = "sample-pool"
+path = "src/sample_pool.rs"
+
 [dependencies]
 secp256k1 = "0.8"
 bitcoin = "0.12"
