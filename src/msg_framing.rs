@@ -992,12 +992,52 @@ impl codec::Decoder for PoolMsgFramer {
 				Ok(Some(msg))
 			},
 			5 => {
-				//TODO
-				Ok(None)
+				let header_version = slice_to_le32(get_slice!(4));
+				let mut header_prevblock = [0; 32];
+				header_prevblock.copy_from_slice(get_slice!(32));
+				let header_time = slice_to_le32(get_slice!(4));
+				let header_nbits = slice_to_le32(get_slice!(4));
+				let header_nonce = slice_to_le32(get_slice!(4));
+
+				let merkle_rhss_count = get_slice!(1)[0] as usize;
+				if merkle_rhss_count > 16 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
+				let mut merkle_rhss = Vec::with_capacity(merkle_rhss_count);
+				for _ in 0..merkle_rhss_count {
+					let mut merkle_rhs = [0; 32];
+					merkle_rhs[..].copy_from_slice(get_slice!(32));
+					merkle_rhss.push(merkle_rhs);
+				}
+
+				let tx_len = slice_to_le32(get_slice!(4));
+				if tx_len > 1000000 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
+				let coinbase_tx = match network::serialize::deserialize(get_slice!(tx_len)) {
+					Ok(tx) => tx,
+					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
+				};
+
+				let msg = PoolMessage::Share {
+					share: PoolShare {
+						header_version,
+						header_prevblock,
+						header_time,
+						header_nbits,
+						header_nonce,
+
+						merkle_rhss,
+						coinbase_tx,
+						user_tag: get_slice!(get_slice!(1)[0]).to_vec(),
+					},
+				};
+				advance_bytes!();
+				Ok(Some(msg))
 			},
 			6 => {
 				//TODO
-				Ok(None)
+				unimplemented!();
 			},
 			7 => {
 				advance_bytes!();

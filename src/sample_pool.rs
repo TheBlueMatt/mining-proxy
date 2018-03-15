@@ -228,7 +228,7 @@ fn main() {
 									return future::result(Ok(()));
 								}
 
-								if !share.coinbase_tx.output[0].script_pubkey[..].ends_with(&client_coinbase_postfix[..]) {
+								if !share.coinbase_tx.input[0].script_sig[..].ends_with(&client_coinbase_postfix[..]) {
 									println!("Client sent share which failed to include the required coinbase postfix");
 									return future::result(Ok(()));
 								}
@@ -246,7 +246,7 @@ fn main() {
 									}
 								}
 
-								if (our_payout + their_payout) * 1000 / CLIENT_PAYOUT_RATIO as u64 != their_payout {
+								if (our_payout + their_payout) * CLIENT_PAYOUT_RATIO as u64 / 1000 != their_payout {
 									println!("Got share which paid client an invalid amount");
 									return future::result(Ok(()));
 								}

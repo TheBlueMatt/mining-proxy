@@ -405,6 +405,7 @@ impl StratumServer {
 								Ok(_) => {},
 								Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 							}
+							script_sig.extend_from_slice(&job.template.coinbase_postfix[..]);
 
 							let coinbase_tx = Transaction {
 								version: job.template.coinbase_version,

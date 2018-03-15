@@ -14,12 +14,12 @@ pub fn does_hash_meet_target(hash: &[u8], target: &[u8]) -> bool {
 	true
 }
 
-pub fn min_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 	for i in (0..32).rev() {
 		if a[i] > b[i] {
-			return b;
-		} else if b[i] > a[i] {
 			return a;
+		} else if b[i] > a[i] {
+			return b;
 		}
 	}
 	a

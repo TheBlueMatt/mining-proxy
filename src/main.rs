@@ -159,7 +159,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			Ok(_) => {
 				us.stream = Some(tx);
 			},
-			Err(_) => {},
+			Err(_) => { panic!("Cant fail to send first message on an unbounded stream"); },
 		}
 		(WorkMsgFramer::new(), rx)
 	}
@@ -411,9 +411,20 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 	type Framer = PoolMsgFramer;
 
 	fn new_connection(&mut self) -> (PoolMsgFramer, mpsc::UnboundedReceiver<PoolMessage>) {
-		let (tx, rx) = mpsc::unbounded();
 		let mut us = self.borrow_mut();
-		us.stream = Some(tx);
+
+		let (mut tx, rx) = mpsc::unbounded();
+		match tx.start_send(PoolMessage::ProtocolSupport {
+			max_version: 1,
+			min_version: 1,
+			flags: 0,
+		}) {
+			Ok(_) => {
+				us.stream = Some(tx);
+			},
+			Err(_) => { panic!("Cant fail to send first message on an unbounded stream"); },
+		}
+
 		us.last_weak_block = None;
 		(PoolMsgFramer::new(), rx)
 	}
@@ -522,7 +533,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::WeakBlockStateReset { } => {
-				println!("Received WeakBlocKStateReset");
+				println!("Received WeakBlockStateReset");
 				us.last_weak_block = None;
 			},
 		}
@@ -588,8 +599,8 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 
 					match difficulty {
 						&Some(ref pool_diff) => {
-							template.target = utils::min_le(template.target, pool_diff.share_target);
-							template.target = utils::min_le(template.target, pool_diff.weak_block_target);
+							template.target = utils::max_le(template.target, pool_diff.share_target);
+							template.target = utils::max_le(template.target, pool_diff.weak_block_target);
 						},
 						&None => {}
 					}
