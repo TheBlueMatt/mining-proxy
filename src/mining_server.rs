@@ -15,6 +15,7 @@ use crypto::sha2::Sha256;
 
 use futures::{future,Stream,Sink};
 use futures::future::Future;
+use futures::unsync::mpsc;
 
 use tokio::executor::current_thread;
 use tokio::net;
@@ -27,26 +28,9 @@ use secp256k1;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::error::Error;
-use std::fmt;
 use std::io;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use futures::unsync::mpsc;
-
-#[derive(Debug)]
-struct HandleError;
-impl fmt::Display for HandleError {
-	fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		fmt.write_str("Failed to handle message")
-	}
-}
-impl Error for HandleError {
-	fn description(&self) -> &str {
-		"Failed to handle message"
-	}
-}
 
 struct MiningClient {
 	stream: mpsc::Sender<WorkMessage>,
@@ -222,18 +206,18 @@ impl MiningServer {
 				($msg: expr) => {
 					match client.stream.start_send($msg) {
 						Ok(_) => {},
-						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)))
+						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)))
 					}
 				}
 			}
 			match msg {
 				WorkMessage::ProtocolSupport { max_version, min_version, flags } => {
 					if min_version > 1 || max_version < 1 {
-						return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+						return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 					}
 					if (flags & 0b11) == 0 {
 						// We don't support clients setting their own payout information
-						return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+						return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 					}
 					client.use_header_variants = (flags & 0b11) == 0b11;
 					client.handshake_complete = true;
@@ -266,11 +250,11 @@ impl MiningServer {
 				},
 				WorkMessage::ProtocolVersion { .. } => {
 					println!("Received ProtocolVersion?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::BlockTemplate { .. } => {
 					println!("Received BlockTemplate?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::WinningNonce { nonces } => {
 					match rc.borrow().jobs.get(&nonces.template_id) {
@@ -301,19 +285,19 @@ impl MiningServer {
 				WorkMessage::TransactionDataRequest { .. } => {
 					//TODO
 					println!("Received TransactionDataRequest?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::TransactionData { .. } => {
 					println!("Received TransactionData?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::CoinbasePrefixPostfix { .. } => {
 					println!("Received CoinbasePrefixPostfix?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::BlockTemplateHeader { .. } => {
 					println!("Received BlockTemplateHeader?");
-					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, HandleError)));
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::WinningNonceHeader { template_id, template_variant, header_version, header_time, header_nonce, user_tag } => {
 					match rc.borrow().jobs.get(&template_id) {

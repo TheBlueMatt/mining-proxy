@@ -66,6 +66,19 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
 	ret
 }
 
+#[derive(Debug)]
+pub struct HandleError;
+impl std::fmt::Display for HandleError {
+	fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+		fmt.write_str("Failed to handle message")
+	}
+}
+impl std::error::Error for HandleError {
+	fn description(&self) -> &str {
+		"Failed to handle message"
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use utils;

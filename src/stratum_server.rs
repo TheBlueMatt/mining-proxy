@@ -146,7 +146,7 @@ fn bytes_to_hex_insane_order(bytes: &[u8; 32]) -> String {
 const EXTRANONCE2_SIZE: usize = 8;
 const VERSION_MASK: u32 = 0x1fffe000;
 fn job_to_json_string(template: &BlockTemplate, prev_changed: bool) -> String {
-	let mut coinbase_prev = String::with_capacity(4*2 + 1*2 + 36*2 + 1*2 + template.coinbase_prefix.len() + 8*2);
+	let mut coinbase_prev = String::with_capacity(4*2 + 1*2 + 36*2 + 1*2 + template.coinbase_prefix.len()*2);
 	push_le_32_hex(template.coinbase_version, &mut coinbase_prev);
 	coinbase_prev.push_str("01");
 	coinbase_prev.push_str("0000000000000000000000000000000000000000000000000000000000000000ffffffff");

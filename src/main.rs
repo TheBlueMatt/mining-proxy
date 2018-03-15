@@ -36,6 +36,10 @@ use futures::{Future,Stream,Sink};
 use tokio::executor::current_thread;
 use tokio::net;
 
+use tokio_io::{AsyncRead,codec};
+
+use tokio_timer::Timer;
+
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 
@@ -44,27 +48,11 @@ use secp256k1::Secp256k1;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::env;
-use std::error::Error;
-use std::fmt;
-use std::io;
-use std::net::ToSocketAddrs;
+use std::{env,io,marker};
+use std::net::{SocketAddr,ToSocketAddrs};
 use std::rc::Rc;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[derive(Debug)]
-struct HandleError;
-impl fmt::Display for HandleError {
-	fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		fmt.write_str("Failed to handle message")
-	}
-}
-impl Error for HandleError {
-	fn description(&self) -> &str {
-		"Failed to handle message"
-	}
-}
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 /// A future, essentially
 struct Eventual<Value> {
@@ -200,9 +188,9 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 					match us.auth_key {
 						Some(pubkey) => match us.secp_ctx.verify(&hash, &$signature, &pubkey) {
 							Ok(()) => {},
-							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError))
+							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
 						},
-						None => return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError))
+						None => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
 					}
 				}
 			}
@@ -211,21 +199,21 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 		match msg {
 			WorkMessage::ProtocolSupport { .. } => {
 				println!("Received ProtocolSupport");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			WorkMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
 				if selected_version != 1 {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 				if flags != 0 {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 				if us.auth_key.is_none() {
 					us.auth_key = Some(auth_key.clone());
 				} else {
 					if us.auth_key.unwrap() != *auth_key {
 						println!("Got unexpected auth key");
-						return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 					}
 				}
 				println!("Received ProtocolVersion, using version {}", selected_version);
@@ -247,7 +235,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 						Ok(_) => {},
 						Err(_) => {
 							println!("Job provider sending jobs too quickly");
-							return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 						}
 					}
 					match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_id: template.template_id }) {
@@ -260,11 +248,11 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			},
 			WorkMessage::WinningNonce { .. } => {
 				println!("Received WinningNonce?");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			WorkMessage::TransactionDataRequest { .. } => {
 				println!("Received TransactionDataRequest?");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			WorkMessage::TransactionData { signature, data } => {
 				check_msg_sig!(6, data, signature);
@@ -313,7 +301,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 							Ok(_) => {},
 							Err(_) => {
 								println!("Job provider sending jobs too quickly");
-								return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+								return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 							}
 						}
 					}
@@ -321,11 +309,11 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			},
 			WorkMessage::BlockTemplateHeader { .. } => {
 				println!("Received BlockTemplateHeader?");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			WorkMessage::WinningNonceHeader { .. } => {
 				println!("Received WinningNonceHeader?");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 		}
 		Ok(())
@@ -432,18 +420,18 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 		match msg {
 			PoolMessage::ProtocolSupport { .. } => {
 				println!("Received ProtocolSupport");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::ProtocolVersion { selected_version, ref auth_key } => {
 				if selected_version != 1 {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 				if us.auth_key.is_none() {
 					us.auth_key = Some(auth_key.clone());
 				} else {
 					if us.auth_key.unwrap() != *auth_key {
 						println!("Got unexpected auth key");
-						return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 					}
 				}
 				println!("Received ProtocolVersion, using version {}", selected_version);
@@ -463,9 +451,9 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 				match us.auth_key {
 					Some(pubkey) => match us.secp_ctx.verify(&hash, &signature, &pubkey) {
 						Ok(()) => {},
-						Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError))
+						Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
 					},
-					None => return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError))
+					None => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
 				}
 
 				if us.cur_payout_info.is_none() || us.cur_payout_info.as_ref().unwrap().timestamp < payout_info.timestamp {
@@ -475,7 +463,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 						Ok(_) => {},
 						Err(_) => {
 							println!("Pool updating payout info too quickly");
-							return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 						}
 					}
 					us.cur_payout_info = Some(payout_info);
@@ -491,18 +479,18 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 						Ok(_) => {},
 						Err(_) => {
 							println!("Pool updating difficulty too quickly");
-							return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 						}
 					}
 				}
 			},
 			PoolMessage::Share { .. } => {
 				println!("Received Share?");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::WeakBlock { .. } => {
 				println!("Received WeakBlock?");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, HandleError));
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::WeakBlockStateReset { } => {
 				println!("Received WeakBlocKStateReset");
@@ -622,6 +610,113 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 			})
 		},
 		&None => None
+	}
+}
+
+pub trait ConnectionHandler<MessageType> {
+	type Stream : Stream<Item = MessageType>;
+	type Framer : codec::Encoder<Item = MessageType, Error = io::Error> + codec::Decoder<Item = MessageType, Error = io::Error>;
+	fn new_connection(&mut self) -> (Self::Framer, Self::Stream);
+	fn handle_message(&mut self, msg: MessageType) -> Result<(), io::Error>;
+	fn connection_closed(&mut self);
+}
+
+pub struct ConnectionMaintainer<MessageType: 'static, HandlerProvider : ConnectionHandler<MessageType>> {
+	host: String,
+	cur_addrs: Option<Vec<SocketAddr>>,
+	handler: HandlerProvider,
+	ph : marker::PhantomData<&'static MessageType>,
+}
+
+pub static mut TIMER: Option<Timer> = None;
+impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> ConnectionMaintainer<MessageType, HandlerProvider> {
+	pub fn new(host: String, handler: HandlerProvider) -> ConnectionMaintainer<MessageType, HandlerProvider> {
+		ConnectionMaintainer {
+			host: host,
+			cur_addrs: None,
+			handler: handler,
+			ph: marker::PhantomData,
+		}
+	}
+
+	pub fn make_connection(rc: Rc<RefCell<Self>>) {
+		if {
+			let mut us = rc.borrow_mut();
+			if us.cur_addrs.is_none() {
+				//TODO: Resolve async
+				match us.host.to_socket_addrs() {
+					Err(_) => {
+						true
+					},
+					Ok(addrs) => {
+						us.cur_addrs = Some(addrs.collect());
+						false
+					}
+				}
+			} else { false }
+		} {
+			let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
+			current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| -> future::FutureResult<(), ()> {
+				Self::make_connection(rc);
+				future::result(Ok(()))
+			}));
+			return;
+		}
+
+		let addr_option = {
+			let mut us = rc.borrow_mut();
+			let addr = us.cur_addrs.as_mut().unwrap().pop();
+			if addr.is_none() {
+				us.cur_addrs = None;
+			}
+			addr
+		};
+
+		match addr_option {
+			Some(addr) => {
+				println!("Trying connection to {}", addr);
+
+				current_thread::spawn(net::TcpStream::connect(&addr).then(move |res| -> future::FutureResult<(), ()> {
+					match res {
+						Ok(stream) => {
+							println!("Connected to {}!", stream.peer_addr().unwrap());
+							stream.set_nodelay(true).unwrap();
+
+							let (framer, tx_stream) = rc.borrow_mut().handler.new_connection();
+							let (tx, rx) = stream.framed(framer).split();
+							let stream = tx_stream.map_err(|_| -> io::Error {
+								panic!("mpsc streams cant generate errors!");
+							});
+							current_thread::spawn(tx.send_all(stream).then(|_| {
+								println!("Disconnected on send side, will reconnect...");
+								future::result(Ok(()))
+							}));
+							let rc_clone = rc.clone();
+							let rc_clone_2 = rc.clone();
+							current_thread::spawn(rx.for_each(move |msg| {
+								future::result(rc_clone.borrow_mut().handler.handle_message(msg))
+							}).then(move |_| {
+								println!("Disconnected on recv side, will reconnect...");
+								rc_clone_2.borrow_mut().handler.connection_closed();
+								Self::make_connection(rc);
+								future::result(Ok(()))
+							}));
+						},
+						Err(_) => {
+							Self::make_connection(rc);
+						}
+					};
+					future::result(Ok(()))
+				}));
+			},
+			None => {
+				let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
+				current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| {
+					Self::make_connection(rc);
+					future::result(Ok(()))
+				}));
+			},
+		}
 	}
 }
 

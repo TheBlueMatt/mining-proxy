@@ -6,30 +6,18 @@ use bitcoin::network;
 use bytes;
 use bytes::BufMut;
 
-use futures::future::Future;
-use futures::{future,Stream,Sink};
 use futures::unsync::mpsc;
 
-use tokio::executor::current_thread;
-use tokio::net;
-
-use tokio_io::AsyncRead;
 use tokio_io::codec;
-
-use tokio_timer::Timer;
 
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 use secp256k1::Signature;
 
-use std::cell::RefCell;
 use std::error::Error;
-use std::net::{SocketAddr,ToSocketAddrs};
 use std::fmt;
 use std::io;
-use std::marker;
 use std::rc::Rc;
-use std::time::Duration;
 
 #[derive(Clone)]
 pub struct BlockTemplate {
@@ -454,7 +442,7 @@ impl codec::Decoder for WorkMsgFramer {
 
 				let coinbase_version = slice_to_le32(get_slice!(4));
 				let coinbase_prefix_len = get_slice!(1)[0] as usize;
-				if coinbase_prefix_len > 100 {
+				if coinbase_prefix_len > 92 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
 				let coinbase_prefix = get_slice!(coinbase_prefix_len).to_vec();
@@ -999,112 +987,3 @@ impl codec::Decoder for PoolMsgFramer {
 		}
 	}
 }
-
-pub trait ConnectionHandler<MessageType> {
-	type Stream : Stream<Item = MessageType>;
-	type Framer : codec::Encoder<Item = MessageType, Error = io::Error> + codec::Decoder<Item = MessageType, Error = io::Error>;
-	fn new_connection(&mut self) -> (Self::Framer, Self::Stream);
-	fn handle_message(&mut self, msg: MessageType) -> Result<(), io::Error>;
-	fn connection_closed(&mut self);
-}
-
-pub struct ConnectionMaintainer<MessageType: 'static, HandlerProvider : ConnectionHandler<MessageType>> {
-	host: String,
-	cur_addrs: Option<Vec<SocketAddr>>,
-	handler: HandlerProvider,
-	ph : marker::PhantomData<&'static MessageType>,
-}
-
-pub static mut TIMER: Option<Timer> = None;
-impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> ConnectionMaintainer<MessageType, HandlerProvider> {
-	pub fn new(host: String, handler: HandlerProvider) -> ConnectionMaintainer<MessageType, HandlerProvider> {
-		ConnectionMaintainer {
-			host: host,
-			cur_addrs: None,
-			handler: handler,
-			ph: marker::PhantomData,
-		}
-	}
-
-	pub fn make_connection(rc: Rc<RefCell<Self>>) {
-		if {
-			let mut us = rc.borrow_mut();
-			if us.cur_addrs.is_none() {
-				//TODO: Resolve async
-				match us.host.to_socket_addrs() {
-					Err(_) => {
-						true
-					},
-					Ok(addrs) => {
-						us.cur_addrs = Some(addrs.collect());
-						false
-					}
-				}
-			} else { false }
-		} {
-			let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
-			current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| -> future::FutureResult<(), ()> {
-				Self::make_connection(rc);
-				future::result(Ok(()))
-			}));
-			return;
-		}
-
-		let addr_option = {
-			let mut us = rc.borrow_mut();
-			let addr = us.cur_addrs.as_mut().unwrap().pop();
-			if addr.is_none() {
-				us.cur_addrs = None;
-			}
-			addr
-		};
-
-		match addr_option {
-			Some(addr) => {
-				println!("Trying connection to {}", addr);
-
-				current_thread::spawn(net::TcpStream::connect(&addr).then(move |res| -> future::FutureResult<(), ()> {
-					match res {
-						Ok(stream) => {
-							println!("Connected to {}!", stream.peer_addr().unwrap());
-							stream.set_nodelay(true).unwrap();
-
-							let (framer, tx_stream) = rc.borrow_mut().handler.new_connection();
-							let (tx, rx) = stream.framed(framer).split();
-							let stream = tx_stream.map_err(|_| -> io::Error {
-								panic!("mpsc streams cant generate errors!");
-							});
-							current_thread::spawn(tx.send_all(stream).then(|_| {
-								println!("Disconnected on send side, will reconnect...");
-								future::result(Ok(()))
-							}));
-							let rc_clone = rc.clone();
-							let rc_clone_2 = rc.clone();
-							current_thread::spawn(rx.for_each(move |msg| {
-								future::result(rc_clone.borrow_mut().handler.handle_message(msg))
-							}).then(move |_| {
-								println!("Disconnected on recv side, will reconnect...");
-								rc_clone_2.borrow_mut().handler.connection_closed();
-								Self::make_connection(rc);
-								future::result(Ok(()))
-							}));
-						},
-						Err(_) => {
-							Self::make_connection(rc);
-						}
-					};
-					future::result(Ok(()))
-				}));
-			},
-			None => {
-				let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
-				current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| {
-					Self::make_connection(rc);
-					future::result(Ok(()))
-				}));
-			},
-		}
-	}
-}
-
-
