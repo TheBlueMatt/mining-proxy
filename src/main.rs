@@ -612,6 +612,8 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				script_pubkey: our_payout_script,
 			});
 
+			let work_target = template.target.clone();
+
 			match payout_info {
 				&Some((ref info, ref difficulty)) => {
 					outputs.push(TxOut {
@@ -647,7 +649,7 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 			current_thread::spawn(solution_rx.for_each(move |nonces: Rc<(WinningNonce, Sha256dHash)>| {
 				match job_source {
 					Some(ref source) => {
-						if utils::does_hash_meet_target(&nonces.1[..], &template_ref.target[..]) {
+						if utils::does_hash_meet_target(&nonces.1[..], &work_target[..]) {
 							source.borrow_mut().send_nonce(nonces.0.clone());
 						}
 					},
