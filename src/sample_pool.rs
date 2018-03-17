@@ -35,10 +35,23 @@ use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
 use std::{env,io};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CLIENT_PAYOUT_RATIO: u16 = 10; // 1% goes to the block-finder
+pub fn slice_to_le64(v: &[u8]) -> u64 {
+	((v[7] as u64) << 8*7) |
+	((v[6] as u64) << 8*6) |
+	((v[5] as u64) << 8*5) |
+	((v[4] as u64) << 8*4) |
+	((v[3] as u64) << 8*3) |
+	((v[2] as u64) << 8*2) |
+	((v[1] as u64) << 8*1) |
+	((v[0] as u64) << 8*0)
+}
+
 const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
 fn main() {
 	println!("USAGE: sample-pool --listen_bind=IP:port --auth_key=base58privkey --payout_address=addr [--server_id=up_to_36_byte_string_for_coinbase]");
@@ -116,7 +129,9 @@ fn main() {
 		return;
 	}
 
-	current_thread::run(move |_| {
+	let clients_ref = Rc::new(RefCell::new(HashMap::new()));
+
+	current_thread::block_on_all(future::lazy(|| -> future::FutureResult<(), ()> {
 		match net::TcpListener::bind(&listen_bind.unwrap()) {
 			Ok(listener) => {
 				let mut max_client_id = 0;
@@ -154,15 +169,18 @@ fn main() {
 
 					let payout_addr_clone = payout_addr.as_ref().unwrap().clone();
 					let server_id_clone = server_id.clone();
+					let clients = clients_ref.clone();
 					let client_id = max_client_id;
 					max_client_id += 1;
 
 					let mut client_coinbase_postfix = utils::le64_to_array(client_id).to_vec();
-					match server_id_clone {
+					match server_id {
 						Some(ref id) => client_coinbase_postfix.extend_from_slice(id.clone().as_bytes()),
 						None => {},
 					};
 
+					let mut received_protocol_support = false;
+					let mut client_authed = false;
 					current_thread::spawn(rx.for_each(move |msg| {
 						macro_rules! send_response {
 							($msg: expr) => {
@@ -183,15 +201,38 @@ fn main() {
 								}
 								send_response!(PoolMessage::ProtocolVersion {
 									selected_version: 1,
+									flags: 0,
 									auth_key: PublicKey::from_secret_key(&secp_ctx, &auth_key.unwrap()).unwrap(),
 								});
+								received_protocol_support = true;
+							},
+							PoolMessage::ProtocolVersion { .. } => {
+								println!("Got ProtocolVersion?");
+								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
+							PoolMessage::PayoutInfoRequest { user_id, .. } => {
+								if !received_protocol_support {
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+								if client_authed {
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+
+								let addr = match Address::from_str(match String::from_utf8(user_id.clone()) {
+									Ok(string) => string,
+									Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))),
+								}.as_str()) {
+									Ok(addr) => addr,
+									Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))),
+								};
+								clients.borrow_mut().insert(client_id, addr);
+								client_authed = true;
 
 								let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 								let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
-
 								let payout_info = PoolPayoutInfo {
+									user_id,
 									timestamp,
-									self_payout_ratio_per_1000: CLIENT_PAYOUT_RATIO,
 									coinbase_postfix: client_coinbase_postfix.clone(),
 									remaining_payout: payout_addr_clone.clone(),
 									appended_outputs: vec![],
@@ -210,10 +251,6 @@ fn main() {
 									difficulty,
 								});
 							},
-							PoolMessage::ProtocolVersion { .. } => {
-								println!("Got ProtocolVersion?");
-								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
-							},
 							PoolMessage::PayoutInfo { .. } => {
 								println!("Got PayoutInfo?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
@@ -223,32 +260,52 @@ fn main() {
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
 							PoolMessage::Share { ref share } => {
-								if share.coinbase_tx.input.len() != 1 || share.coinbase_tx.output.len() < 2 {
+								if !received_protocol_support || !client_authed {
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+
+								if share.coinbase_tx.input.len() != 1 || share.coinbase_tx.output.len() < 1 {
 									println!("Client sent share with a coinbase_tx which had an input count other than 1 or no payout");
 									return future::result(Ok(()));
 								}
 
-								if !share.coinbase_tx.input[0].script_sig[..].ends_with(&client_coinbase_postfix[..]) {
-									println!("Client sent share which failed to include the required coinbase postfix");
-									return future::result(Ok(()));
-								}
+								let coinbase = &share.coinbase_tx.input[0].script_sig[..];
+								let share_client_id = match server_id_clone {
+									Some(ref server_id) => {
+										if coinbase.len() < server_id.len() + 8 || !coinbase.ends_with(&server_id.as_bytes()[..]) {
+											println!("Client sent share which failed to include the required coinbase postfix");
+											return future::result(Ok(()));
+										}
+										slice_to_le64(&coinbase[coinbase.len() - server_id.len() - 8..coinbase.len() - server_id.len()])
 
-								let mut their_payout = 0;
-								let mut our_payout = 0;
+									},
+									None => {
+										if coinbase.len() < 8 {
+											println!("Client sent share which failed to include the required coinbase postfix");
+											return future::result(Ok(()));
+										}
+										slice_to_le64(&coinbase[coinbase.len() - 8..coinbase.len()])
+									},
+								};
+								let clients_ref = clients.borrow();
+								let client_payout = match clients_ref.get(&share_client_id) {
+									Some(payout_addr) => payout_addr,
+									None => {
+										println!("Client sent share with a coinbase_tx which did not pay to a known auth'ed client");
+										return future::result(Ok(()));
+									}
+								};
+
 								for (idx, out) in share.coinbase_tx.output.iter().enumerate() {
 									if idx == 0 {
-										their_payout = out.value;
-									} else if idx == 1 {
-										our_payout = out.value;
+										if out.script_pubkey != payout_addr_clone {
+											println!("Got share which paid out to unknown location");
+											return future::result(Ok(()));
+										}
 									} else if out.value != 0 {
 										println!("Got share which paid out excess to unkown location");
 										return future::result(Ok(()));
 									}
-								}
-
-								if (our_payout + their_payout) * CLIENT_PAYOUT_RATIO as u64 / 1000 != their_payout {
-									println!("Got share which paid client an invalid amount");
-									return future::result(Ok(()));
 								}
 
 								let mut merkle_lhs = [0; 32];
@@ -274,7 +331,7 @@ fn main() {
 								}.bitcoin_hash();
 
 								if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
-									println!("Got valid share from {} for payout to script: {}", String::from_utf8_lossy(&share.user_tag), utils::bytes_to_hex(&share.coinbase_tx.output[0].script_pubkey[..]));
+									println!("Got valid share from {} for payout to script: {}", String::from_utf8_lossy(&share.user_tag), client_payout.to_string());
 								} else {
 									println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&SHARE_TARGET[..]));
 								}
@@ -286,7 +343,11 @@ fn main() {
 							PoolMessage::WeakBlockStateReset { } => {
 								println!("Got WeakBlockStateReset?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
-							}
+							},
+							PoolMessage::NewPoolServer { .. } => {
+								println!("Got NewPoolServer?");
+								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
 						}
 						future::result(Ok(()))
 					}).then(|_| {
@@ -300,8 +361,8 @@ fn main() {
 			},
 			Err(_) => {
 				println!("Failed to bind to listen bind addr");
-				return;
 			}
 		};
-	});
+		future::result(Ok(()))
+	})).unwrap();
 }

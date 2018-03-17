@@ -355,6 +355,7 @@ struct PoolHandler {
 	pool_priority: usize,
 	stream: Option<mpsc::UnboundedSender<PoolMessage>>,
 	auth_key: Option<PublicKey>,
+	our_payout_addr: Address,
 
 	cur_payout_info: Option<PoolPayoutInfo>,
 	cur_difficulty: Option<PoolDifficulty>,
@@ -366,13 +367,14 @@ struct PoolHandler {
 }
 
 impl PoolHandler {
-	fn new(expected_auth_key: Option<PublicKey>, pool_priority: usize) -> (Rc<RefCell<PoolHandler>>, mpsc::Receiver<(PoolPayoutInfo, Option<PoolDifficulty>)>) {
+	fn new(expected_auth_key: Option<PublicKey>, our_payout_addr: Address, pool_priority: usize) -> (Rc<RefCell<PoolHandler>>, mpsc::Receiver<(PoolPayoutInfo, Option<PoolDifficulty>)>) {
 		let (work_sender, work_receiver) = mpsc::channel(5);
 
 		(Rc::new(RefCell::new(PoolHandler {
-			pool_priority: pool_priority,
+			pool_priority,
 			stream: None,
 			auth_key: expected_auth_key,
+			our_payout_addr,
 
 			cur_payout_info: None,
 			cur_difficulty: None,
@@ -489,8 +491,11 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 				println!("Received ProtocolSupport");
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
-			PoolMessage::ProtocolVersion { selected_version, ref auth_key } => {
+			PoolMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
 				if selected_version != 1 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+				if flags != 1 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 				if us.auth_key.is_none() {
@@ -501,7 +506,21 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 					}
 				}
+
+				match us.stream.as_ref().unwrap().start_send(PoolMessage::PayoutInfoRequest {
+					user_id: us.our_payout_addr.to_string().into_bytes(),
+					user_auth: vec![],
+				}) {
+					Ok(_) => {},
+					Err(_) => {
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+					}
+				}
 				println!("Received ProtocolVersion, using version {}", selected_version);
+			},
+			PoolMessage::PayoutInfoRequest { .. } => {
+				println!("Received PayoutInfoRequest?");
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::PayoutInfo { signature, payout_info } => {
 				check_msg_sig!(3, payout_info, signature);
@@ -560,6 +579,9 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 				println!("Received WeakBlockStateReset");
 				us.last_weak_block = None;
 			},
+			PoolMessage::NewPoolServer { .. } => {
+				unimplemented!();
+			}
 		}
 		Ok(())
 	}
@@ -586,7 +608,6 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				&None => {}
 			}
 
-			let mut self_payout_ratio_per_1000 = 1000;
 			match payout_info {
 				&Some((ref info, _)) => {
 					for output in info.appended_outputs.iter() {
@@ -595,8 +616,6 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 						}
 						constant_value_output += output.value;
 					}
-
-					self_payout_ratio_per_1000 = info.self_payout_ratio_per_1000;
 				},
 				&None => {}
 			}
@@ -606,18 +625,12 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				return None;
 			}
 
-			let our_value = value_remaining * (self_payout_ratio_per_1000 as i64) / 1000;
-			outputs.push(TxOut {
-				value: our_value as u64,
-				script_pubkey: our_payout_script,
-			});
-
 			let work_target = template.target.clone();
 
 			match payout_info {
 				&Some((ref info, ref difficulty)) => {
 					outputs.push(TxOut {
-						value: (value_remaining - our_value) as u64,
+						value: value_remaining as u64,
 						script_pubkey: info.remaining_payout.clone(),
 					});
 
@@ -634,7 +647,12 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 					if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
 					template.coinbase_postfix.extend_from_slice(&info.coinbase_postfix[..]);
 				},
-				&None => {}
+				&None => {
+					outputs.push(TxOut {
+						value: value_remaining as u64,
+						script_pubkey: our_payout_script.clone(),
+					});
+				}
 			}
 
 			outputs.extend_from_slice(&template.appended_coinbase_outputs[..]);
@@ -925,7 +943,7 @@ fn main() {
 		job_tx: job_tx,
 	}));
 
-	current_thread::run(|_| {
+	current_thread::block_on_all(future::lazy(|| -> future::FutureResult<(), ()> {
 		for host in job_provider_hosts {
 			let (mut handler, mut job_rx) = JobProviderHandler::new(None);
 			let work_rc = cur_work_rc.clone();
@@ -956,7 +974,7 @@ fn main() {
 		}
 
 		for (idx, host) in pool_server_hosts.iter().enumerate() {
-			let (mut handler, mut pool_rx) = PoolHandler::new(None, idx);
+			let (mut handler, mut pool_rx) = PoolHandler::new(None, payout_addr.as_ref().unwrap().clone(), idx);
 			let work_rc = cur_work_rc.clone();
 			let handler_rc = handler.clone();
 			current_thread::spawn(pool_rx.for_each(move |pool_info| {
@@ -1013,7 +1031,7 @@ fn main() {
 							},
 							Err(_) => {
 								println!("Failed to bind to listen bind addr");
-								return;
+								return future::result(Ok(()));
 							}
 						};
 					},
@@ -1045,5 +1063,7 @@ fn main() {
 			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx), StratumServer);
 			bind_and_handle!(mining_listen_bind, MiningServer::new(mining_rx, mining_auth_key.unwrap()), MiningServer);
 		}
-	});
+
+		future::result(Ok(()))
+	})).unwrap();
 }
