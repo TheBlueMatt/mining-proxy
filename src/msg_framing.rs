@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 #[derive(Clone)]
 pub struct BlockTemplate {
-	pub template_id: u64,
+	pub template_timestamp: u64,
 	pub target: [u8; 32],
 
 	pub header_version: u32,
@@ -53,50 +53,50 @@ fn push_compact_size(u: usize, v: &mut bytes::BytesMut) {
 		253...0x10000 => {
 			v.reserve(3);
 			v.put_u8(253);
-			v.put_u16::<bytes::LittleEndian>(u as u16);
+			v.put_u16_le(u as u16);
 		},
 		_ => {
 			v.reserve(5);
 			v.put_u8(254);
-			v.put_u32::<bytes::LittleEndian>(u as u32);
+			v.put_u32_le(u as u32);
 		},
 	}
 }
 impl BlockTemplate {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(850); // Round upper bound assuming 2, 33-byte-sPK outputs
-		res.put_u64::<bytes::LittleEndian>(self.template_id);
+		res.put_u64_le(self.template_timestamp);
 		res.put_slice(&self.target);
 
-		res.put_u32::<bytes::LittleEndian>(self.header_version);
+		res.put_u32_le(self.header_version);
 		res.put_slice(&self.header_prevblock);
-		res.put_u32::<bytes::LittleEndian>(self.header_time);
-		res.put_u32::<bytes::LittleEndian>(self.header_nbits);
+		res.put_u32_le(self.header_time);
+		res.put_u32_le(self.header_nbits);
 
 		res.put_u8(self.merkle_rhss.len() as u8);
 		for merkle_rhs in self.merkle_rhss.iter() {
 			res.put_slice(merkle_rhs);
 		}
-		res.put_u64::<bytes::LittleEndian>(self.coinbase_value_remaining);
+		res.put_u64_le(self.coinbase_value_remaining);
 
-		res.put_u32::<bytes::LittleEndian>(self.coinbase_version);
+		res.put_u32_le(self.coinbase_version);
 		res.put_u8(self.coinbase_prefix.len() as u8);
 		res.put_slice(&self.coinbase_prefix[..]);
 		res.put_u8(self.coinbase_postfix.len() as u8);
 		res.put_slice(&self.coinbase_postfix[..]);
-		res.put_u32::<bytes::LittleEndian>(self.coinbase_input_sequence);
+		res.put_u32_le(self.coinbase_input_sequence);
 
-		res.put_u16::<bytes::LittleEndian>(0);
+		res.put_u16_le(0);
 		let remaining_len_pos = res.len();
 
 		push_compact_size(self.appended_coinbase_outputs.len(), res);
 		for txout in self.appended_coinbase_outputs.iter() {
 			res.reserve(8 + 5 + txout.script_pubkey.len() + 4);
-			res.put_u64::<bytes::LittleEndian>(txout.value);
+			res.put_u64_le(txout.value);
 			push_compact_size(txout.script_pubkey.len(), res);
 			res.put_slice(&txout.script_pubkey[..]);
 		}
-		res.put_u32::<bytes::LittleEndian>(self.coinbase_locktime);
+		res.put_u32_le(self.coinbase_locktime);
 
 		le32_into_slice((res.len() - remaining_len_pos) as u16, &mut res[remaining_len_pos - 2..remaining_len_pos]);
 	}
@@ -110,7 +110,7 @@ pub struct CoinbasePrefixPostfix {
 impl CoinbasePrefixPostfix {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(8 + 1 + self.coinbase_prefix_postfix.len());
-		res.put_u64::<bytes::LittleEndian>(self.timestamp);
+		res.put_u64_le(self.timestamp);
 		res.put_u8(self.coinbase_prefix_postfix.len() as u8);
 		res.put_slice(&self.coinbase_prefix_postfix[..]);
 	}
@@ -118,7 +118,7 @@ impl CoinbasePrefixPostfix {
 
 #[derive(Clone)]
 pub struct WinningNonce {
-	pub template_id: u64,
+	pub template_timestamp: u64,
 	pub header_version: u32,
 	pub header_time: u32,
 	pub header_nonce: u32,
@@ -129,30 +129,30 @@ impl WinningNonce {
 	pub fn encode(&self, res: &mut bytes::BytesMut) {
 		let tx_enc = network::serialize::serialize(&self.coinbase_tx).unwrap();
 		res.reserve(8 + 4*4 + tx_enc.len() + 1 + self.user_tag.len());
-		res.put_u64::<bytes::LittleEndian>(self.template_id);
-		res.put_u32::<bytes::LittleEndian>(self.header_version);
-		res.put_u32::<bytes::LittleEndian>(self.header_time);
-		res.put_u32::<bytes::LittleEndian>(self.header_nonce);
+		res.put_u64_le(self.template_timestamp);
+		res.put_u32_le(self.header_version);
+		res.put_u32_le(self.header_time);
+		res.put_u32_le(self.header_nonce);
 		res.put_u8(self.user_tag.len() as u8);
 		res.put_slice(&self.user_tag[..]);
-		res.put_u32::<bytes::LittleEndian>(tx_enc.len() as u32);
+		res.put_u32_le(tx_enc.len() as u32);
 		res.put_slice(&tx_enc[..]);
 	}
 }
 
 pub struct TransactionData {
-	pub template_id: u64,
+	pub template_timestamp: u64,
 	pub transactions: Vec<Transaction>,
 }
 impl TransactionData {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(8+4);
-		res.put_u64::<bytes::LittleEndian>(self.template_id);
-		res.put_u32::<bytes::LittleEndian>(self.transactions.len() as u32);
+		res.put_u64_le(self.template_timestamp);
+		res.put_u32_le(self.transactions.len() as u32);
 		for tx in self.transactions.iter() {
 			let tx_enc = network::serialize::serialize(tx).unwrap();
 			res.reserve(4 + tx_enc.len());
-			res.put_u32::<bytes::LittleEndian>(tx_enc.len() as u32);
+			res.put_u32_le(tx_enc.len() as u32);
 			res.put_slice(&tx_enc[..]);
 		}
 	}
@@ -160,7 +160,7 @@ impl TransactionData {
 
 #[derive(Clone)]
 pub struct BlockTemplateHeader {
-	pub template_id: u64,
+	pub template_timestamp: u64,
 	pub template_variant: u64,
 	pub target: [u8; 32],
 
@@ -173,15 +173,15 @@ pub struct BlockTemplateHeader {
 impl BlockTemplateHeader {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(124);
-		res.put_u64::<bytes::LittleEndian>(self.template_id);
-		res.put_u64::<bytes::LittleEndian>(self.template_variant);
+		res.put_u64_le(self.template_timestamp);
+		res.put_u64_le(self.template_variant);
 		res.put_slice(&self.target);
 
-		res.put_u32::<bytes::LittleEndian>(self.header_version);
+		res.put_u32_le(self.header_version);
 		res.put_slice(&self.header_prevblock);
 		res.put_slice(&self.header_merkle_root);
-		res.put_u32::<bytes::LittleEndian>(self.header_time);
-		res.put_u32::<bytes::LittleEndian>(self.header_nbits);
+		res.put_u32_le(self.header_time);
+		res.put_u32_le(self.header_nbits);
 	}
 }
 
@@ -210,7 +210,7 @@ pub enum WorkMessage {
 		nonces: WinningNonce,
 	},
 	TransactionDataRequest {
-		template_id: u64,
+		template_timestamp: u64,
 	},
 	TransactionData {
 		signature: Signature,
@@ -225,7 +225,7 @@ pub enum WorkMessage {
 		template: BlockTemplateHeader,
 	},
 	WinningNonceHeader {
-		template_id: u64,
+		template_timestamp: u64,
 		template_variant: u64,
 		header_version: u32,
 		header_time: u32,
@@ -268,15 +268,15 @@ impl codec::Encoder for WorkMsgFramer {
 			WorkMessage::ProtocolSupport { max_version, min_version, flags } => {
 				res.reserve(1 + 2*3);
 				res.put_u8(1);
-				res.put_u16::<bytes::LittleEndian>(max_version);
-				res.put_u16::<bytes::LittleEndian>(min_version);
-				res.put_u16::<bytes::LittleEndian>(flags);
+				res.put_u16_le(max_version);
+				res.put_u16_le(min_version);
+				res.put_u16_le(flags);
 			},
 			WorkMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
 				res.reserve(1 + 2 + 33);
 				res.put_u8(2);
-				res.put_u16::<bytes::LittleEndian>(selected_version);
-				res.put_u16::<bytes::LittleEndian>(flags);
+				res.put_u16_le(selected_version);
+				res.put_u16_le(flags);
 				res.put_slice(&auth_key.serialize());
 			},
 			WorkMessage::BlockTemplate { ref signature, ref template } => {
@@ -290,10 +290,10 @@ impl codec::Encoder for WorkMsgFramer {
 				res.put_u8(4);
 				nonces.encode(res);
 			},
-			WorkMessage::TransactionDataRequest { template_id } => {
+			WorkMessage::TransactionDataRequest { template_timestamp } => {
 				res.reserve(1 + 8);
 				res.put_u8(5);
-				res.put_u64::<bytes::LittleEndian>(template_id);
+				res.put_u64_le(template_timestamp);
 			}
 			WorkMessage::TransactionData { ref signature, ref data } => {
 				res.reserve(1 + 33);
@@ -313,14 +313,14 @@ impl codec::Encoder for WorkMsgFramer {
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				template.encode_unsigned(res);
 			},
-			WorkMessage::WinningNonceHeader { template_id, template_variant, header_version, header_time, header_nonce, ref user_tag } => {
+			WorkMessage::WinningNonceHeader { template_timestamp, template_variant, header_version, header_time, header_nonce, ref user_tag } => {
 				res.reserve(30 + user_tag.len());
 				res.put_u8(9);
-				res.put_u64::<bytes::LittleEndian>(template_id);
-				res.put_u64::<bytes::LittleEndian>(template_variant);
-				res.put_u32::<bytes::LittleEndian>(header_version);
-				res.put_u32::<bytes::LittleEndian>(header_time);
-				res.put_u32::<bytes::LittleEndian>(header_nonce);
+				res.put_u64_le(template_timestamp);
+				res.put_u64_le(template_variant);
+				res.put_u32_le(header_version);
+				res.put_u32_le(header_time);
+				res.put_u32_le(header_nonce);
 				res.put_u8(user_tag.len() as u8);
 				res.put_slice(&user_tag[..]);
 			},
@@ -420,7 +420,7 @@ impl codec::Decoder for WorkMsgFramer {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let template_id = slice_to_le64(get_slice!(8));
+				let template_timestamp = slice_to_le64(get_slice!(8));
 				let mut target = [0; 32];
 				target[..].copy_from_slice(get_slice!(32));
 
@@ -472,7 +472,7 @@ impl codec::Decoder for WorkMsgFramer {
 				let msg = WorkMessage::BlockTemplate {
 					signature: signature,
 					template: BlockTemplate {
-						template_id,
+						template_timestamp,
 						target,
 
 						header_version,
@@ -495,7 +495,7 @@ impl codec::Decoder for WorkMsgFramer {
 				Ok(Some(msg))
 			},
 			4 => {
-				let template_id = slice_to_le64(get_slice!(8));
+				let template_timestamp = slice_to_le64(get_slice!(8));
 				let header_version = slice_to_le32(get_slice!(4));
 				let header_time = slice_to_le32(get_slice!(4));
 				let header_nonce = slice_to_le32(get_slice!(4));
@@ -510,7 +510,7 @@ impl codec::Decoder for WorkMsgFramer {
 				};
 				let msg = WorkMessage::WinningNonce {
 					nonces: WinningNonce {
-						template_id,
+						template_timestamp,
 						header_version,
 						header_time,
 						header_nonce,
@@ -523,7 +523,7 @@ impl codec::Decoder for WorkMsgFramer {
 			},
 			5 => {
 				let msg = WorkMessage::TransactionDataRequest {
-					template_id: slice_to_le64(get_slice!(8)),
+					template_timestamp: slice_to_le64(get_slice!(8)),
 				};
 				advance_bytes!();
 				Ok(Some(msg))
@@ -533,7 +533,7 @@ impl codec::Decoder for WorkMsgFramer {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let template_id = slice_to_le64(get_slice!(8));
+				let template_timestamp = slice_to_le64(get_slice!(8));
 
 				let tx_count = slice_to_le32(get_slice!(4)) as usize;
 				if bytes.len() < 64 + 8 + 4 + tx_count * 4 {
@@ -552,7 +552,7 @@ impl codec::Decoder for WorkMsgFramer {
 				let msg = WorkMessage::TransactionData {
 					signature: signature,
 					data: TransactionData {
-						template_id: template_id,
+						template_timestamp,
 						transactions: txn,
 					},
 				};
@@ -584,7 +584,7 @@ impl codec::Decoder for WorkMsgFramer {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let template_id = slice_to_le64(get_slice!(8));
+				let template_timestamp = slice_to_le64(get_slice!(8));
 				let template_variant = slice_to_le64(get_slice!(8));
 
 				let mut target = [0; 32];
@@ -599,7 +599,7 @@ impl codec::Decoder for WorkMsgFramer {
 				let msg = WorkMessage::BlockTemplateHeader {
 					signature: signature,
 					template: BlockTemplateHeader {
-						template_id: template_id,
+						template_timestamp,
 						template_variant: template_variant,
 						target: target,
 
@@ -615,7 +615,7 @@ impl codec::Decoder for WorkMsgFramer {
 			},
 			9 => {
 				let msg = WorkMessage::WinningNonceHeader {
-					template_id: slice_to_le64(get_slice!(8)),
+					template_timestamp: slice_to_le64(get_slice!(8)),
 					template_variant: slice_to_le64(get_slice!(8)),
 
 					header_version: slice_to_le32(get_slice!(4)),
@@ -644,23 +644,23 @@ pub struct PoolPayoutInfo {
 }
 impl PoolPayoutInfo {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
-		res.reserve(12 + self.user_id.len() + self.coinbase_postfix.len() + self.remaining_payout.len());
-
+		res.reserve(13 + self.user_id.len() + self.coinbase_postfix.len() + self.remaining_payout.len());
 		res.put_u8(self.user_id.len() as u8);
 		res.put_slice(&self.user_id[..]);
-		res.put_u64::<bytes::LittleEndian>(self.timestamp);
+
+		res.put_u64_le(self.timestamp);
 
 		res.put_u8(self.coinbase_postfix.len() as u8);
 		res.put_slice(&self.coinbase_postfix[..]);
 
-		res.put_u16::<bytes::LittleEndian>(self.remaining_payout.len() as u16);
+		res.put_u16_le(self.remaining_payout.len() as u16);
 		res.put_slice(&self.remaining_payout[..]);
 
 		res.put_u8(self.appended_outputs.len() as u8);
 		for txout in self.appended_outputs.iter() {
 			res.reserve(8 + 2 + txout.script_pubkey.len());
-			res.put_u64::<bytes::LittleEndian>(txout.value);
-			res.put_u16::<bytes::LittleEndian>(txout.script_pubkey.len() as u16);
+			res.put_u64_le(txout.value);
+			res.put_u16_le(txout.script_pubkey.len() as u16);
 			res.put_slice(&txout.script_pubkey[..]);
 		}
 	}
@@ -724,14 +724,14 @@ impl WeakBlock {
 	pub fn encode(&self, res: &mut bytes::BytesMut) {
 		res.reserve(4*4 + 8*2 + 32 + self.txn.len()/8);
 
-		res.put_u32::<bytes::LittleEndian>(self.header_version);
+		res.put_u32_le(self.header_version);
 		res.put_slice(&self.header_prevblock);
-		res.put_u32::<bytes::LittleEndian>(self.header_time);
-		res.put_u32::<bytes::LittleEndian>(self.header_nbits);
-		res.put_u32::<bytes::LittleEndian>(self.header_nonce);
+		res.put_u32_le(self.header_time);
+		res.put_u32_le(self.header_nbits);
+		res.put_u32_le(self.header_nonce);
 
-		res.put_u64::<bytes::LittleEndian>(self.sketch_id);
-		res.put_u64::<bytes::LittleEndian>(self.prev_sketch_id);
+		res.put_u64_le(self.sketch_id);
+		res.put_u64_le(self.prev_sketch_id);
 
 		let mut action_buff = 0;
 		for tx in self.txn.iter() {
@@ -760,7 +760,7 @@ impl WeakBlock {
 					res.reserve(1 + 4 + tx_enc.len());
 					res.put_u8(action_buff);
 					action_buff = 0;
-					res.put_u32::<bytes::LittleEndian>(tx_enc.len() as u32);
+					res.put_u32_le(tx_enc.len() as u32);
 					res.put_slice(&tx_enc[..]);
 				}
 			}
@@ -779,7 +779,7 @@ pub enum PoolMessage {
 		flags: u16,
 		auth_key: PublicKey,
 	},
-	PayoutInfoRequest {
+	GetPayoutInfo {
 		user_id: Vec<u8>,
 		user_auth: Vec<u8>,
 	},
@@ -802,7 +802,7 @@ pub enum PoolMessage {
 		signature: Signature,
 		new_host_port: String,
 	},
-/*TODO:
+	/*TODO:
 	BitcoindAddNode {
 		signature: Signature,
 		bitcoind_add_nodes: Vec<String>,
@@ -831,24 +831,24 @@ impl codec::Encoder for PoolMsgFramer {
 			PoolMessage::ProtocolSupport { max_version, min_version, flags } => {
 				res.reserve(1 + 2*3);
 				res.put_u8(1);
-				res.put_u16::<bytes::LittleEndian>(max_version);
-				res.put_u16::<bytes::LittleEndian>(min_version);
-				res.put_u16::<bytes::LittleEndian>(flags);
+				res.put_u16_le(max_version);
+				res.put_u16_le(min_version);
+				res.put_u16_le(flags);
 			},
 			PoolMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
 				res.reserve(1 + 2*2 + 33);
 				res.put_u8(2);
-				res.put_u16::<bytes::LittleEndian>(selected_version);
-				res.put_u16::<bytes::LittleEndian>(flags);
+				res.put_u16_le(selected_version);
+				res.put_u16_le(flags);
 				res.put_slice(&auth_key.serialize());
 			},
-			PoolMessage::PayoutInfoRequest { ref user_id, ref user_auth } => {
+			PoolMessage::GetPayoutInfo { ref user_id, ref user_auth } => {
 				res.reserve(3 + user_id.len() + user_auth.len());
 				res.put_u8(10);
 				res.put_u8(user_id.len() as u8);
-				res.put_slice(&user_id[..]);
+				res.put_slice(&user_id);
 				res.put_u8(user_auth.len() as u8);
-				res.put_slice(&user_auth[..]);
+				res.put_slice(&user_auth);
 			},
 			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
 				res.reserve(1 + 33);
@@ -866,23 +866,23 @@ impl codec::Encoder for PoolMsgFramer {
 				let tx_enc = network::serialize::serialize(&share.coinbase_tx).unwrap();
 				res.reserve(1 + 4*4 + 32 + 1 + share.merkle_rhss.len()*32 + 4 + tx_enc.len() + 1 + share.user_tag.len());
 				res.put_u8(13);
-				res.put_u32::<bytes::LittleEndian>(share.header_version);
+				res.put_u32_le(share.header_version);
 				res.put_slice(&share.header_prevblock);
-				res.put_u32::<bytes::LittleEndian>(share.header_time);
-				res.put_u32::<bytes::LittleEndian>(share.header_nbits);
-				res.put_u32::<bytes::LittleEndian>(share.header_nonce);
+				res.put_u32_le(share.header_time);
+				res.put_u32_le(share.header_nbits);
+				res.put_u32_le(share.header_nonce);
 				res.put_u8(share.merkle_rhss.len() as u8);
 				for rhs in share.merkle_rhss.iter() {
 					res.put_slice(rhs);
 				}
-				res.put_u32::<bytes::LittleEndian>(tx_enc.len() as u32);
+				res.put_u32_le(tx_enc.len() as u32);
 				res.put_slice(&tx_enc[..]);
 				res.put_u8(share.user_tag.len() as u8);
 				res.put_slice(&share.user_tag[..]);
 			},
 			PoolMessage::WeakBlock { ref sketch } => {
-				res.reserve(1);
-				res.put_u8(14);
+				res.reserve(14);
+				res.put_u8(6);
 				sketch.encode(res);
 			},
 			PoolMessage::WeakBlockStateReset { } => {
@@ -895,7 +895,7 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				res.put_u8(new_host_port.len() as u8);
 				res.put_slice(new_host_port.as_bytes());
-			}
+			},
 		}
 		Ok(())
 	}
@@ -950,6 +950,7 @@ impl codec::Decoder for PoolMsgFramer {
 					auth_key: match PublicKey::from_slice(&self.secp_ctx, get_slice!(33)) {
 						Ok(key) => key,
 						Err(_) => {
+							println!("Bad key {}", selected_version);
 							return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 						}
 					}
@@ -958,19 +959,25 @@ impl codec::Decoder for PoolMsgFramer {
 				Ok(Some(msg))
 			},
 			10 => {
-				let msg = PoolMessage::PayoutInfoRequest {
-					user_id: get_slice!(get_slice!(1)[0]).to_vec(),
-					user_auth: get_slice!(get_slice!(1)[0]).to_vec(),
-				};
+				let user_id_len = get_slice!(1)[0];
+				let user_id = get_slice!(user_id_len).to_vec();
+				let user_auth_len = get_slice!(1)[0];
+				let user_auth = get_slice!(user_auth_len).to_vec();
+
 				advance_bytes!();
-				Ok(Some(msg))
+				Ok(Some(PoolMessage::GetPayoutInfo {
+					user_id,
+					user_auth,
+				}))
 			},
 			11 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let user_id = get_slice!(get_slice!(1)[0]).to_vec();
+				let user_id_len = get_slice!(1)[0];
+				let user_id = get_slice!(user_id_len).to_vec();
+
 				let timestamp = slice_to_le64(get_slice!(8));
 
 				let coinbase_postfix_len = get_slice!(1)[0];
@@ -997,7 +1004,7 @@ impl codec::Decoder for PoolMsgFramer {
 						timestamp,
 						coinbase_postfix,
 						remaining_payout: script,
-						appended_outputs: appended_coinbase_outputs
+						appended_outputs: appended_coinbase_outputs,
 					}
 				};
 				advance_bytes!();
@@ -1093,7 +1100,7 @@ impl codec::Decoder for PoolMsgFramer {
 				};
 				advance_bytes!();
 				Ok(Some(msg))
-			}
+			},
 			_ => {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 			}

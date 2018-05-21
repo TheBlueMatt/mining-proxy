@@ -176,7 +176,7 @@ fn job_to_json_string(template: &BlockTemplate, prev_changed: bool) -> String {
 
 	json!({
 		"params": [
-			template.template_id.to_string(),
+			template.template_timestamp.to_string(),
 			bytes_to_hex_insane_order(&template.header_prevblock),
 			coinbase_prev,
 			coinbase_post,
@@ -252,7 +252,7 @@ impl StratumServer {
 
 			let job_json = job_to_json_string(&job.template, prev_changed);
 			announce_str!(job_json);
-			us_cp.borrow_mut().jobs.insert(job.template.template_id, job);
+			us_cp.borrow_mut().jobs.insert(job.template.template_timestamp, job);
 			future::result(Ok(()))
 		}));
 
@@ -414,9 +414,9 @@ impl StratumServer {
 									prev_index: 0xffffffff,
 									script_sig: Script::from(script_sig),
 									sequence: job.template.coinbase_input_sequence,
+									witness: vec!(),
 								}),
 								output: job.template.appended_coinbase_outputs.clone(),
-								witness: vec!(),
 								lock_time: job.template.coinbase_locktime,
 							};
 
@@ -447,7 +447,7 @@ impl StratumServer {
 
 							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
 								match job.solutions.unbounded_send(Rc::new((WinningNonce {
-									template_id: job.template.template_id,
+									template_timestamp: job.template.template_timestamp,
 									header_version: version,
 									header_time: time,
 									header_nonce: nonce,

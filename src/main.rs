@@ -24,7 +24,7 @@ mod utils;
 use bitcoin::blockdata::transaction::{TxOut,Transaction};
 use bitcoin::blockdata::script::Script;
 use bitcoin::util::address::Address;
-use bitcoin::util::address;
+use bitcoin::util::privkey;
 use bitcoin::util::hash::Sha256dHash;
 
 use bytes::BufMut;
@@ -223,8 +223,8 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
-				if template.template_id < timestamp - 1000*60*20 || template.template_id > timestamp + 1000*60*1 {
-					println!("Got template with unreasonable timestamp ({}, our time is {})", template.template_id, timestamp);
+				if template.template_timestamp < timestamp - 1000*60*20 || template.template_timestamp > timestamp + 1000*60*1 {
+					println!("Got template with unreasonable timestamp ({}, our time is {})", template.template_timestamp, timestamp);
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 
@@ -242,7 +242,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 					None => {}
 				}
 
-				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_id < template.template_id {
+				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_timestamp < template.template_timestamp {
 					println!("Received new BlockTemplate");
 					let (txn, txn_tx) = Eventual::new();
 					let cur_postfix_prefix = us.cur_prefix_postfix.clone();
@@ -253,11 +253,11 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 						}
 					}
-					match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_id: template.template_id }) {
+					match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_timestamp: template.template_timestamp }) {
 						Ok(_) => {},
 						Err(_) => { panic!("unbounded streams should never fail"); }
 					}
-					us.pending_tx_data_requests.insert(template.template_id, txn_tx);
+					us.pending_tx_data_requests.insert(template.template_timestamp, txn_tx);
 					us.cur_template = Some(template);
 				}
 			},
@@ -272,7 +272,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			WorkMessage::TransactionData { signature, data } => {
 				check_msg_sig!(6, data, signature);
 
-				match us.pending_tx_data_requests.remove(&data.template_id) {
+				match us.pending_tx_data_requests.remove(&data.template_timestamp) {
 					Some(chan) => {
 						match chan.send(data) {
 							Ok(()) => {},
@@ -322,11 +322,11 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 						//TODO: This is pretty lazy...we should cache these instead of requesting
 						//new ones from the server...hopefully they dont update the coinbase prefix
 						//postfix very often...
-						match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_id: template.template_id }) {
+						match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_timestamp: template.template_timestamp }) {
 							Ok(_) => {},
 							Err(_) => { panic!("unbounded streams should never fail"); }
 						}
-						us.pending_tx_data_requests.insert(template.template_id, txn_tx);
+						us.pending_tx_data_requests.insert(template.template_timestamp, txn_tx);
 
 						match us.job_stream.start_send((template, cur_prefix_postfix, txn)) {
 							Ok(_) => {},
@@ -355,7 +355,9 @@ struct PoolHandler {
 	pool_priority: usize,
 	stream: Option<mpsc::UnboundedSender<PoolMessage>>,
 	auth_key: Option<PublicKey>,
-	our_payout_addr: Address,
+
+	user_id: Vec<u8>,
+	user_auth: Vec<u8>,
 
 	cur_payout_info: Option<PoolPayoutInfo>,
 	cur_difficulty: Option<PoolDifficulty>,
@@ -367,14 +369,16 @@ struct PoolHandler {
 }
 
 impl PoolHandler {
-	fn new(expected_auth_key: Option<PublicKey>, our_payout_addr: Address, pool_priority: usize) -> (Rc<RefCell<PoolHandler>>, mpsc::Receiver<(PoolPayoutInfo, Option<PoolDifficulty>)>) {
+	fn new(expected_auth_key: Option<PublicKey>, user_id: Vec<u8>, user_auth: Vec<u8>, pool_priority: usize) -> (Rc<RefCell<PoolHandler>>, mpsc::Receiver<(PoolPayoutInfo, Option<PoolDifficulty>)>) {
 		let (work_sender, work_receiver) = mpsc::channel(5);
 
 		(Rc::new(RefCell::new(PoolHandler {
-			pool_priority,
+			pool_priority: pool_priority,
 			stream: None,
 			auth_key: expected_auth_key,
-			our_payout_addr,
+
+			user_id,
+			user_auth,
 
 			cur_payout_info: None,
 			cur_difficulty: None,
@@ -495,7 +499,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 				if selected_version != 1 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
-				if flags != 1 {
+				if flags != 0 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 				if us.auth_key.is_none() {
@@ -506,24 +510,24 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 					}
 				}
+				println!("Received ProtocolVersion, using version {}", selected_version);
 
-				match us.stream.as_ref().unwrap().start_send(PoolMessage::PayoutInfoRequest {
-					user_id: us.our_payout_addr.to_string().into_bytes(),
-					user_auth: vec![],
+				match us.stream.as_ref().unwrap().start_send(PoolMessage::GetPayoutInfo {
+					user_id: us.user_id.clone(),
+					user_auth: us.user_auth.clone(),
 				}) {
 					Ok(_) => {},
 					Err(_) => {
 						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 					}
 				}
-				println!("Received ProtocolVersion, using version {}", selected_version);
 			},
-			PoolMessage::PayoutInfoRequest { .. } => {
-				println!("Received PayoutInfoRequest?");
+			PoolMessage::GetPayoutInfo { .. } => {
+				println!("Received GetPayoutInfo?");
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::PayoutInfo { signature, payout_info } => {
-				check_msg_sig!(3, payout_info, signature);
+				check_msg_sig!(11, payout_info, signature);
 
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
@@ -551,7 +555,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 				}
 			},
 			PoolMessage::ShareDifficulty { signature, difficulty } => {
-				check_msg_sig!(4, difficulty, signature);
+				check_msg_sig!(12, difficulty, signature);
 
 				println!("Received new difficulty!");
 				us.cur_difficulty = Some(difficulty);
@@ -581,7 +585,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 			},
 			PoolMessage::NewPoolServer { .. } => {
 				unimplemented!();
-			}
+			},
 		}
 		Ok(())
 	}
@@ -608,27 +612,24 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				&None => {}
 			}
 
+			if template.coinbase_value_remaining <= 0 {
+				return None;
+			}
+
 			match payout_info {
-				&Some((ref info, _)) => {
+				&Some((ref info, ref difficulty)) => {
 					for output in info.appended_outputs.iter() {
 						if output.value > 21000000*100000000 {
 							return None;
 						}
 						constant_value_output += output.value;
 					}
-				},
-				&None => {}
-			}
 
-			let value_remaining = (template.coinbase_value_remaining as i64) - (constant_value_output as i64);
-			if value_remaining < 0 {
-				return None;
-			}
+					let value_remaining = (template.coinbase_value_remaining as i64) - (constant_value_output as i64);
+					if value_remaining <= 0 {
+						return None;
+					}
 
-			let work_target = template.target.clone();
-
-			match payout_info {
-				&Some((ref info, ref difficulty)) => {
 					outputs.push(TxOut {
 						value: value_remaining as u64,
 						script_pubkey: info.remaining_payout.clone(),
@@ -649,12 +650,13 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				},
 				&None => {
 					outputs.push(TxOut {
-						value: value_remaining as u64,
-						script_pubkey: our_payout_script.clone(),
+						value: template.coinbase_value_remaining,
+						script_pubkey: our_payout_script,
 					});
 				}
 			}
 
+			let work_target = template.target.clone();
 			outputs.extend_from_slice(&template.appended_coinbase_outputs[..]);
 
 			template.appended_coinbase_outputs = outputs;
@@ -818,6 +820,8 @@ fn main() {
 	println!("USAGE: stratum-proxy (--job_provider=host:port)* (--pool_server=host:port)* --stratum_listen_bind=IP:port --mining_listen_bind=IP:port --mining_auth_key=base58privkey --payout_address=addr");
 	println!("--job_provider - bitcoind(s) running as mining server(s) to get work from");
 	println!("--pool_server - pool server(s) to get payout address from/submit shares to");
+	println!("--pool_user_id - user id (eg username) on pool");
+	println!("--pool_user_auth - user auth (eg password) on pool");
 	println!("--stratum_listen_bind - the address to bind to to announce stratum jobs on");
 	println!("--mining_listen_bind - the address to bind to to announce jobs on natively");
 	println!("--mining_auth_key - the auth key to use to authenticate to native clients");
@@ -826,9 +830,13 @@ fn main() {
 	println!("many hosts a DNS name may resolve to. We try each hostname until one works.");
 	println!("Job providers are not prioritized (the latest job is always used), pools are");
 	println!("prioritized in the order they appear on the command line.");
+	println!("--payout_address is used whenever no pools are available but does not affect");
+	println!("pool payout information (only --pool_user_id does so).");
 
 	let mut job_provider_hosts = Vec::new();
 	let mut pool_server_hosts = Vec::new();
+	let mut user_id = None;
+	let mut user_auth = None;
 	let mut stratum_listen_bind = None;
 	let mut mining_listen_bind = None;
 	let mut mining_auth_key = None;
@@ -880,7 +888,7 @@ fn main() {
 				println!("Cannot specify multiple auth keys");
 				return;
 			}
-			mining_auth_key = Some(match address::Privkey::from_str(arg.split_at(18).1) {
+			mining_auth_key = Some(match privkey::Privkey::from_str(arg.split_at(18).1) {
 				Ok(privkey) => {
 					if !privkey.compressed {
 						println!("Private key must represent a compressed key!");
@@ -906,6 +914,18 @@ fn main() {
 					return;
 				}
 			});
+		} else if arg.starts_with("--pool_user_id") {
+			if user_id.is_some() {
+				println!("Cannot specify multiple pool_user_ids");
+				return;
+			}
+			user_id = Some(arg.split_at(15).1.as_bytes().to_vec());
+		} else if arg.starts_with("--pool_user_auth") {
+			if user_auth.is_some() {
+				println!("Cannot specify multiple pool_user_auths");
+				return;
+			}
+			user_auth = Some(arg.split_at(17).1.as_bytes().to_vec());
 		} else {
 			println!("Unkown arg: {}", arg);
 			return;
@@ -921,12 +941,19 @@ fn main() {
 		return;
 	}
 	if payout_addr.is_none() {
-		println!("Need some payout address");
+		println!("Need some payout address for fallback/solo mining");
 		return;
 	}
 	if mining_listen_bind.is_some() && mining_auth_key.is_none() {
 		println!("Need some mining_auth_key for mining_listen_bind");
 		return;
+	}
+
+	if user_id.is_none() {
+		user_id = Some(Vec::new());
+	}
+	if user_auth.is_none() {
+		user_auth = Some(Vec::new());
 	}
 
 	unsafe {
@@ -943,14 +970,14 @@ fn main() {
 		job_tx: job_tx,
 	}));
 
-	current_thread::block_on_all(future::lazy(|| -> future::FutureResult<(), ()> {
+	current_thread::block_on_all(future::lazy(|| -> Result<(), ()> {
 		for host in job_provider_hosts {
 			let (mut handler, mut job_rx) = JobProviderHandler::new(None);
 			let work_rc = cur_work_rc.clone();
 			let handler_rc = handler.clone();
 			current_thread::spawn(job_rx.for_each(move |job| {
 				let mut cur_work = work_rc.borrow_mut();
-				if cur_work.cur_job.is_none() || cur_work.cur_job.as_ref().unwrap().0.template_id < job.0.template_id {
+				if cur_work.cur_job.is_none() || cur_work.cur_job.as_ref().unwrap().0.template_timestamp < job.0.template_timestamp {
 					let new_job = Some(job);
 					match merge_job_pool(cur_work.payout_script.clone(), &new_job, Some(handler_rc.clone()), &cur_work.cur_pool, cur_work.cur_pool_source.clone()) {
 						Some(work) => {
@@ -966,15 +993,15 @@ fn main() {
 						None => {}
 					}
 				}
-				future::result(Ok(()))
+				Ok(())
 			}).then(|_| {
-				future::result(Ok(()))
+				Ok(())
 			}));
 			ConnectionMaintainer::make_connection(Rc::new(RefCell::new(ConnectionMaintainer::new(host, handler))));
 		}
 
 		for (idx, host) in pool_server_hosts.iter().enumerate() {
-			let (mut handler, mut pool_rx) = PoolHandler::new(None, payout_addr.as_ref().unwrap().clone(), idx);
+			let (mut handler, mut pool_rx) = PoolHandler::new(None, user_id.as_ref().unwrap().clone(), user_auth.as_ref().unwrap().clone(), idx);
 			let work_rc = cur_work_rc.clone();
 			let handler_rc = handler.clone();
 			current_thread::spawn(pool_rx.for_each(move |pool_info| {
@@ -984,7 +1011,7 @@ fn main() {
 						let pool = cur_pool.borrow();
 						//TODO: Fallback to lower-priority pool when one gets disconnected
 						if pool.is_connected() && pool.get_priority() < handler_rc.borrow().get_priority() {
-							return future::result(Ok(()));
+							return Ok(());
 						}
 					},
 					None => {}
@@ -1008,9 +1035,9 @@ fn main() {
 						}
 					}
 				}
-				future::result(Ok(()))
+				Ok(())
 			}).then(|_| {
-				future::result(Ok(()))
+				Ok(())
 			}));
 			ConnectionMaintainer::make_connection(Rc::new(RefCell::new(ConnectionMaintainer::new(host.clone(), handler))));
 		}
@@ -1024,14 +1051,14 @@ fn main() {
 							Ok(listener) => {
 								current_thread::spawn(listener.incoming().for_each(move |sock| {
 									$server_type::new_connection(server.clone(), sock);
-									future::result(Ok(()))
+									Ok(())
 								}).then(|_| {
-									future::result(Ok(()))
+									Ok(())
 								}));
 							},
 							Err(_) => {
 								println!("Failed to bind to listen bind addr");
-								return future::result(Ok(()));
+								return Ok(());
 							}
 						};
 					},
@@ -1056,14 +1083,14 @@ fn main() {
 					Ok(_) => {},
 					Err(_) => { println!("Dropped new job for stratum clients as server ran behind!"); },
 				}
-				future::result(Ok(()))
+				Ok(())
 			}).then(|_| {
-				future::result(Ok(()))
+				Ok(())
 			}));
 			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx), StratumServer);
 			bind_and_handle!(mining_listen_bind, MiningServer::new(mining_rx, mining_auth_key.unwrap()), MiningServer);
 		}
 
-		future::result(Ok(()))
+		Ok(())
 	})).unwrap();
 }

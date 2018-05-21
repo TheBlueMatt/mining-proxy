@@ -61,9 +61,9 @@ fn work_to_coinbase_tx(template: &BlockTemplate, client_id: u64) -> Transaction 
 			prev_index: 0xffffffff,
 			script_sig: Script::from(script_sig),
 			sequence: template.coinbase_input_sequence,
+			witness: vec!(),
 		}),
 		output: template.appended_coinbase_outputs.clone(),
-		witness: vec!(),
 		lock_time: template.coinbase_locktime,
 	}
 }
@@ -132,7 +132,7 @@ impl MiningServer {
 				if !client.handshake_complete { return true; }
 				if client.use_header_variants {
 					let template_header = BlockTemplateHeader {
-						template_id: job.template.template_id,
+						template_timestamp: job.template.template_timestamp,
 						template_variant: client.client_id,
 						target: job.template.target,
 
@@ -160,7 +160,7 @@ impl MiningServer {
 				}
 			});
 
-			self_ref.jobs.insert(job.template.template_id, job);
+			self_ref.jobs.insert(job.template.template_timestamp, job);
 			future::result(Ok(()))
 		}));
 
@@ -258,7 +258,7 @@ impl MiningServer {
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::WinningNonce { nonces } => {
-					match rc.borrow().jobs.get(&nonces.template_id) {
+					match rc.borrow().jobs.get(&nonces.template_timestamp) {
 						Some(job) => {
 							let block_hash = BlockHeader {
 								version: nonces.header_version,
@@ -300,8 +300,8 @@ impl MiningServer {
 					println!("Received BlockTemplateHeader?");
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
-				WorkMessage::WinningNonceHeader { template_id, template_variant, header_version, header_time, header_nonce, user_tag } => {
-					match rc.borrow().jobs.get(&template_id) {
+				WorkMessage::WinningNonceHeader { template_timestamp, template_variant, header_version, header_time, header_nonce, user_tag } => {
+					match rc.borrow().jobs.get(&template_timestamp) {
 						Some(job) => {
 							let block_hash = BlockHeader {
 								version: header_version,
@@ -314,7 +314,7 @@ impl MiningServer {
 
 							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
 								match job.solutions.unbounded_send(Rc::new((WinningNonce {
-									template_id,
+									template_timestamp,
 									header_version,
 									header_time,
 									header_nonce,

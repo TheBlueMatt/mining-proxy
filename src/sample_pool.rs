@@ -15,7 +15,7 @@ mod utils;
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::network::serialize::BitcoinHash;
 use bitcoin::util::address::Address;
-use bitcoin::util::address;
+use bitcoin::util::privkey;
 use bitcoin::util::hash::Sha256dHash;
 
 use bytes::BufMut;
@@ -35,21 +35,16 @@ use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
 use std::{env,io};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn slice_to_le64(v: &[u8]) -> u64 {
-	((v[7] as u64) << 8*7) |
-	((v[6] as u64) << 8*6) |
-	((v[5] as u64) << 8*5) |
-	((v[4] as u64) << 8*4) |
-	((v[3] as u64) << 8*3) |
-	((v[2] as u64) << 8*2) |
-	((v[1] as u64) << 8*1) |
-	((v[0] as u64) << 8*0)
+fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
+	println!("User {} authed with pass {}", String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_auth));
+	true
+}
+
+fn share_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64) {
+	println!("Got valid share with value {} from {} from machine identified as: {}", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag));
 }
 
 const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
@@ -82,7 +77,7 @@ fn main() {
 				println!("Cannot specify multiple auth keys");
 				return;
 			}
-			auth_key = Some(match address::Privkey::from_str(arg.split_at(11).1) {
+			auth_key = Some(match privkey::Privkey::from_str(arg.split_at(11).1) {
 				Ok(privkey) => {
 					if !privkey.compressed {
 						println!("Private key must represent a compressed key!");
@@ -129,9 +124,7 @@ fn main() {
 		return;
 	}
 
-	let clients_ref = Rc::new(RefCell::new(HashMap::new()));
-
-	current_thread::block_on_all(future::lazy(|| -> future::FutureResult<(), ()> {
+	current_thread::block_on_all(futures::lazy(move || -> Result<(), ()> {
 		match net::TcpListener::bind(&listen_bind.unwrap()) {
 			Ok(listener) => {
 				let mut max_client_id = 0;
@@ -168,8 +161,6 @@ fn main() {
 					}
 
 					let payout_addr_clone = payout_addr.as_ref().unwrap().clone();
-					let server_id_clone = server_id.clone();
-					let clients = clients_ref.clone();
 					let client_id = max_client_id;
 					max_client_id += 1;
 
@@ -179,8 +170,9 @@ fn main() {
 						None => {},
 					};
 
-					let mut received_protocol_support = false;
-					let mut client_authed = false;
+					let mut client_version = None;
+					let mut client_user_id = None;
+
 					current_thread::spawn(rx.for_each(move |msg| {
 						macro_rules! send_response {
 							($msg: expr) => {
@@ -193,43 +185,44 @@ fn main() {
 
 						match msg {
 							PoolMessage::ProtocolSupport { max_version, min_version, flags } => {
+								if client_version.is_some() {
+									println!("Client sent duplicative ProtocolSupport");
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
 								if min_version > 1 || max_version < 1 {
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 								if flags != 0 {
 									println!("Client requested unknown flags {}", flags);
 								}
+								client_version = Some(1);
 								send_response!(PoolMessage::ProtocolVersion {
 									selected_version: 1,
 									flags: 0,
 									auth_key: PublicKey::from_secret_key(&secp_ctx, &auth_key.unwrap()).unwrap(),
 								});
-								received_protocol_support = true;
 							},
 							PoolMessage::ProtocolVersion { .. } => {
 								println!("Got ProtocolVersion?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
-							PoolMessage::PayoutInfoRequest { user_id, .. } => {
-								if !received_protocol_support {
-									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
-								}
-								if client_authed {
-									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
-								}
-
-								let addr = match Address::from_str(match String::from_utf8(user_id.clone()) {
-									Ok(string) => string,
-									Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))),
-								}.as_str()) {
-									Ok(addr) => addr,
-									Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))),
-								};
-								clients.borrow_mut().insert(client_id, addr);
-								client_authed = true;
-
+							PoolMessage::GetPayoutInfo { user_id, user_auth } => {
 								let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 								let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+
+								if client_version.is_none() {
+									println!("Client sent GetPayoutInfo before ProtocolSupport");
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+								if client_user_id.is_some() {
+									println!("Client sent duplicative GetPayoutInfo");
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+								if !check_user_auth(&user_id, &user_auth) {
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+								client_user_id = Some(user_id.clone());
+
 								let payout_info = PoolPayoutInfo {
 									user_id,
 									timestamp,
@@ -238,7 +231,7 @@ fn main() {
 									appended_outputs: vec![],
 								};
 								send_response!(PoolMessage::PayoutInfo {
-									signature: sign_message!(payout_info, 3),
+									signature: sign_message!(payout_info, 11),
 									payout_info,
 								});
 
@@ -247,7 +240,7 @@ fn main() {
 									weak_block_target: [0; 32],
 								};
 								send_response!(PoolMessage::ShareDifficulty {
-									signature: sign_message!(difficulty, 4),
+									signature: sign_message!(difficulty, 12),
 									difficulty,
 								});
 							},
@@ -260,7 +253,8 @@ fn main() {
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
 							PoolMessage::Share { ref share } => {
-								if !received_protocol_support || !client_authed {
+								if client_version.is_none() || client_user_id.is_none() {
+									println!("Client sent Share before version/id handshake");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 
@@ -269,37 +263,17 @@ fn main() {
 									return future::result(Ok(()));
 								}
 
-								let coinbase = &share.coinbase_tx.input[0].script_sig[..];
-								let share_client_id = match server_id_clone {
-									Some(ref server_id) => {
-										if coinbase.len() < server_id.len() + 8 || !coinbase.ends_with(&server_id.as_bytes()[..]) {
-											println!("Client sent share which failed to include the required coinbase postfix");
-											return future::result(Ok(()));
-										}
-										slice_to_le64(&coinbase[coinbase.len() - server_id.len() - 8..coinbase.len() - server_id.len()])
+								if !share.coinbase_tx.input[0].script_sig[..].ends_with(&client_coinbase_postfix[..]) {
+									println!("Client sent share which failed to include the required coinbase postfix");
+									return future::result(Ok(()));
+								}
 
-									},
-									None => {
-										if coinbase.len() < 8 {
-											println!("Client sent share which failed to include the required coinbase postfix");
-											return future::result(Ok(()));
-										}
-										slice_to_le64(&coinbase[coinbase.len() - 8..coinbase.len()])
-									},
-								};
-								let clients_ref = clients.borrow();
-								let client_payout = match clients_ref.get(&share_client_id) {
-									Some(payout_addr) => payout_addr,
-									None => {
-										println!("Client sent share with a coinbase_tx which did not pay to a known auth'ed client");
-										return future::result(Ok(()));
-									}
-								};
-
+								let mut our_payout = 0;
 								for (idx, out) in share.coinbase_tx.output.iter().enumerate() {
 									if idx == 0 {
+										our_payout = out.value;
 										if out.script_pubkey != payout_addr_clone {
-											println!("Got share which paid out to unknown location");
+											println!("Got share which paid out to an unknown location");
 											return future::result(Ok(()));
 										}
 									} else if out.value != 0 {
@@ -331,7 +305,7 @@ fn main() {
 								}.bitcoin_hash();
 
 								if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
-									println!("Got valid share from {} for payout to script: {}", String::from_utf8_lossy(&share.user_tag), client_payout.to_string());
+									share_submitted(client_user_id.as_ref().unwrap(), &share.user_tag, our_payout);
 								} else {
 									println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&SHARE_TARGET[..]));
 								}
@@ -361,8 +335,10 @@ fn main() {
 			},
 			Err(_) => {
 				println!("Failed to bind to listen bind addr");
+				return Ok(())
 			}
 		};
-		future::result(Ok(()))
+
+		Ok(())
 	})).unwrap();
 }
