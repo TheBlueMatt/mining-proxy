@@ -14,13 +14,11 @@ use futures::{future,Future,Sink};
 use futures::stream::Stream;
 use futures::unsync::mpsc;
 
-use tokio::net;
+use tokio::{net, timer};
 use tokio::executor::current_thread;
 
 use tokio_io::AsyncRead;
 use tokio_io::codec;
-
-use tokio_timer;
 
 use serde_json;
 
@@ -207,7 +205,7 @@ fn job_to_difficulty_string(template: &BlockTemplate) -> String {
 struct StratumClient {
 	stream: mpsc::Sender<String>,
 	client_id: u64,
-	last_send: u64,
+	last_send: Instant,
 	subscribed: bool,
 }
 
@@ -229,15 +227,12 @@ impl StratumServer {
 		let mut last_prevblock = [0; 32];
 		let mut last_diff = [0; 32];
 		current_thread::spawn(job_providers.for_each(move |job| {
-			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
-
 			macro_rules! announce_str {
 				($str: expr) => {
 					us_cp.borrow_mut().clients.retain(|ref it| {
 						let mut client = it.borrow_mut();
 						if !client.subscribed { return true; }
-						client.last_send = timestamp;
+						client.last_send = Instant::now();
 						match client.stream.start_send($str.clone()) {
 							Ok(_) => true,
 							Err(_) => false
@@ -264,7 +259,7 @@ impl StratumServer {
 		}));
 
 		let us_timer = us.clone(); // Wait, you wanted a deconstructor? LOL
-		current_thread::spawn(tokio_timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(15)).for_each(move |_| {
+		current_thread::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(15)).for_each(move |_| {
 			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
@@ -282,13 +277,15 @@ impl StratumServer {
 
 			match r.jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 				Some(job) => {
+					let now = Instant::now();
+					let send_target = now - Duration::from_secs(29);
 					let job_string = job_to_json_string(&job.1.template, true);
 					for client in r.clients.iter() {
 						let mut client_ref = client.borrow_mut();
-						if client_ref.last_send < timestamp && client_ref.subscribed {
+						if client_ref.last_send < send_target && client_ref.subscribed {
 							match client_ref.stream.start_send(job_string.clone()) {
+								Ok(_) => client_ref.last_send = now,
 								Err(_) => {},
-								Ok(_) => {}
 							}
 						}
 					}
@@ -319,7 +316,7 @@ impl StratumServer {
 			let client = Rc::new(RefCell::new(StratumClient {
 				stream: send_sink,
 				client_id: us.client_id_max,
-				last_send: 0,
+				last_send: Instant::now(),
 				subscribed: false,
 			}));
 			println!("Got new client connection (id {})", us.client_id_max);
@@ -332,9 +329,6 @@ impl StratumServer {
 
 		let rc_close = rc.clone();
 		let client_ref_close = client_ref.clone();
-
-		//TODO: Set a timer for the client to always push *something* to them every 30 seconds or
-		//so, as otherwise stratum clients time out.
 
 		current_thread::spawn(rx.for_each(move |line| -> future::FutureResult<(), io::Error> {
 			let json = match serde_json::from_str::<serde_json::Value>(&line) {
@@ -398,9 +392,7 @@ impl StratumServer {
 							}
 						}, None => {}
 					}
-					let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-					let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
-					client.last_send = timestamp;
+					client.last_send = Instant::now();
 					client.subscribed = true;
 				},
 				"mining.submit" => {

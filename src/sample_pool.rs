@@ -4,7 +4,6 @@ extern crate crypto;
 extern crate futures;
 extern crate tokio;
 extern crate tokio_io;
-extern crate tokio_timer;
 extern crate secp256k1;
 
 mod msg_framing;

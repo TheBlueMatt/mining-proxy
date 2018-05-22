@@ -18,11 +18,9 @@ use futures::future::Future;
 use futures::unsync::mpsc;
 
 use tokio::executor::current_thread;
-use tokio::net;
+use tokio::{net, timer};
 
 use tokio_io::AsyncRead;
-
-use tokio_timer;
 
 use secp256k1::key::{SecretKey,PublicKey};
 use secp256k1::Secp256k1;
@@ -166,7 +164,7 @@ impl MiningServer {
 		}));
 
 		let us_timer = us.clone(); // Wait, you wanted a deconstructor? LOL
-		current_thread::spawn(tokio_timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(15)).for_each(move |_| {
+		current_thread::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(15)).for_each(move |_| {
 			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
