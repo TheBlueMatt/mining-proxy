@@ -22,6 +22,8 @@ use tokio::net;
 
 use tokio_io::AsyncRead;
 
+use tokio_timer;
+
 use secp256k1::key::{SecretKey,PublicKey};
 use secp256k1::Secp256k1;
 use secp256k1;
@@ -30,7 +32,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 
 struct MiningClient {
 	stream: mpsc::Sender<WorkMessage>,
@@ -45,7 +47,6 @@ pub struct MiningServer {
 
 	clients: Vec<Rc<RefCell<MiningClient>>>,
 	client_id_max: u64,
-	// TODO: Limit size of jobs by evicting old ones
 	jobs: BTreeMap<u64, WorkInfo>,
 }
 
@@ -161,6 +162,28 @@ impl MiningServer {
 			});
 
 			self_ref.jobs.insert(job.template.template_timestamp, job);
+			future::result(Ok(()))
+		}));
+
+		let us_timer = us.clone(); // Wait, you wanted a deconstructor? LOL
+		current_thread::spawn(tokio_timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(15)).for_each(move |_| {
+			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+
+			let mut r = us_timer.borrow_mut();
+			loop {
+				// There should be a much easier way to implement this...
+				let first_timestamp = match r.jobs.iter().next() {
+					Some((k, _)) => *k,
+					None => break,
+				};
+				if first_timestamp < timestamp {
+					r.jobs.remove(&first_timestamp);
+				}
+			}
+
+			future::result(Ok(()))
+		}).then(|_| {
 			future::result(Ok(()))
 		}));
 

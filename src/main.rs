@@ -38,8 +38,6 @@ use tokio::net;
 
 use tokio_io::{AsyncRead,codec};
 
-use tokio_timer::Timer;
-
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 
@@ -52,7 +50,7 @@ use std::{env,io,marker};
 use std::net::{SocketAddr,ToSocketAddrs};
 use std::rc::Rc;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 
 /// A future, essentially
 struct Eventual<Value> {
@@ -715,7 +713,6 @@ pub struct ConnectionMaintainer<MessageType: 'static, HandlerProvider : Connecti
 	ph : marker::PhantomData<&'static MessageType>,
 }
 
-pub static mut TIMER: Option<Timer> = None;
 impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> ConnectionMaintainer<MessageType, HandlerProvider> {
 	pub fn new(host: String, handler: HandlerProvider) -> ConnectionMaintainer<MessageType, HandlerProvider> {
 		ConnectionMaintainer {
@@ -742,8 +739,7 @@ impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> Co
 				}
 			} else { false }
 		} {
-			let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
-			current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| -> future::FutureResult<(), ()> {
+			current_thread::spawn(tokio_timer::Delay::new(Instant::now() + Duration::from_secs(10)).then(move |_| -> future::FutureResult<(), ()> {
 				Self::make_connection(rc);
 				future::result(Ok(()))
 			}));
@@ -797,8 +793,7 @@ impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> Co
 				}));
 			},
 			None => {
-				let timer: &Timer = unsafe { TIMER.as_ref().unwrap() };
-				current_thread::spawn(timer.sleep(Duration::from_secs(10)).then(move |_| {
+				current_thread::spawn(tokio_timer::Delay::new(Instant::now() + Duration::from_secs(10)).then(move |_| {
 					Self::make_connection(rc);
 					future::result(Ok(()))
 				}));
@@ -954,10 +949,6 @@ fn main() {
 	}
 	if user_auth.is_none() {
 		user_auth = Some(Vec::new());
-	}
-
-	unsafe {
-		TIMER = Some(tokio_timer::Timer::default());
 	}
 
 	let (job_tx, job_rx) = mpsc::channel(5);
