@@ -14,6 +14,26 @@ pub fn does_hash_meet_target(hash: &[u8], target: &[u8]) -> bool {
 	true
 }
 
+pub fn does_hash_meet_target_div4(hash: &[u8], target: &[u8]) -> bool {
+	assert_eq!(hash.len(), 32);
+	assert_eq!(target.len(), 32);
+
+	for i in (0..32).rev() {
+		if hash[i] > target[i] {
+			let mut hashval = hash[i] as u16;
+			let mut targetval = target[i] as u16;
+			if i > 0 {
+				hashval = ((hash[i - 1] as u16) << 8) | hashval;
+				targetval = ((target[i - 1] as u16) << 8) | targetval;
+			}
+			return targetval > hashval / 4;
+		} else if target[i] > hash[i] {
+			return true;
+		}
+	}
+	true
+}
+
 pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 	for i in (0..32).rev() {
 		if a[i] > b[i] {

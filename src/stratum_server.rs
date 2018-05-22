@@ -293,7 +293,6 @@ impl StratumServer {
 		//so, as otherwise stratum clients time out.
 
 		current_thread::spawn(rx.for_each(move |line| -> future::FutureResult<(), io::Error> {
-			println!("Got line from {}: {}", client_ref.borrow().client_id, line);
 			let json = match serde_json::from_str::<serde_json::Value>(&line) {
 				Ok(v) => {
 					if !v.is_object() {
@@ -323,7 +322,6 @@ impl StratumServer {
 						"id": msg["id"],
 						"result": $res,
 					}).to_string();
-					println!("Sending command to {}: {}", client.client_id, msg_str);
 					match client.stream.start_send(msg_str) {
 						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 						Ok(_) => {}
@@ -345,13 +343,11 @@ impl StratumServer {
 					match rc.borrow().jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 						Some(job) => {
 							let diff_string = job_to_difficulty_string(&job.1.template);
-							println!("Sending command to {}: {}", client.client_id, diff_string);
 							match client.stream.start_send(diff_string) {
 								Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 								Ok(_) => {}
 							}
 							let job_string = job_to_json_string(&job.1.template, true);
-							println!("Sending command to {}: {}", client.client_id, job_string);
 							match client.stream.start_send(job_string) {
 								Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 								Ok(_) => {}
@@ -457,6 +453,9 @@ impl StratumServer {
 									Ok(_) => {},
 									Err(_) => { panic!(); },
 								};
+								send_response!(serde_json::Value::Null, true);
+							} else if utils::does_hash_meet_target_div4(&block_hash[..], &job.template.target[..]) {
+								println!("Got work that missed target (hashed to {}, which is greater than {}), but which (probably) met the stratum diff", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&job.template.target[..]));
 								send_response!(serde_json::Value::Null, true);
 							} else {
 								println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&job.template.target[..]));
