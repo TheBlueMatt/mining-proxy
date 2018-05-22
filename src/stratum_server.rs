@@ -207,6 +207,7 @@ fn job_to_difficulty_string(template: &BlockTemplate) -> String {
 struct StratumClient {
 	stream: mpsc::Sender<String>,
 	client_id: u64,
+	last_send: u64,
 	subscribed: bool,
 }
 
@@ -228,11 +229,15 @@ impl StratumServer {
 		let mut last_prevblock = [0; 32];
 		let mut last_diff = [0; 32];
 		current_thread::spawn(job_providers.for_each(move |job| {
+			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+
 			macro_rules! announce_str {
 				($str: expr) => {
 					us_cp.borrow_mut().clients.retain(|ref it| {
 						let mut client = it.borrow_mut();
 						if !client.subscribed { return true; }
+						client.last_send = timestamp;
 						match client.stream.start_send($str.clone()) {
 							Ok(_) => true,
 							Err(_) => false
@@ -275,6 +280,21 @@ impl StratumServer {
 				}
 			}
 
+			match r.jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
+				Some(job) => {
+					let job_string = job_to_json_string(&job.1.template, true);
+					for client in r.clients.iter() {
+						let mut client_ref = client.borrow_mut();
+						if client_ref.last_send < timestamp && client_ref.subscribed {
+							match client_ref.stream.start_send(job_string.clone()) {
+								Err(_) => {},
+								Ok(_) => {}
+							}
+						}
+					}
+				}, None => {}
+			}
+
 			future::result(Ok(()))
 		}).then(|_| {
 			future::result(Ok(()))
@@ -299,6 +319,7 @@ impl StratumServer {
 			let client = Rc::new(RefCell::new(StratumClient {
 				stream: send_sink,
 				client_id: us.client_id_max,
+				last_send: 0,
 				subscribed: false,
 			}));
 			println!("Got new client connection (id {})", us.client_id_max);
@@ -377,6 +398,9 @@ impl StratumServer {
 							}
 						}, None => {}
 					}
+					let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+					let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+					client.last_send = timestamp;
 					client.subscribed = true;
 				},
 				"mining.submit" => {

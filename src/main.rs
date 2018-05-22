@@ -241,7 +241,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 				}
 
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_timestamp < template.template_timestamp {
-					println!("Received new BlockTemplate");
+					println!("Received new BlockTemplate with diff lower bound {}", utils::target_to_diff_lb(&template.target));
 					let (txn, txn_tx) = Eventual::new();
 					let cur_postfix_prefix = us.cur_prefix_postfix.clone();
 					match us.job_stream.start_send((template.clone(), cur_postfix_prefix.clone(), txn)) {
@@ -614,6 +614,8 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				return None;
 			}
 
+			let work_target = template.target.clone();
+
 			match payout_info {
 				&Some((ref info, ref difficulty)) => {
 					for output in info.appended_outputs.iter() {
@@ -654,7 +656,6 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 				}
 			}
 
-			let work_target = template.target.clone();
 			outputs.extend_from_slice(&template.appended_coinbase_outputs[..]);
 
 			template.appended_coinbase_outputs = outputs;
