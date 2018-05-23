@@ -1,6 +1,6 @@
 use msg_framing::{BlockTemplate,BlockTemplateHeader,CoinbasePrefixPostfix,WinningNonce,WorkInfo,WorkMessage,WorkMsgFramer};
-use utils
-;
+use utils;
+
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::blockdata::script::Script;
 use bitcoin::blockdata::transaction::{TxIn,Transaction};
@@ -15,9 +15,9 @@ use crypto::sha2::Sha256;
 
 use futures::{future,Stream,Sink};
 use futures::future::Future;
-use futures::unsync::mpsc;
+use futures::sync::mpsc;
 
-use tokio::executor::current_thread;
+use tokio;
 use tokio::{net, timer};
 
 use tokio_io::AsyncRead;
@@ -26,26 +26,25 @@ use secp256k1::key::{SecretKey,PublicKey};
 use secp256k1::Secp256k1;
 use secp256k1;
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 
 struct MiningClient {
 	stream: mpsc::Sender<WorkMessage>,
 	client_id: u64,
-	use_header_variants: bool,
-	handshake_complete: bool,
+	use_header_variants: AtomicBool,
+	handshake_complete: AtomicBool,
 }
 
 pub struct MiningServer {
 	secp_ctx: Secp256k1,
 	auth_key: SecretKey,
 
-	clients: Vec<Rc<RefCell<MiningClient>>>,
-	client_id_max: u64,
-	jobs: BTreeMap<u64, WorkInfo>,
+	clients: Mutex<(Vec<Arc<MiningClient>>, u64)>,
+	jobs: RwLock<BTreeMap<u64, WorkInfo>>,
 }
 
 fn work_to_coinbase_tx(template: &BlockTemplate, client_id: u64) -> Transaction {
@@ -108,28 +107,32 @@ macro_rules! sign_message {
 }
 
 impl MiningServer {
-	pub fn new(job_providers: mpsc::Receiver<WorkInfo>, auth_key: SecretKey) -> Rc<RefCell<Self>> {
-		let us = Rc::new(RefCell::new(Self {
+	pub fn new(job_providers: mpsc::Receiver<WorkInfo>, auth_key: SecretKey) -> Arc<Self> {
+		let us = Arc::new(Self {
 			secp_ctx: Secp256k1::new(),
 			auth_key: auth_key,
 
-			clients: Vec::new(),
-			client_id_max: 0,
-			jobs: BTreeMap::new(),
-		}));
+			clients: Mutex::new((Vec::new(), 0)),
+			jobs: RwLock::new(BTreeMap::new()),
+		});
 
 		let us_cp = us.clone();
 		//This is dumb, but passing the borrow checker otherwise seems hard:
 		let second_secp_ctx = Secp256k1::new();
 		let auth_key_copy = auth_key;
-		current_thread::spawn(job_providers.for_each(move |job| {
-			let mut self_ref = us_cp.borrow_mut();
-			let our_template_sig = sign_message!(job.template, 3, self_ref);
+		tokio::spawn(job_providers.for_each(move |job| {
+			let our_template_sig = sign_message!(job.template, 3, us_cp);
 
-			self_ref.clients.retain(|ref it| {
-				let mut client = it.borrow_mut();
-				if !client.handshake_complete { return true; }
-				if client.use_header_variants {
+			{
+				let mut jobs = us_cp.jobs.write().unwrap();
+				jobs.insert(job.template.template_timestamp, job.clone());
+			}
+
+			let clients = us_cp.clients.lock().unwrap().0.clone();
+			for client in clients {
+				if !client.handshake_complete.load(Ordering::Acquire) { continue; }
+				let mut client_stream = client.stream.clone();
+				if client.use_header_variants.load(Ordering::Acquire) {
 					let template_header = BlockTemplateHeader {
 						template_timestamp: job.template.template_timestamp,
 						template_variant: client.client_id,
@@ -141,42 +144,35 @@ impl MiningServer {
 						header_time: job.template.header_time,
 						header_nbits: job.template.header_nbits,
 					};
-					match client.stream.start_send(WorkMessage::BlockTemplateHeader {
+					let _ = client_stream.start_send(WorkMessage::BlockTemplateHeader {
 						signature: sign_message_ctx!(template_header, 8, second_secp_ctx, auth_key_copy),
 						template: template_header,
-					}) {
-						Ok(_) => true,
-						Err(_) => false
-					}
+					});
 				} else {
-					match client.stream.start_send(WorkMessage::BlockTemplate {
+					let _ = client_stream.start_send(WorkMessage::BlockTemplate {
 						signature: our_template_sig.clone(),
 						template: (*job.template).clone(),
-					}) {
-						Ok(_) => true,
-						Err(_) => false
-					}
+					});
 				}
-			});
+			}
 
-			self_ref.jobs.insert(job.template.template_timestamp, job);
 			future::result(Ok(()))
 		}));
 
 		let us_timer = us.clone(); // Wait, you wanted a deconstructor? LOL
-		current_thread::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(15)).for_each(move |_| {
+		tokio::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(1)).for_each(move |_| {
 			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
-			let mut r = us_timer.borrow_mut();
-			loop {
+			let mut jobs = us_timer.jobs.write().unwrap();
+			while jobs.len() > 1 {
 				// There should be a much easier way to implement this...
-				let first_timestamp = match r.jobs.iter().next() {
+				let first_timestamp = match jobs.iter().next() {
 					Some((k, _)) => *k,
 					None => break,
 				};
 				if first_timestamp < timestamp {
-					r.jobs.remove(&first_timestamp);
+					jobs.remove(&first_timestamp);
 				} else { break; }
 			}
 
@@ -188,45 +184,45 @@ impl MiningServer {
 		us
 	}
 
-	pub fn new_connection(rc: Rc<RefCell<Self>>, stream: net::TcpStream) {
+	pub fn new_connection(us: Arc<Self>, stream: net::TcpStream) {
 		stream.set_nodelay(true).unwrap();
 
 		let (tx, rx) = stream.framed(WorkMsgFramer::new()).split();
 
-		let client_ref = {
+		let (client, mut send_sink) = {
 			let (send_sink, send_stream) = mpsc::channel(5);
-			current_thread::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
+			tokio::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
 				panic!("mpsc streams cant generate errors!");
 			})).then(|_| {
 				future::result(Ok(()))
 			}));
+			let mut sink_dup = send_sink.clone();
 
-			let mut us = rc.borrow_mut();
-			let client = Rc::new(RefCell::new(MiningClient {
+			let mut client_list = us.clients.lock().unwrap();
+			let client = Arc::new(MiningClient {
 				stream: send_sink,
-				client_id: us.client_id_max,
-				use_header_variants: false,
-				handshake_complete: false,
-			}));
-			println!("Got new client connection (id {})", us.client_id_max);
-			us.client_id_max += 1;
+				client_id: client_list.1,
+				use_header_variants: AtomicBool::new(false),
+				handshake_complete: AtomicBool::new(false),
+			});
+			println!("Got new client connection (id {})", client_list.1);
+			client_list.1 += 1;
 
 			let client_ref = client.clone();
-			us.clients.push(client);
-			client_ref
+			client_list.0.push(client);
+			(client_ref, sink_dup)
 		};
 
-		let rc_close = rc.clone();
-		let client_ref_close = client_ref.clone();
+		let client_close = client.clone();
+		let us_close = us.clone();
 
 		//TODO: Set a timer for the client to always push *something* to them every 30 seconds or
 		//so, as otherwise stratum clients time out.
 
-		current_thread::spawn(rx.for_each(move |msg| -> future::FutureResult<(), io::Error> {
-			let mut client = client_ref.borrow_mut();
+		tokio::spawn(rx.for_each(move |msg| -> future::FutureResult<(), io::Error> {
 			macro_rules! send_response {
 				($msg: expr) => {
-					match client.stream.start_send($msg) {
+					match send_sink.start_send($msg) {
 						Ok(_) => {},
 						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)))
 					}
@@ -241,15 +237,12 @@ impl MiningServer {
 						// We don't support clients setting their own payout information
 						return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 					}
-					client.use_header_variants = (flags & 0b11) == 0b11;
-					client.handshake_complete = true;
-					let us = rc.borrow();
 					send_response!(WorkMessage::ProtocolVersion {
 						selected_version: 1,
 						flags: if (flags & 0b11) == 0b11 { 0b11 } else { 0b01 },
 						auth_key: PublicKey::from_secret_key(&us.secp_ctx, &us.auth_key).unwrap(),
 					});
-					if !client.use_header_variants {
+					if !client.use_header_variants.load(Ordering::Acquire) {
 						let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 						let prefix_postfix = CoinbasePrefixPostfix {
 							timestamp: time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000,
@@ -261,7 +254,8 @@ impl MiningServer {
 							coinbase_prefix_postfix: prefix_postfix,
 						});
 					}
-					match rc.borrow().jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
+					let jobs = us.jobs.read().unwrap();
+					match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 						Some(job) => {
 							send_response!(WorkMessage::BlockTemplate {
 								signature: sign_message!(job.1.template, 3, us),
@@ -269,6 +263,8 @@ impl MiningServer {
 							});
 						}, None => {}
 					}
+					client.use_header_variants.store((flags & 0b11) == 0b11, Ordering::Release);
+					client.handshake_complete.store(true, Ordering::Release);
 				},
 				WorkMessage::ProtocolVersion { .. } => {
 					println!("Received ProtocolVersion?");
@@ -279,7 +275,8 @@ impl MiningServer {
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::WinningNonce { nonces } => {
-					match rc.borrow().jobs.get(&nonces.template_timestamp) {
+					let jobs = us.jobs.read().unwrap();
+					match jobs.get(&nonces.template_timestamp) {
 						Some(job) => {
 							let block_hash = BlockHeader {
 								version: nonces.header_version,
@@ -291,7 +288,7 @@ impl MiningServer {
 							}.bitcoin_hash();
 
 							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
-								match job.solutions.unbounded_send(Rc::new((nonces, block_hash))) {
+								match job.solutions.unbounded_send(Arc::new((nonces, block_hash))) {
 									Ok(_) => {},
 									Err(_) => { panic!(); },
 								};
@@ -322,7 +319,8 @@ impl MiningServer {
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::WinningNonceHeader { template_timestamp, template_variant, header_version, header_time, header_nonce, user_tag } => {
-					match rc.borrow().jobs.get(&template_timestamp) {
+					let jobs = us.jobs.read().unwrap();
+					match jobs.get(&template_timestamp) {
 						Some(job) => {
 							let block_hash = BlockHeader {
 								version: header_version,
@@ -334,7 +332,7 @@ impl MiningServer {
 							}.bitcoin_hash();
 
 							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
-								match job.solutions.unbounded_send(Rc::new((WinningNonce {
+								match job.solutions.unbounded_send(Arc::new((WinningNonce {
 									template_timestamp,
 									header_version,
 									header_time,
@@ -357,11 +355,11 @@ impl MiningServer {
 			}
 			future::result(Ok(()))
 		}).then(move |_| {
-			let mut us = rc_close.borrow_mut();
-			us.clients.retain(|client| {
-				!Rc::ptr_eq(&client_ref_close, client)
+			let mut clients = us_close.clients.lock().unwrap();
+			clients.0.retain(|client| {
+				!Arc::ptr_eq(&client_close, client)
 			});
-			println!("Client {} disconnected, now have {} clients!", client_ref_close.borrow().client_id, us.clients.len());
+			println!("Client {} disconnected, now have {} clients!", client_close.client_id, clients.0.len());
 			future::result(Ok(()))
 		}));
 	}

@@ -25,7 +25,6 @@ use crypto::sha2::Sha256;
 use futures::{future,Stream,Sink,Future};
 use futures::sync::mpsc;
 
-use tokio::executor::current_thread;
 use tokio::net;
 
 use tokio_io::AsyncRead;
@@ -47,6 +46,7 @@ fn share_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64) {
 }
 
 const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
+const WEAK_BLOCK_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
 fn main() {
 	println!("USAGE: sample-pool --listen_bind=IP:port --auth_key=base58privkey --payout_address=addr [--server_id=up_to_36_byte_string_for_coinbase]");
 	println!("--listen_bind - the address to bind to");
@@ -237,7 +237,7 @@ fn main() {
 
 								let difficulty = PoolDifficulty {
 									share_target: SHARE_TARGET,
-									weak_block_target: [0; 32],
+									weak_block_target: WEAK_BLOCK_TARGET,
 								};
 								send_response!(PoolMessage::ShareDifficulty {
 									signature: sign_message!(difficulty, 12),
@@ -311,8 +311,7 @@ fn main() {
 								}
 							},
 							PoolMessage::WeakBlock { .. } => {
-								println!("Got WeakBlock with infinite difficulty?");
-								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								unimplemented!();
 							},
 							PoolMessage::WeakBlockStateReset { } => {
 								println!("Got WeakBlockStateReset?");

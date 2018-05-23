@@ -12,24 +12,24 @@ use crypto::sha2::Sha256;
 
 use futures::{future,Future,Sink};
 use futures::stream::Stream;
-use futures::unsync::mpsc;
+use futures::sync::mpsc;
 
+use tokio;
 use tokio::{net, timer};
-use tokio::executor::current_thread;
 
 use tokio_io::AsyncRead;
 use tokio_io::codec;
 
 use serde_json;
 
-use std::cell::RefCell;
 use std::char;
 use std::cmp;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 
 #[derive(Debug)]
@@ -205,40 +205,29 @@ fn job_to_difficulty_string(template: &BlockTemplate) -> String {
 struct StratumClient {
 	stream: mpsc::Sender<String>,
 	client_id: u64,
-	last_send: Instant,
-	subscribed: bool,
+	last_send: Mutex<Instant>,
+	subscribed: AtomicBool,
 }
 
 pub struct StratumServer {
-	clients: Vec<Rc<RefCell<StratumClient>>>,
-	client_id_max: u64,
-	jobs: BTreeMap<u64, WorkInfo>,
+	clients: Mutex<(Vec<Arc<StratumClient>>, u64)>,
+	jobs: RwLock<BTreeMap<u64, WorkInfo>>,
 }
 
 impl StratumServer {
-	pub fn new(job_providers: mpsc::Receiver<WorkInfo>) -> Rc<RefCell<Self>> {
-		let us = Rc::new(RefCell::new(Self {
-			clients: Vec::new(),
-			client_id_max: 0,
-			jobs: BTreeMap::new(),
-		}));
+	pub fn new(job_providers: mpsc::Receiver<WorkInfo>) -> Arc<Self> {
+		let us = Arc::new(Self {
+			clients: Mutex::new((Vec::new(), 0)),
+			jobs: RwLock::new(BTreeMap::new()),
+		});
 
 		let us_cp = us.clone();
 		let mut last_prevblock = [0; 32];
 		let mut last_diff = [0; 32];
-		current_thread::spawn(job_providers.for_each(move |job| {
-			macro_rules! announce_str {
-				($str: expr) => {
-					us_cp.borrow_mut().clients.retain(|ref it| {
-						let mut client = it.borrow_mut();
-						if !client.subscribed { return true; }
-						client.last_send = Instant::now();
-						match client.stream.start_send($str.clone()) {
-							Ok(_) => true,
-							Err(_) => false
-						}
-					});
-				}
+		tokio::spawn(job_providers.for_each(move |job| {
+			{
+				let mut jobs = us_cp.jobs.write().unwrap();
+				jobs.insert(job.template.template_timestamp, job.clone());
 			}
 
 			let prev_changed = last_prevblock != job.template.header_prevblock;
@@ -246,49 +235,61 @@ impl StratumServer {
 				last_prevblock = job.template.header_prevblock;
 			}
 			let diff_changed = last_diff != job.template.target;
+			let mut diff_str = String::new();
 			if diff_changed {
 				last_diff = job.template.target;
-				let diff_str = job_to_difficulty_string(&job.template);
-				announce_str!(diff_str);
+				diff_str = job_to_difficulty_string(&job.template);
+			}
+			let job_json = job_to_json_string(&job.template, prev_changed);
+
+			let clients = us_cp.clients.lock().unwrap().0.clone();
+			for client in clients {
+				if !client.subscribed.load(Ordering::Acquire) { continue; }
+				let mut client_stream = client.stream.clone();
+				if diff_changed {
+					let _ = client_stream.start_send(diff_str.clone());
+				}
+				let _ = client_stream.start_send(job_json.clone());
+				*client.last_send.lock().unwrap() = Instant::now();
 			}
 
-			let job_json = job_to_json_string(&job.template, prev_changed);
-			announce_str!(job_json);
-			us_cp.borrow_mut().jobs.insert(job.template.template_timestamp, job);
 			future::result(Ok(()))
 		}));
 
 		let us_timer = us.clone(); // Wait, you wanted a deconstructor? LOL
-		current_thread::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(15)).for_each(move |_| {
+		tokio::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(1)).for_each(move |_| {
 			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
-			let mut r = us_timer.borrow_mut();
-			loop {
-				// There should be a much easier way to implement this...
-				let first_timestamp = match r.jobs.iter().next() {
-					Some((k, _)) => *k,
-					None => break,
-				};
-				if first_timestamp < timestamp {
-					r.jobs.remove(&first_timestamp);
-				} else { break; }
-			}
+			let last_job = {
+				let mut jobs = us_timer.jobs.write().unwrap();
+				while jobs.len() > 1 {
+					// There should be a much easier way to implement this...
+					let first_timestamp = match jobs.iter().next() {
+						Some((k, _)) => *k,
+						None => break,
+					};
+					if first_timestamp < timestamp {
+						jobs.remove(&first_timestamp);
+					} else { break; }
+				}
+				match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
+					Some((_, v)) => Some(v.clone()),
+					None => None,
+				}
+			};
 
-			match r.jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
+			match last_job {
 				Some(job) => {
 					let now = Instant::now();
 					let send_target = now - Duration::from_secs(29);
-					let job_string = job_to_json_string(&job.1.template, true);
-					let diff_string = job_to_difficulty_string(&job.1.template);
-					for client in r.clients.iter() {
-						let mut client_ref = client.borrow_mut();
-						if client_ref.last_send < send_target && client_ref.subscribed {
-							match client_ref.stream.start_send(diff_string.clone()) {
-								Ok(_) => match client_ref.stream.start_send(job_string.clone()) {
-										Ok(_) => client_ref.last_send = now,
-										Err(_) => {},
-									},
+					let job_string = job_to_json_string(&job.template, false);
+					let mut clients = us_timer.clients.lock().unwrap().0.clone();
+					for client in clients.iter() {
+						if client.subscribed.load(Ordering::Acquire) && *client.last_send.lock().unwrap() < send_target {
+							let mut client_stream = client.stream.clone();
+							match client_stream.start_send(job_string.clone()) {
+								Ok(_) => *client.last_send.lock().unwrap() = now,
 								Err(_) => {},
 							}
 						}
@@ -303,38 +304,40 @@ impl StratumServer {
 		us
 	}
 
-	pub fn new_connection(rc: Rc<RefCell<Self>>, stream: net::TcpStream) {
+	pub fn new_connection(us: Arc<Self>, stream: net::TcpStream) {
 		stream.set_nodelay(true).unwrap();
 
 		let (tx, rx) = stream.framed(codec::LinesCodec::new()).split();
 
-		let client_ref = {
+		let (client, mut send_sink) = {
 			let (send_sink, send_stream) = mpsc::channel(5);
-			current_thread::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
+			tokio::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
 				panic!("mpsc streams cant generate errors!");
 			})).then(|_| {
 				future::result(Ok(()))
 			}));
 
-			let mut us = rc.borrow_mut();
-			let client = Rc::new(RefCell::new(StratumClient {
+			let sink_dup = send_sink.clone();
+
+			let mut client_list = us.clients.lock().unwrap();
+			let client = Arc::new(StratumClient {
 				stream: send_sink,
-				client_id: us.client_id_max,
-				last_send: Instant::now(),
-				subscribed: false,
-			}));
-			println!("Got new client connection (id {})", us.client_id_max);
-			us.client_id_max += 1;
+				client_id: client_list.1,
+				last_send: Mutex::new(Instant::now()),
+				subscribed: AtomicBool::new(false),
+			});
+			println!("Got new client connection (id {})", client_list.1);
+			client_list.1 += 1;
 
 			let client_ref = client.clone();
-			us.clients.push(client);
-			client_ref
+			client_list.0.push(client);
+			(client_ref, sink_dup)
 		};
 
-		let rc_close = rc.clone();
-		let client_ref_close = client_ref.clone();
+		let client_close = client.clone();
+		let us_close = us.clone();
 
-		current_thread::spawn(rx.for_each(move |line| -> future::FutureResult<(), io::Error> {
+		tokio::spawn(rx.for_each(move |line| -> future::FutureResult<(), io::Error> {
 			let json = match serde_json::from_str::<serde_json::Value>(&line) {
 				Ok(v) => {
 					if !v.is_object() {
@@ -355,8 +358,6 @@ impl StratumServer {
 				return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError)));
 			}
 
-			let mut client = client_ref.borrow_mut();
-
 			macro_rules! send_response {
 				($err: expr, $res: tt) => {
 					let msg_str = json!({
@@ -364,7 +365,7 @@ impl StratumServer {
 						"id": msg["id"],
 						"result": $res,
 					}).to_string();
-					match client.stream.start_send(msg_str) {
+					match send_sink.start_send(msg_str) {
 						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 						Ok(_) => {}
 					}
@@ -382,22 +383,23 @@ impl StratumServer {
 							client_id_str,
 							EXTRANONCE2_SIZE,
 						]);
-					match rc.borrow().jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
+					let jobs = us.jobs.read().unwrap();
+					match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 						Some(job) => {
 							let diff_string = job_to_difficulty_string(&job.1.template);
-							match client.stream.start_send(diff_string) {
+							match send_sink.start_send(diff_string) {
 								Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 								Ok(_) => {}
 							}
 							let job_string = job_to_json_string(&job.1.template, true);
-							match client.stream.start_send(job_string) {
+							match send_sink.start_send(job_string) {
 								Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 								Ok(_) => {}
 							}
 						}, None => {}
 					}
-					client.last_send = Instant::now();
-					client.subscribed = true;
+					*client.last_send.lock().unwrap() = Instant::now();
+					client.subscribed.store(true, Ordering::Release);
 				},
 				"mining.submit" => {
 					if !msg["params"].is_array() || msg["params"].as_array().unwrap().len() < 5 {
@@ -429,7 +431,8 @@ impl StratumServer {
 						Ok(nonce) => nonce,
 					};
 
-					match rc.borrow().jobs.get(&job_id) {
+					let jobs = us.jobs.read().unwrap();
+					match jobs.get(&job_id) {
 						Some(job) => {
 							let version = if params.len() >= 6 {
 								match hex_to_be32(params[5].as_str().unwrap()) {
@@ -485,7 +488,7 @@ impl StratumServer {
 							let user_tag = user_tag_bytes[0..cmp::min(user_tag_bytes.len(), 255)].to_vec();
 
 							if utils::does_hash_meet_target(&block_hash[..], &job.template.target[..]) {
-								match job.solutions.unbounded_send(Rc::new((WinningNonce {
+								match job.solutions.unbounded_send(Arc::new((WinningNonce {
 									template_timestamp: job.template.template_timestamp,
 									header_version: version,
 									header_time: time,
@@ -561,11 +564,11 @@ impl StratumServer {
 			};
 			future::result(Ok(()))
 		}).then(move |_| {
-			let mut us = rc_close.borrow_mut();
-			us.clients.retain(|client| {
-				!Rc::ptr_eq(&client_ref_close, client)
+			let mut clients = us_close.clients.lock().unwrap();
+			clients.0.retain(|client| {
+				!Arc::ptr_eq(&client_close, client)
 			});
-			println!("Client {} disconnected, now have {} clients!", client_ref_close.borrow().client_id, us.clients.len());
+			println!("Client {} disconnected, now have {} clients!", client_close.client_id, clients.0.len());
 			future::result(Ok(()))
 		}));
 	}

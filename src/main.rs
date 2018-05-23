@@ -29,10 +29,9 @@ use bitcoin::util::hash::Sha256dHash;
 use bytes::BufMut;
 
 use futures::future;
-use futures::unsync::{mpsc,oneshot};
+use futures::sync::{mpsc,oneshot};
 use futures::{Future,Stream,Sink};
 
-use tokio::executor::current_thread;
 use tokio::{net, timer};
 
 use tokio_io::{AsyncRead,codec};
@@ -43,11 +42,10 @@ use crypto::sha2::Sha256;
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::{env,io,marker};
 use std::net::{SocketAddr,ToSocketAddrs};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 
@@ -55,24 +53,25 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 struct Eventual<Value> {
 	// We dont really want Fn here, we want FnOnce, but we can't because that'd require a move of
 	// the function onto stack, which is of unknown size, so we cant...
-	callees: Vec<Box<Fn(&Value)>>,
-	value: Option<Value>,
+	callees: Mutex<Vec<Box<Fn(&Value) + Send>>>,
+	value: RwLock<Option<Value>>,
 }
-impl<Value: 'static> Eventual<Value> {
-	fn new() -> (Rc<RefCell<Self>>, oneshot::Sender<Value>) {
-		let us = Rc::new(RefCell::new(Self {
-			callees: Vec::new(),
-			value: None,
-		}));
+impl<Value: 'static + Send + Sync> Eventual<Value> {
+	fn new() -> (Arc<Self>, oneshot::Sender<Value>) {
+		let us = Arc::new(Self {
+			callees: Mutex::new(Vec::new()),
+			value: RwLock::new(None),
+		});
 		let (tx, rx) = oneshot::channel();
-		let us_ref = us.clone();
-		current_thread::spawn(rx.and_then(move |res| {
-			let mut us = us_ref.borrow_mut();
-			for callee in us.callees.iter() {
-				(callee)(&res);
+		let us_rx = us.clone();
+		tokio::spawn(rx.and_then(move |res| {
+			*us_rx.value.write().unwrap() = Some(res);
+			let v_lock = us_rx.value.read().unwrap();
+			let v = v_lock.as_ref().unwrap();
+			for callee in us_rx.callees.lock().unwrap().iter() {
+				(callee)(v);
 			}
-			us.callees.clear();
-			us.value = Some(res);
+			us_rx.callees.lock().unwrap().clear();
 			future::result(Ok(()))
 		}).then(|_| {
 			future::result(Ok(()))
@@ -80,19 +79,21 @@ impl<Value: 'static> Eventual<Value> {
 		(us, tx)
 	}
 
-	fn get_and(&mut self, then: Box<Fn(&Value)>) {
-		match &self.value {
+	fn get_and<F: Fn(&Value) + 'static + Send>(&self, then: F) {
+		let value = self.value.read().unwrap();
+		match &(*value) {
 			&Some(ref value) => {
 				then(value);
+				return;
 			},
 			&None => {
-				self.callees.push(then);
+				self.callees.lock().unwrap().push(Box::new(then));
 			},
 		}
 	}
 }
 
-pub struct JobProviderHandler {
+struct JobProviderState {
 	stream: Option<mpsc::UnboundedSender<WorkMessage>>,
 	auth_key: Option<PublicKey>,
 
@@ -100,31 +101,36 @@ pub struct JobProviderHandler {
 	cur_prefix_postfix: Option<CoinbasePrefixPostfix>,
 
 	pending_tx_data_requests: HashMap<u64, oneshot::Sender<TransactionData>>,
-	job_stream: mpsc::Sender<(BlockTemplate, Option<CoinbasePrefixPostfix>, Rc<RefCell<Eventual<TransactionData>>>)>,
+	job_stream: mpsc::Sender<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>,
+}
 
+pub struct JobProviderHandler {
+	state: Mutex<JobProviderState>,
 	secp_ctx: Secp256k1,
 }
 
 impl JobProviderHandler {
-	fn new(expected_auth_key: Option<PublicKey>) -> (Rc<RefCell<JobProviderHandler>>, mpsc::Receiver<(BlockTemplate, Option<CoinbasePrefixPostfix>, Rc<RefCell<Eventual<TransactionData>>>)>) {
+	fn new(expected_auth_key: Option<PublicKey>) -> (Arc<JobProviderHandler>, mpsc::Receiver<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>) {
 		let (work_sender, work_receiver) = mpsc::channel(10);
 
-		(Rc::new(RefCell::new(JobProviderHandler {
-			stream: None,
-			auth_key: expected_auth_key,
+		(Arc::new(JobProviderHandler {
+			state: Mutex::new(JobProviderState {
+				stream: None,
+				auth_key: expected_auth_key,
 
-			cur_template: None,
-			cur_prefix_postfix: None,
+				cur_template: None,
+				cur_prefix_postfix: None,
 
-			pending_tx_data_requests: HashMap::new(),
-			job_stream: work_sender,
-
+				pending_tx_data_requests: HashMap::new(),
+				job_stream: work_sender,
+			}),
 			secp_ctx: Secp256k1::new(),
-		})), work_receiver)
+		}), work_receiver)
 	}
 
-	fn send_nonce(&mut self, work: WinningNonce) {
-		match &self.stream {
+	fn send_nonce(&self, work: WinningNonce) {
+		let state = self.state.lock().unwrap();
+		match &state.stream {
 			&Some(ref stream) => {
 				match stream.unbounded_send(WorkMessage::WinningNonce {
 					nonces: work
@@ -140,13 +146,11 @@ impl JobProviderHandler {
 	}
 }
 
-impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
+impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 	type Stream = mpsc::UnboundedReceiver<WorkMessage>;
 	type Framer = WorkMsgFramer;
 
-	fn new_connection(&mut self) -> (WorkMsgFramer, mpsc::UnboundedReceiver<WorkMessage>) {
-		let mut us = self.borrow_mut();
-
+	fn new_connection(&self) -> (WorkMsgFramer, mpsc::UnboundedReceiver<WorkMessage>) {
 		let (mut tx, rx) = mpsc::unbounded();
 		match tx.start_send(WorkMessage::ProtocolSupport {
 			max_version: 1,
@@ -154,19 +158,20 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 			flags: 0,
 		}) {
 			Ok(_) => {
-				us.stream = Some(tx);
+				self.state.lock().unwrap().stream = Some(tx);
 			},
 			Err(_) => { panic!("Cant fail to send first message on an unbounded stream"); },
 		}
 		(WorkMsgFramer::new(), rx)
 	}
 
-	fn connection_closed(&mut self) {
-		self.borrow_mut().stream = None;
+	fn connection_closed(&self) {
+		self.state.lock().unwrap().stream = None;
 	}
 
-	fn handle_message(&mut self, msg: WorkMessage) -> Result<(), io::Error> {
-		let mut us = self.borrow_mut();
+	fn handle_message(&self, msg: WorkMessage) -> Result<(), io::Error> {
+		let mut us = self.state.lock().unwrap();
+		if us.stream.is_none() { return Ok(()); }
 
 		macro_rules! check_msg_sig {
 			($msg_type: expr, $msg: expr, $signature: expr) => {
@@ -183,7 +188,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 					};
 
 					match us.auth_key {
-						Some(pubkey) => match us.secp_ctx.verify(&hash, &$signature, &pubkey) {
+						Some(pubkey) => match self.secp_ctx.verify(&hash, &$signature, &pubkey) {
 							Ok(()) => {},
 							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
 						},
@@ -348,7 +353,7 @@ impl ConnectionHandler<WorkMessage> for Rc<RefCell<JobProviderHandler>> {
 	}
 }
 
-struct PoolHandler {
+struct PoolHandlerState {
 	pool_priority: usize,
 	stream: Option<mpsc::UnboundedSender<PoolMessage>>,
 	auth_key: Option<PublicKey>,
@@ -358,48 +363,53 @@ struct PoolHandler {
 
 	cur_payout_info: Option<PoolPayoutInfo>,
 	cur_difficulty: Option<PoolDifficulty>,
-	last_weak_block: Option<WeakBlock>,
+	last_weak_block: Option<Vec<Transaction>>,
 
 	job_stream: mpsc::Sender<(PoolPayoutInfo, Option<PoolDifficulty>)>,
+}
 
+struct PoolHandler {
+	state: Mutex<PoolHandlerState>,
 	secp_ctx: Secp256k1,
 }
 
 impl PoolHandler {
-	fn new(expected_auth_key: Option<PublicKey>, user_id: Vec<u8>, user_auth: Vec<u8>, pool_priority: usize) -> (Rc<RefCell<PoolHandler>>, mpsc::Receiver<(PoolPayoutInfo, Option<PoolDifficulty>)>) {
+	fn new(expected_auth_key: Option<PublicKey>, user_id: Vec<u8>, user_auth: Vec<u8>, pool_priority: usize) -> (Arc<PoolHandler>, mpsc::Receiver<(PoolPayoutInfo, Option<PoolDifficulty>)>) {
 		let (work_sender, work_receiver) = mpsc::channel(5);
 
-		(Rc::new(RefCell::new(PoolHandler {
-			pool_priority: pool_priority,
-			stream: None,
-			auth_key: expected_auth_key,
+		(Arc::new(PoolHandler {
+			state: Mutex::new(PoolHandlerState {
+				pool_priority: pool_priority,
+				stream: None,
+				auth_key: expected_auth_key,
 
-			user_id,
-			user_auth,
+				user_id,
+				user_auth,
 
-			cur_payout_info: None,
-			cur_difficulty: None,
-			last_weak_block: None,
+				cur_payout_info: None,
+				cur_difficulty: None,
+				last_weak_block: None,
 
-			job_stream: work_sender,
-
+				job_stream: work_sender,
+			}),
 			secp_ctx: Secp256k1::new(),
-		})), work_receiver)
+		}), work_receiver)
 	}
 
 	fn is_connected(&self) -> bool {
-		self.stream.is_some()
+		self.state.lock().unwrap().stream.is_some()
 	}
 
 	fn get_priority(&self) -> usize {
-		self.pool_priority
+		self.state.lock().unwrap().pool_priority
 	}
 
-	fn send_nonce(&mut self, work: &(WinningNonce, Sha256dHash), template: &Rc<BlockTemplate>, post_coinbase_txn: &Vec<Transaction>) {
-		match self.cur_difficulty {
+	fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<Transaction>) {
+		let us = self.state.lock().unwrap();
+		match us.cur_difficulty {
 			Some(ref difficulty) => {
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.share_target[..]) {
-					match self.stream {
+					match us.stream {
 						Some(ref stream) => {
 							match stream.unbounded_send(PoolMessage::Share {
 								share: PoolShare {
@@ -423,7 +433,14 @@ impl PoolHandler {
 					}
 				}
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.weak_block_target[..]) {
-					//TODO
+					match us.last_weak_block {
+						Some(ref last_weak_block) => {
+							//TODO
+						},
+						None => {
+							//TODO
+						},
+					}
 				}
 			},
 			None => {
@@ -433,12 +450,12 @@ impl PoolHandler {
 	}
 }
 
-impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
+impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 	type Stream = mpsc::UnboundedReceiver<PoolMessage>;
 	type Framer = PoolMsgFramer;
 
-	fn new_connection(&mut self) -> (PoolMsgFramer, mpsc::UnboundedReceiver<PoolMessage>) {
-		let mut us = self.borrow_mut();
+	fn new_connection(&self) -> (PoolMsgFramer, mpsc::UnboundedReceiver<PoolMessage>) {
+		let mut us = self.state.lock().unwrap();
 
 		let (mut tx, rx) = mpsc::unbounded();
 		match tx.start_send(PoolMessage::ProtocolSupport {
@@ -456,12 +473,13 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 		(PoolMsgFramer::new(), rx)
 	}
 
-	fn connection_closed(&mut self) {
-		self.borrow_mut().stream = None;
+	fn connection_closed(&self) {
+		self.state.lock().unwrap().stream = None;
 	}
 
-	fn handle_message(&mut self, msg: PoolMessage) -> Result<(), io::Error> {
-		let mut us = self.borrow_mut();
+	fn handle_message(&self, msg: PoolMessage) -> Result<(), io::Error> {
+		let mut us = self.state.lock().unwrap();
+		if us.stream.is_none() { return Ok(()); }
 
 		macro_rules! check_msg_sig {
 			($msg_type: expr, $msg: expr, $signature: expr) => {
@@ -478,7 +496,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 					};
 
 					match us.auth_key {
-						Some(pubkey) => match us.secp_ctx.verify(&hash, &$signature, &pubkey) {
+						Some(pubkey) => match self.secp_ctx.verify(&hash, &$signature, &pubkey) {
 							Ok(()) => {},
 							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError))
 						},
@@ -588,7 +606,7 @@ impl ConnectionHandler<PoolMessage> for Rc<RefCell<PoolHandler>> {
 	}
 }
 
-fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Rc<RefCell<Eventual<TransactionData>>>)>, job_source: Option<Rc<RefCell<JobProviderHandler>>>, payout_info: &Option<(PoolPayoutInfo, Option<PoolDifficulty>)>, payout_source: Option<Rc<RefCell<PoolHandler>>>) -> Option<WorkInfo> {
+fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>, job_source: Option<Arc<JobProviderHandler>>, payout_info: &Option<(PoolPayoutInfo, Option<PoolDifficulty>)>, payout_source: Option<Arc<PoolHandler>>) -> Option<WorkInfo> {
 	match job_info {
 		&Some((ref template_ref, ref coinbase_prefix_postfix, ref tx_data)) => {
 			let mut template = template_ref.clone();
@@ -659,16 +677,16 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 
 			template.appended_coinbase_outputs = outputs;
 
-			let template_rc = Rc::new(template);
+			let template_rc = Arc::new(template);
 
 			let (solution_tx, solution_rx) = mpsc::unbounded();
 			let tx_data_ref = tx_data.clone();
 			let template_ref = template_rc.clone();
-			current_thread::spawn(solution_rx.for_each(move |nonces: Rc<(WinningNonce, Sha256dHash)>| {
+			tokio::spawn(solution_rx.for_each(move |nonces: Arc<(WinningNonce, Sha256dHash)>| {
 				match job_source {
 					Some(ref source) => {
 						if utils::does_hash_meet_target(&nonces.1[..], &work_target[..]) {
-							source.borrow_mut().send_nonce(nonces.0.clone());
+							source.send_nonce(nonces.0.clone());
 						}
 					},
 					None => {}
@@ -677,10 +695,10 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 					Some(ref source) => {
 						let source_ref = source.clone();
 						let template_ref_2 = template_ref.clone();
-						tx_data_ref.borrow_mut().get_and(Box::new(move |txn| {
+						tx_data_ref.get_and(move |txn| {
 							let source_clone = source_ref.clone();
-							source_clone.borrow_mut().send_nonce(&nonces, &template_ref_2, &txn.transactions);
-						}));
+							source_clone.send_nonce(&nonces, &template_ref_2, &txn.transactions);
+						});
 					},
 					None => {}
 				}
@@ -699,21 +717,21 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 }
 
 pub trait ConnectionHandler<MessageType> {
-	type Stream : Stream<Item = MessageType>;
-	type Framer : codec::Encoder<Item = MessageType, Error = io::Error> + codec::Decoder<Item = MessageType, Error = io::Error>;
-	fn new_connection(&mut self) -> (Self::Framer, Self::Stream);
-	fn handle_message(&mut self, msg: MessageType) -> Result<(), io::Error>;
-	fn connection_closed(&mut self);
+	type Stream : Stream<Item = MessageType> + Send;
+	type Framer : codec::Encoder<Item = MessageType, Error = io::Error> + codec::Decoder<Item = MessageType, Error = io::Error> + Send;
+	fn new_connection(&self) -> (Self::Framer, Self::Stream);
+	fn handle_message(&self, msg: MessageType) -> Result<(), io::Error>;
+	fn connection_closed(&self);
 }
 
-pub struct ConnectionMaintainer<MessageType: 'static, HandlerProvider : ConnectionHandler<MessageType>> {
+pub struct ConnectionMaintainer<MessageType: 'static + Send, HandlerProvider : ConnectionHandler<MessageType>> {
 	host: String,
 	cur_addrs: Option<Vec<SocketAddr>>,
 	handler: HandlerProvider,
 	ph : marker::PhantomData<&'static MessageType>,
 }
 
-impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> ConnectionMaintainer<MessageType, HandlerProvider> {
+impl<MessageType : Send + Sync, HandlerProvider : 'static + ConnectionHandler<MessageType> + Send + Sync> ConnectionMaintainer<MessageType, HandlerProvider> {
 	pub fn new(host: String, handler: HandlerProvider) -> ConnectionMaintainer<MessageType, HandlerProvider> {
 		ConnectionMaintainer {
 			host: host,
@@ -723,34 +741,32 @@ impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> Co
 		}
 	}
 
-	pub fn make_connection(rc: Rc<RefCell<Self>>) {
+	pub fn make_connection(mut self) {
 		if {
-			let mut us = rc.borrow_mut();
-			if us.cur_addrs.is_none() {
+			if self.cur_addrs.is_none() {
 				//TODO: Resolve async
-				match us.host.to_socket_addrs() {
+				match self.host.to_socket_addrs() {
 					Err(_) => {
 						true
 					},
 					Ok(addrs) => {
-						us.cur_addrs = Some(addrs.collect());
+						self.cur_addrs = Some(addrs.collect());
 						false
 					}
 				}
 			} else { false }
 		} {
-			current_thread::spawn(timer::Delay::new(Instant::now() + Duration::from_secs(10)).then(move |_| -> future::FutureResult<(), ()> {
-				Self::make_connection(rc);
+			tokio::spawn(timer::Delay::new(Instant::now() + Duration::from_secs(10)).then(move |_| -> future::FutureResult<(), ()> {
+				self.make_connection();
 				future::result(Ok(()))
 			}));
 			return;
 		}
 
 		let addr_option = {
-			let mut us = rc.borrow_mut();
-			let addr = us.cur_addrs.as_mut().unwrap().pop();
+			let addr = self.cur_addrs.as_mut().unwrap().pop();
 			if addr.is_none() {
-				us.cur_addrs = None;
+				self.cur_addrs = None;
 			}
 			addr
 		};
@@ -759,42 +775,42 @@ impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> Co
 			Some(addr) => {
 				println!("Trying connection to {}", addr);
 
-				current_thread::spawn(net::TcpStream::connect(&addr).then(move |res| -> future::FutureResult<(), ()> {
+				tokio::spawn(net::TcpStream::connect(&addr).then(move |res| -> future::FutureResult<(), ()> {
 					match res {
 						Ok(stream) => {
 							println!("Connected to {}!", stream.peer_addr().unwrap());
 							stream.set_nodelay(true).unwrap();
 
-							let (framer, tx_stream) = rc.borrow_mut().handler.new_connection();
+							let (framer, tx_stream) = self.handler.new_connection();
 							let (tx, rx) = stream.framed(framer).split();
 							let stream = tx_stream.map_err(|_| -> io::Error {
 								panic!("mpsc streams cant generate errors!");
 							});
-							current_thread::spawn(tx.send_all(stream).then(|_| {
+							tokio::spawn(tx.send_all(stream).then(|_| {
 								println!("Disconnected on send side, will reconnect...");
 								future::result(Ok(()))
 							}));
-							let rc_clone = rc.clone();
-							let rc_clone_2 = rc.clone();
-							current_thread::spawn(rx.for_each(move |msg| {
-								future::result(rc_clone.borrow_mut().handler.handle_message(msg))
+							let us = Arc::new(self);
+							let us_close = us.clone();
+							tokio::spawn(rx.for_each(move |msg| {
+								future::result(us.handler.handle_message(msg))
 							}).then(move |_| {
 								println!("Disconnected on recv side, will reconnect...");
-								rc_clone_2.borrow_mut().handler.connection_closed();
-								Self::make_connection(rc);
+								us_close.handler.connection_closed();
+								Arc::try_unwrap(us_close).ok().unwrap().make_connection();
 								future::result(Ok(()))
 							}));
 						},
 						Err(_) => {
-							Self::make_connection(rc);
+							self.make_connection();
 						}
 					};
 					future::result(Ok(()))
 				}));
 			},
 			None => {
-				current_thread::spawn(timer::Delay::new(Instant::now() + Duration::from_secs(10)).then(move |_| {
-					Self::make_connection(rc);
+				tokio::spawn(timer::Delay::new(Instant::now() + Duration::from_secs(10)).then(move |_| {
+					self.make_connection();
 					future::result(Ok(()))
 				}));
 			},
@@ -804,10 +820,10 @@ impl<MessageType, HandlerProvider : 'static + ConnectionHandler<MessageType>> Co
 
 struct JobInfo {
 	payout_script: Script,
-	cur_job: Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Rc<RefCell<Eventual<TransactionData>>>)>,
-	cur_job_source: Option<Rc<RefCell<JobProviderHandler>>>,
+	cur_job: Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>,
+	cur_job_source: Option<Arc<JobProviderHandler>>,
 	cur_pool: Option<(PoolPayoutInfo, Option<PoolDifficulty>)>,
-	cur_pool_source: Option<Rc<RefCell<PoolHandler>>>,
+	cur_pool_source: Option<Arc<PoolHandler>>,
 	job_tx: mpsc::Sender<WorkInfo>,
 }
 
@@ -952,7 +968,7 @@ fn main() {
 	}
 
 	let (job_tx, job_rx) = mpsc::channel(5);
-	let cur_work_rc = Rc::new(RefCell::new(JobInfo {
+	let cur_work_rc = Arc::new(Mutex::new(JobInfo {
 		payout_script: payout_addr.clone().unwrap().script_pubkey(),
 		cur_job: None,
 		cur_job_source: None,
@@ -961,14 +977,14 @@ fn main() {
 		job_tx: job_tx,
 	}));
 
-	let mut rt = tokio::runtime::current_thread::Runtime::new().unwrap();
+	let mut rt = tokio::runtime::Runtime::new().unwrap();
 	rt.spawn(future::lazy(move || -> Result<(), ()> {
 		for host in job_provider_hosts {
 			let (mut handler, mut job_rx) = JobProviderHandler::new(None);
 			let work_rc = cur_work_rc.clone();
 			let handler_rc = handler.clone();
-			current_thread::spawn(job_rx.for_each(move |job| {
-				let mut cur_work = work_rc.borrow_mut();
+			tokio::spawn(job_rx.for_each(move |job| {
+				let mut cur_work = work_rc.lock().unwrap();
 				if cur_work.cur_job.is_none() || cur_work.cur_job.as_ref().unwrap().0.template_timestamp < job.0.template_timestamp {
 					let new_job = Some(job);
 					match merge_job_pool(cur_work.payout_script.clone(), &new_job, Some(handler_rc.clone()), &cur_work.cur_pool, cur_work.cur_pool_source.clone()) {
@@ -989,20 +1005,19 @@ fn main() {
 			}).then(|_| {
 				Ok(())
 			}));
-			ConnectionMaintainer::make_connection(Rc::new(RefCell::new(ConnectionMaintainer::new(host, handler))));
+			ConnectionMaintainer::new(host, handler).make_connection();
 		}
 
 		for (idx, host) in pool_server_hosts.iter().enumerate() {
 			let (mut handler, mut pool_rx) = PoolHandler::new(None, user_id.as_ref().unwrap().clone(), user_auth.as_ref().unwrap().clone(), idx);
 			let work_rc = cur_work_rc.clone();
 			let handler_rc = handler.clone();
-			current_thread::spawn(pool_rx.for_each(move |pool_info| {
-				let mut cur_work = work_rc.borrow_mut();
+			tokio::spawn(pool_rx.for_each(move |pool_info| {
+				let mut cur_work = work_rc.lock().unwrap();
 				match cur_work.cur_pool_source {
 					Some(ref cur_pool) => {
-						let pool = cur_pool.borrow();
 						//TODO: Fallback to lower-priority pool when one gets disconnected
-						if pool.is_connected() && pool.get_priority() < handler_rc.borrow().get_priority() {
+						if cur_pool.is_connected() && cur_pool.get_priority() < handler_rc.get_priority() {
 							return Ok(());
 						}
 					},
@@ -1031,7 +1046,7 @@ fn main() {
 			}).then(|_| {
 				Ok(())
 			}));
-			ConnectionMaintainer::make_connection(Rc::new(RefCell::new(ConnectionMaintainer::new(host.clone(), handler))));
+			ConnectionMaintainer::new(host.clone(), handler).make_connection();
 		}
 
 		macro_rules! bind_and_handle {
@@ -1041,7 +1056,7 @@ fn main() {
 						let server = $server;
 						match net::TcpListener::bind(&listen_bind) {
 							Ok(listener) => {
-								current_thread::spawn(listener.incoming().for_each(move |sock| {
+								tokio::spawn(listener.incoming().for_each(move |sock| {
 									$server_type::new_connection(server.clone(), sock);
 									Ok(())
 								}).then(|_| {
@@ -1066,7 +1081,7 @@ fn main() {
 		} else {
 			let (mut stratum_tx, stratum_rx) = mpsc::channel(5);
 			let (mut mining_tx, mining_rx) = mpsc::channel(5);
-			current_thread::spawn(job_rx.for_each(move |job| {
+			tokio::spawn(job_rx.for_each(move |job| {
 				match mining_tx.start_send(job.clone()) {
 					Ok(_) => {},
 					Err(_) => { println!("Dropped new job for native clients as server ran behind!"); },
@@ -1085,5 +1100,5 @@ fn main() {
 
 		Ok(())
 	}));
-	rt.run().unwrap();
+	rt.shutdown_on_idle().wait().unwrap();
 }

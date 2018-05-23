@@ -6,7 +6,7 @@ use bitcoin::network;
 use bytes;
 use bytes::BufMut;
 
-use futures::unsync::mpsc;
+use futures::sync::mpsc;
 
 use tokio_io::codec;
 
@@ -17,7 +17,7 @@ use secp256k1::Signature;
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct BlockTemplate {
@@ -187,8 +187,8 @@ impl BlockTemplateHeader {
 
 #[derive(Clone)]
 pub struct WorkInfo {
-	pub template: Rc<BlockTemplate>,
-	pub solutions: mpsc::UnboundedSender<Rc<(WinningNonce, Sha256dHash)>>,
+	pub template: Arc<BlockTemplate>,
+	pub solutions: mpsc::UnboundedSender<Arc<(WinningNonce, Sha256dHash)>>,
 }
 
 pub enum WorkMessage {
@@ -715,14 +715,12 @@ pub struct WeakBlock {
 	pub header_nbits: u32,
 	pub header_nonce: u32,
 
-	pub sketch_id: u64,
-	pub prev_sketch_id: u64,
 	pub txn: Vec<WeakBlockAction>,
 }
 
 impl WeakBlock {
 	pub fn encode(&self, res: &mut bytes::BytesMut) {
-		res.reserve(4*4 + 8*2 + 32 + self.txn.len()/8);
+		res.reserve(4*5 + 32 + self.txn.len()/8);
 
 		res.put_u32_le(self.header_version);
 		res.put_slice(&self.header_prevblock);
@@ -730,8 +728,7 @@ impl WeakBlock {
 		res.put_u32_le(self.header_nbits);
 		res.put_u32_le(self.header_nonce);
 
-		res.put_u64_le(self.sketch_id);
-		res.put_u64_le(self.prev_sketch_id);
+		res.put_u32_le(self.txn.len() as u32);
 
 		let mut action_buff = 0;
 		for tx in self.txn.iter() {
@@ -1078,8 +1075,56 @@ impl codec::Decoder for PoolMsgFramer {
 				Ok(Some(msg))
 			},
 			14 => {
-				//TODO: WeakBlock
-				unimplemented!();
+				let header_version = slice_to_le32(get_slice!(4));
+				let mut header_prevblock = [0; 32];
+				header_prevblock.copy_from_slice(get_slice!(32));
+				let header_time = slice_to_le32(get_slice!(4));
+				let header_nbits = slice_to_le32(get_slice!(4));
+				let header_nonce = slice_to_le32(get_slice!(4));
+				let action_count = slice_to_le32(get_slice!(4));
+
+				let mut actions = Vec::new();
+				let mut total_tx_len = 0;
+				while actions.len() < action_count as usize {
+					let mut action_buf = get_slice!(1)[0];
+					for i in 1..5 {
+						match action_buf >> (8 - 2*i) {
+							0b01 => {
+								let n = get_slice!(1)[0];
+								actions.push(WeakBlockAction::SkipN { n });
+								break;
+							},
+							0b10 => {
+								actions.push(WeakBlockAction::IncludeTx{});
+							},
+							0b11 => {
+								let txlen = slice_to_le32(get_slice!(4));
+								if txlen > 4000000 || total_tx_len + txlen > 4000000 {
+									return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+								}
+								total_tx_len += txlen;
+								actions.push(WeakBlockAction::NewTx { tx: match network::serialize::deserialize(get_slice!(txlen)) {
+									Ok(tx) => tx,
+									Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
+								} });
+							},
+							0b00 => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
+							_ => panic!("Shift aint right?"),
+						}
+					}
+				}
+
+				advance_bytes!();
+				Ok(Some(PoolMessage::WeakBlock {
+					sketch: WeakBlock {
+						header_version,
+						header_prevblock,
+						header_time,
+						header_nbits,
+						header_nonce,
+						txn: actions,
+					}
+				}))
 			},
 			15 => {
 				advance_bytes!();
