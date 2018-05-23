@@ -961,7 +961,8 @@ fn main() {
 		job_tx: job_tx,
 	}));
 
-	current_thread::block_on_all(future::lazy(|| -> Result<(), ()> {
+	let mut rt = tokio::runtime::current_thread::Runtime::new().unwrap();
+	rt.spawn(future::lazy(move || -> Result<(), ()> {
 		for host in job_provider_hosts {
 			let (mut handler, mut job_rx) = JobProviderHandler::new(None);
 			let work_rc = cur_work_rc.clone();
@@ -1083,5 +1084,6 @@ fn main() {
 		}
 
 		Ok(())
-	})).unwrap();
+	}));
+	rt.run().unwrap();
 }

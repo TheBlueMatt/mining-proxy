@@ -177,7 +177,7 @@ impl MiningServer {
 				};
 				if first_timestamp < timestamp {
 					r.jobs.remove(&first_timestamp);
-				}
+				} else { break; }
 			}
 
 			future::result(Ok(()))

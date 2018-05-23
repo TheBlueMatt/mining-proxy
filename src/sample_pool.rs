@@ -23,7 +23,7 @@ use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 
 use futures::{future,Stream,Sink,Future};
-use futures::unsync::mpsc;
+use futures::sync::mpsc;
 
 use tokio::executor::current_thread;
 use tokio::net;
@@ -123,17 +123,18 @@ fn main() {
 		return;
 	}
 
-	current_thread::block_on_all(futures::lazy(move || -> Result<(), ()> {
+	let mut rt = tokio::runtime::Runtime::new().unwrap();
+	rt.spawn(futures::lazy(move || -> Result<(), ()> {
 		match net::TcpListener::bind(&listen_bind.unwrap()) {
 			Ok(listener) => {
 				let mut max_client_id = 0;
 
-				current_thread::spawn(listener.incoming().for_each(move |sock| {
+				tokio::spawn(listener.incoming().for_each(move |sock| {
 					sock.set_nodelay(true).unwrap();
 
 					let (tx, rx) = sock.framed(PoolMsgFramer::new()).split();
 					let (mut send_sink, send_stream) = mpsc::channel(5);
-					current_thread::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
+					tokio::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
 						panic!("mpsc streams cant generate errors!");
 					})).then(|_| {
 						future::result(Ok(()))
@@ -172,7 +173,7 @@ fn main() {
 					let mut client_version = None;
 					let mut client_user_id = None;
 
-					current_thread::spawn(rx.for_each(move |msg| {
+					tokio::spawn(rx.for_each(move |msg| {
 						macro_rules! send_response {
 							($msg: expr) => {
 								match send_sink.start_send($msg) {
@@ -339,5 +340,6 @@ fn main() {
 		};
 
 		Ok(())
-	})).unwrap();
+	}));
+	rt.shutdown_on_idle().wait().unwrap();
 }

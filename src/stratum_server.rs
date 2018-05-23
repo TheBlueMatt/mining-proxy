@@ -272,7 +272,7 @@ impl StratumServer {
 				};
 				if first_timestamp < timestamp {
 					r.jobs.remove(&first_timestamp);
-				}
+				} else { break; }
 			}
 
 			match r.jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
@@ -280,11 +280,15 @@ impl StratumServer {
 					let now = Instant::now();
 					let send_target = now - Duration::from_secs(29);
 					let job_string = job_to_json_string(&job.1.template, true);
+					let diff_string = job_to_difficulty_string(&job.1.template);
 					for client in r.clients.iter() {
 						let mut client_ref = client.borrow_mut();
 						if client_ref.last_send < send_target && client_ref.subscribed {
-							match client_ref.stream.start_send(job_string.clone()) {
-								Ok(_) => client_ref.last_send = now,
+							match client_ref.stream.start_send(diff_string.clone()) {
+								Ok(_) => match client_ref.stream.start_send(job_string.clone()) {
+										Ok(_) => client_ref.last_send = now,
+										Err(_) => {},
+									},
 								Err(_) => {},
 							}
 						}
