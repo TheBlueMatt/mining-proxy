@@ -22,6 +22,7 @@ mod utils;
 
 use bitcoin::blockdata::transaction::{TxOut,Transaction};
 use bitcoin::blockdata::script::Script;
+use bitcoin::network::serialize::BitcoinHash;
 use bitcoin::util::address::Address;
 use bitcoin::util::privkey;
 use bitcoin::util::hash::Sha256dHash;
@@ -50,22 +51,29 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 
 /// A future, essentially
-struct Eventual<Value> {
+struct EventualTxData {
 	// We dont really want Fn here, we want FnOnce, but we can't because that'd require a move of
 	// the function onto stack, which is of unknown size, so we cant...
-	callees: Mutex<Vec<Box<Fn(&Value) + Send>>>,
-	value: RwLock<Option<Value>>,
+	callees: Mutex<Vec<Box<Fn(&Vec<(Transaction, Sha256dHash, usize)>) + Send>>>,
+	value: RwLock<Option<Vec<(Transaction, Sha256dHash, usize)>>>,
 }
-impl<Value: 'static + Send + Sync> Eventual<Value> {
-	fn new() -> (Arc<Self>, oneshot::Sender<Value>) {
+impl EventualTxData {
+	fn new() -> (Arc<Self>, oneshot::Sender<TransactionData>) {
 		let us = Arc::new(Self {
 			callees: Mutex::new(Vec::new()),
 			value: RwLock::new(None),
 		});
 		let (tx, rx) = oneshot::channel();
 		let us_rx = us.clone();
-		tokio::spawn(rx.and_then(move |res| {
-			*us_rx.value.write().unwrap() = Some(res);
+		tokio::spawn(rx.and_then(move |mut res: TransactionData| {
+			let mut value = Vec::with_capacity(res.transactions.len());
+			for tx in res.transactions.drain(..) {
+				// TODO: This is both redundant, and a terrible way to calculate serialized length
+				let len = bitcoin::network::serialize::serialize(&tx).unwrap().len();
+				let hash = tx.bitcoin_hash();
+				value.push((tx, hash, len));
+			}
+			*us_rx.value.write().unwrap() = Some(value);
 			let v_lock = us_rx.value.read().unwrap();
 			let v = v_lock.as_ref().unwrap();
 			for callee in us_rx.callees.lock().unwrap().iter() {
@@ -79,7 +87,7 @@ impl<Value: 'static + Send + Sync> Eventual<Value> {
 		(us, tx)
 	}
 
-	fn get_and<F: Fn(&Value) + 'static + Send>(&self, then: F) {
+	fn get_and<F: Fn(&Vec<(Transaction, Sha256dHash, usize)>) + 'static + Send>(&self, then: F) {
 		let value = self.value.read().unwrap();
 		match &(*value) {
 			&Some(ref value) => {
@@ -101,7 +109,7 @@ struct JobProviderState {
 	cur_prefix_postfix: Option<CoinbasePrefixPostfix>,
 
 	pending_tx_data_requests: HashMap<u64, oneshot::Sender<TransactionData>>,
-	job_stream: mpsc::Sender<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>,
+	job_stream: mpsc::Sender<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<EventualTxData>)>,
 }
 
 pub struct JobProviderHandler {
@@ -110,7 +118,7 @@ pub struct JobProviderHandler {
 }
 
 impl JobProviderHandler {
-	fn new(expected_auth_key: Option<PublicKey>) -> (Arc<JobProviderHandler>, mpsc::Receiver<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>) {
+	fn new(expected_auth_key: Option<PublicKey>) -> (Arc<JobProviderHandler>, mpsc::Receiver<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<EventualTxData>)>) {
 		let (work_sender, work_receiver) = mpsc::channel(10);
 
 		(Arc::new(JobProviderHandler {
@@ -246,7 +254,7 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_timestamp < template.template_timestamp {
 					println!("Received new BlockTemplate with diff lower bound {}", utils::target_to_diff_lb(&template.target));
-					let (txn, txn_tx) = Eventual::new();
+					let (txn, txn_tx) = EventualTxData::new();
 					let cur_postfix_prefix = us.cur_prefix_postfix.clone();
 					match us.job_stream.start_send((template.clone(), cur_postfix_prefix.clone(), txn)) {
 						Ok(_) => {},
@@ -320,7 +328,7 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 						let cur_prefix_postfix = us.cur_prefix_postfix.clone();
 						let template = us.cur_template.as_ref().unwrap().clone();
 
-						let (txn, txn_tx) = Eventual::new();
+						let (txn, txn_tx) = EventualTxData::new();
 						//TODO: This is pretty lazy...we should cache these instead of requesting
 						//new ones from the server...hopefully they dont update the coinbase prefix
 						//postfix very often...
@@ -404,7 +412,7 @@ impl PoolHandler {
 		self.state.lock().unwrap().pool_priority
 	}
 
-	fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<Transaction>) {
+	fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash, usize)>) {
 		let us = self.state.lock().unwrap();
 		match us.cur_difficulty {
 			Some(ref difficulty) => {
@@ -606,7 +614,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 	}
 }
 
-fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>, job_source: Option<Arc<JobProviderHandler>>, payout_info: &Option<(PoolPayoutInfo, Option<PoolDifficulty>)>, payout_source: Option<Arc<PoolHandler>>) -> Option<WorkInfo> {
+fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<EventualTxData>)>, job_source: Option<Arc<JobProviderHandler>>, payout_info: &Option<(PoolPayoutInfo, Option<PoolDifficulty>)>, payout_source: Option<Arc<PoolHandler>>) -> Option<WorkInfo> {
 	match job_info {
 		&Some((ref template_ref, ref coinbase_prefix_postfix, ref tx_data)) => {
 			let mut template = template_ref.clone();
@@ -697,7 +705,7 @@ fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplate, O
 						let template_ref_2 = template_ref.clone();
 						tx_data_ref.get_and(move |txn| {
 							let source_clone = source_ref.clone();
-							source_clone.send_nonce(&nonces, &template_ref_2, &txn.transactions);
+							source_clone.send_nonce(&nonces, &template_ref_2, &txn);
 						});
 					},
 					None => {}
@@ -820,7 +828,7 @@ impl<MessageType : Send + Sync, HandlerProvider : 'static + ConnectionHandler<Me
 
 struct JobInfo {
 	payout_script: Script,
-	cur_job: Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<Eventual<TransactionData>>)>,
+	cur_job: Option<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<EventualTxData>)>,
 	cur_job_source: Option<Arc<JobProviderHandler>>,
 	cur_pool: Option<(PoolPayoutInfo, Option<PoolDifficulty>)>,
 	cur_pool_source: Option<Arc<PoolHandler>>,
