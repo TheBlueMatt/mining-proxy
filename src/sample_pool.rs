@@ -45,7 +45,9 @@ fn share_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64) {
 	println!("Got valid share with value {} from {} from machine identified as: {}", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag));
 }
 
-const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
+//const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
+//const WEAK_BLOCK_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0x3f, 0, 0, 0, 0, 0, 0]; // Diff 262144
+const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0x03, 0, 0, 0, 0, 0]; // Diff something
 const WEAK_BLOCK_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
 fn main() {
 	println!("USAGE: sample-pool --listen_bind=IP:port --auth_key=base58privkey --payout_address=addr [--server_id=up_to_36_byte_string_for_coinbase]");
@@ -304,14 +306,17 @@ fn main() {
 									nonce: share.header_nonce,
 								}.bitcoin_hash();
 
-								if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
+								if utils::does_hash_meet_target(&block_hash[..], &WEAK_BLOCK_TARGET) {
+									println!("Got share that met weak block target, ignored as we'll check the weak block");
+								} else if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
 									share_submitted(client_user_id.as_ref().unwrap(), &share.user_tag, our_payout);
 								} else {
 									println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&SHARE_TARGET[..]));
 								}
 							},
 							PoolMessage::WeakBlock { .. } => {
-								unimplemented!();
+								println!("WEAKBLOCK");
+								//XXX
 							},
 							PoolMessage::WeakBlockStateReset { } => {
 								println!("Got WeakBlockStateReset?");
