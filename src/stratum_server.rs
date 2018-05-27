@@ -22,12 +22,9 @@ use tokio_io::codec;
 
 use serde_json;
 
-use std::char;
-use std::cmp;
+use std::{char, cmp, fmt, io};
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::fmt;
-use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
@@ -501,7 +498,7 @@ impl StratumServer {
 								};
 								send_response!(serde_json::Value::Null, true);
 							} else if utils::does_hash_meet_target_div4(&block_hash[..], &job.template.target[..]) {
-								println!("Got work that missed target (hashed to {}, which is greater than {}), but which (probably) met the stratum diff", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&job.template.target[..]));
+								println!("Got work that missed target, but which (probably) met the stratum diff");
 								send_response!(serde_json::Value::Null, true);
 							} else {
 								println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&job.template.target[..]));
@@ -524,7 +521,7 @@ impl StratumServer {
 						return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError)));
 					}
 					let params = msg["params"].as_array().unwrap();
-					if !params[0].is_array() || params[1].is_object() {
+					if !params[0].is_array() || !params[1].is_object() {
 						return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError)));
 					}
 					for ext in params[0].as_array().unwrap().iter() {
@@ -534,7 +531,7 @@ impl StratumServer {
 									Some(ref mask) => {
 										let mask_value: u32 = match mask.as_str() {
 											Some(mask_str) => {
-												match mask_str.parse() {
+												match u32::from_str_radix(mask_str, 16) {
 													Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
 													Ok(v) => v,
 												}
