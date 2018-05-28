@@ -168,7 +168,7 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 			Ok(_) => {
 				self.state.lock().unwrap().stream = Some(tx);
 			},
-			Err(_) => { panic!("Cant fail to send first message on an unbounded stream"); },
+			Err(_) => { println!("Job Provider disconnected before we could send version handshake"); },
 		}
 		(WorkMsgFramer::new(), rx)
 	}
@@ -255,6 +255,10 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_timestamp < template.template_timestamp {
 					println!("Received new BlockTemplate with diff lower bound {}", utils::target_to_diff_lb(&template.target));
 					let (txn, txn_tx) = EventualTxData::new();
+					match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_timestamp: template.template_timestamp }) {
+						Ok(_) => {},
+						Err(_) => return Ok(()), // Disconnected
+					}
 					let cur_postfix_prefix = us.cur_prefix_postfix.clone();
 					match us.job_stream.start_send((template.clone(), cur_postfix_prefix.clone(), txn)) {
 						Ok(_) => {},
@@ -262,10 +266,6 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 							println!("Job provider sending jobs too quickly");
 							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 						}
-					}
-					match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_timestamp: template.template_timestamp }) {
-						Ok(_) => {},
-						Err(_) => { panic!("unbounded streams should never fail"); }
 					}
 					us.pending_tx_data_requests.insert(template.template_timestamp, txn_tx);
 					us.cur_template = Some(template);
@@ -334,7 +334,7 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 						//postfix very often...
 						match us.stream.as_ref().unwrap().unbounded_send(WorkMessage::TransactionDataRequest { template_timestamp: template.template_timestamp }) {
 							Ok(_) => {},
-							Err(_) => { panic!("unbounded streams should never fail"); }
+							Err(_) => return Ok(()), // Disconnected
 						}
 						us.pending_tx_data_requests.insert(template.template_timestamp, txn_tx);
 
@@ -555,7 +555,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 			Ok(_) => {
 				us.stream = Some(tx);
 			},
-			Err(_) => { panic!("Cant fail to send first message on an unbounded stream"); },
+			Err(_) => { println!("Pool disconnected before we could send version handshake"); },
 		}
 
 		us.last_weak_block = None;
