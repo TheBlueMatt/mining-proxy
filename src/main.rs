@@ -43,8 +43,8 @@ use crypto::sha2::Sha256;
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
-use std::collections::HashMap;
-use std::{env,io,marker};
+use std::collections::{HashSet, HashMap, BTreeMap};
+use std::{cmp,env,io,marker,mem};
 use std::net::{SocketAddr,ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
 use std::str::FromStr;
@@ -371,7 +371,7 @@ struct PoolHandlerState {
 
 	cur_payout_info: Option<PoolPayoutInfo>,
 	cur_difficulty: Option<PoolDifficulty>,
-	last_weak_block: Option<Vec<Transaction>>,
+	last_weak_block: Option<Vec<(Transaction, Sha256dHash, usize)>>,
 
 	job_stream: mpsc::Sender<(PoolPayoutInfo, Option<PoolDifficulty>)>,
 }
@@ -413,7 +413,7 @@ impl PoolHandler {
 	}
 
 	fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash, usize)>) {
-		let us = self.state.lock().unwrap();
+		let mut us = self.state.lock().unwrap();
 		match us.cur_difficulty {
 			Some(ref difficulty) => {
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.share_target[..]) {
@@ -441,20 +441,101 @@ impl PoolHandler {
 					}
 				}
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.weak_block_target[..]) {
-					match us.last_weak_block {
-						Some(ref last_weak_block) => {
-							//TODO
+					match us.stream {
+						Some(ref stream) => {
+							let mut actions = Vec::with_capacity(post_coinbase_txn.len() + 1);
+							actions.push(WeakBlockAction::NewTx { tx: work.0.coinbase_tx.clone() });
+
+							match us.last_weak_block {
+								Some(ref last_weak_block) => {
+									let mut old_txids_set = HashSet::with_capacity(last_weak_block.len());
+									for &(_, ref txid, _) in last_weak_block {
+										old_txids_set.insert(txid.clone());
+									}
+									let mut total_len = 0;
+									let mut new_txids_posn = HashMap::with_capacity(post_coinbase_txn.len());
+									for &(_, ref txid, ref txlen) in post_coinbase_txn {
+										if old_txids_set.contains(txid) {
+											new_txids_posn.insert(txid.clone(), total_len);
+											total_len += txlen;
+										}
+									}
+									total_len = 0;
+									let mut old_txids_posn = HashMap::with_capacity(last_weak_block.len());
+									for (idx, &(_, ref txid, ref txlen)) in last_weak_block.iter().enumerate() {
+										if new_txids_posn.contains_key(txid) {
+											old_txids_posn.insert(txid.clone(), (total_len, idx));
+											total_len += txlen;
+										}
+									}
+									actions.push(WeakBlockAction::SkipN { n: 1 }); // Skip original coinbase tx
+									let mut old_tx_idx = 0;
+									let mut old_tx_posn = 0;
+									for &(ref tx, ref txid, ref txlen) in post_coinbase_txn {
+										match old_txids_posn.get(txid) {
+											None => actions.push(WeakBlockAction::NewTx { tx: tx.clone() }),
+											Some(&(potential_new_posn, potential_new_idx)) => {
+												if potential_new_idx >= old_tx_idx && old_tx_posn + (txlen * 3)/2 >= potential_new_posn {
+													let mut skip_count = potential_new_idx - old_tx_idx;
+													while skip_count > 0xff {
+														actions.push(WeakBlockAction::SkipN { n: 0xff });
+														skip_count -= 0xff;
+													}
+													if skip_count != 0 {
+														actions.push(WeakBlockAction::SkipN { n: skip_count as u8 });
+													}
+													actions.push(WeakBlockAction::IncludeTx{});
+
+													old_tx_idx = potential_new_idx + 1;
+												} else {
+													if potential_new_idx > 0xffff {
+														actions.push(WeakBlockAction::NewTx { tx: tx.clone() });
+													} else {
+														actions.push(WeakBlockAction::TakeTx { n: potential_new_idx as u16 });
+													}
+												}
+												old_tx_posn += txlen;
+											},
+										}
+									}
+								},
+								None => {
+									for &(ref tx, _, _) in post_coinbase_txn {
+										actions.push(WeakBlockAction::NewTx { tx: tx.clone() });
+									}
+								}
+							}
+							match stream.unbounded_send(PoolMessage::WeakBlock {
+								sketch: WeakBlock {
+									header_version: work.0.header_version,
+									header_prevblock: template.header_prevblock.clone(),
+									header_time: work.0.header_time,
+									header_nbits: template.header_nbits,
+									header_nonce: work.0.header_nonce,
+									user_tag: work.0.user_tag.clone(),
+									txn: actions,
+								},
+							}) {
+								Ok(_) => { println!("Submitted weak block!"); },
+								Err(_) => {
+									println!("Failed to submit weak block as pool connection lost");
+									return;
+								},
+							}
 						},
 						None => {
-							//TODO
-						},
+							println!("Failed to submit weak block as pool connection lost");
+							return;
+						}
 					}
-				}
+				} else { return; }
 			},
 			None => {
 				println!("Got share but failed to submit because pool has not yet provided difficulty information!");
+				return;
 			}
 		}
+		us.last_weak_block = Some(post_coinbase_txn.clone());
 	}
 }
 

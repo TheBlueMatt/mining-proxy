@@ -304,14 +304,17 @@ fn main() {
 									nonce: share.header_nonce,
 								}.bitcoin_hash();
 
-								if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
+								if utils::does_hash_meet_target(&block_hash[..], &WEAK_BLOCK_TARGET) {
+									println!("Got share that met weak block target, ignored as we'll check the weak block");
+								} else if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
 									share_submitted(client_user_id.as_ref().unwrap(), &share.user_tag, our_payout);
 								} else {
 									println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&SHARE_TARGET[..]));
 								}
 							},
 							PoolMessage::WeakBlock { .. } => {
-								unimplemented!();
+								println!("Received WeakBlock");
+								//TODO: Check WeakBlock
 							},
 							PoolMessage::WeakBlockStateReset { } => {
 								println!("Got WeakBlockStateReset?");

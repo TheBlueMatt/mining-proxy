@@ -696,11 +696,15 @@ pub struct PoolShare {
 #[derive(Clone)]
 pub enum WeakBlockAction {
 	/// Skips the next n transactions from the original sketch
-	SkipN { // 0b01
+	SkipN { // 0b00
 		n: u8,
 	},
 	/// Includes the transaction at the current index from the original sketch
-	IncludeTx {}, // 0b10
+	IncludeTx {}, // 0b01
+	/// Takes tx at index n from the original sketch (without effecting SkipN/IncludeTx position)
+	TakeTx { // 0b10
+		n: u16
+	},
 	/// Adds a new transaction not in the original sketch
 	NewTx { // 0b11
 		tx: Transaction
@@ -715,12 +719,14 @@ pub struct WeakBlock {
 	pub header_nbits: u32,
 	pub header_nonce: u32,
 
+	pub user_tag: Vec<u8>,
+
 	pub txn: Vec<WeakBlockAction>,
 }
 
 impl WeakBlock {
 	pub fn encode(&self, res: &mut bytes::BytesMut) {
-		res.reserve(4*5 + 32 + self.txn.len()/8);
+		res.reserve(4*5 + 32 + 1 + self.user_tag.len() + self.txn.len()/4);
 
 		res.put_u32_le(self.header_version);
 		res.put_slice(&self.header_prevblock);
@@ -728,35 +734,63 @@ impl WeakBlock {
 		res.put_u32_le(self.header_nbits);
 		res.put_u32_le(self.header_nonce);
 
+		res.put_u8(self.user_tag.len() as u8);
+		res.put_slice(&self.user_tag);
+
 		res.put_u32_le(self.txn.len() as u32);
 
 		let mut action_buff = 0;
+		let mut action_count = 0;
+		macro_rules! push_action {
+			($v: expr) => {
+				{
+					action_buff <<= 2;
+					action_buff |= $v;
+					action_count += 1;
+					if action_count == 4 {
+						res.reserve(1);
+						res.put_u8(action_buff);
+						action_count = 0;
+						action_buff = 0;
+					}
+				}
+			}
+		}
+		for tx in self.txn.iter() {
+			match tx {
+				&WeakBlockAction::SkipN { .. } => {
+					push_action!(0b00);
+				},
+				&WeakBlockAction::IncludeTx {} => {
+					push_action!(0b01);
+				},
+				&WeakBlockAction::TakeTx { .. } => {
+					push_action!(0b10);
+				},
+				&WeakBlockAction::NewTx { .. } => {
+					push_action!(0b11);
+				}
+			}
+		}
+		if action_count != 0 {
+			res.reserve(1);
+			res.put_u8(action_buff << (8 - 2*action_count));
+		}
+
 		for tx in self.txn.iter() {
 			match tx {
 				&WeakBlockAction::SkipN { n } => {
-					action_buff <<= 2;
-					action_buff |= 0b01;
-					res.reserve(2);
-					res.put_u8(action_buff);
-					action_buff = 0;
+					res.reserve(1);
 					res.put_u8(n);
 				},
-				&WeakBlockAction::IncludeTx {} => {
-					action_buff <<= 2;
-					action_buff |= 0b10;
-					if (action_buff & 0b11000000) != 0 {
-						res.reserve(1);
-						res.put_u8(action_buff);
-						action_buff = 0;
-					}
+				&WeakBlockAction::IncludeTx {} => {},
+				&WeakBlockAction::TakeTx { n } => {
+					res.reserve(2);
+					res.put_u16_le(n);
 				},
 				&WeakBlockAction::NewTx { ref tx } => {
-					action_buff <<= 2;
-					action_buff |= 0b11;
 					let tx_enc = network::serialize::serialize(tx).unwrap();
-					res.reserve(1 + 4 + tx_enc.len());
-					res.put_u8(action_buff);
-					action_buff = 0;
+					res.reserve(4 + tx_enc.len());
 					res.put_u32_le(tx_enc.len() as u32);
 					res.put_slice(&tx_enc[..]);
 				}
@@ -878,13 +912,13 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_slice(&share.user_tag[..]);
 			},
 			PoolMessage::WeakBlock { ref sketch } => {
-				res.reserve(14);
-				res.put_u8(6);
+				res.reserve(1);
+				res.put_u8(14);
 				sketch.encode(res);
 			},
 			PoolMessage::WeakBlockStateReset { } => {
-				res.reserve(15);
-				res.put_u8(7);
+				res.reserve(1);
+				res.put_u8(15);
 			},
 			PoolMessage::NewPoolServer { ref signature, ref new_host_port } => {
 				res.reserve(1 + 33 + 1 + new_host_port.len());
@@ -1081,35 +1115,45 @@ impl codec::Decoder for PoolMsgFramer {
 				let header_time = slice_to_le32(get_slice!(4));
 				let header_nbits = slice_to_le32(get_slice!(4));
 				let header_nonce = slice_to_le32(get_slice!(4));
-				let action_count = slice_to_le32(get_slice!(4));
+
+				let user_tag_len = get_slice!(1)[0];
+				let user_tag = get_slice!(user_tag_len).to_vec();
 
 				let mut actions = Vec::new();
-				let mut total_tx_len = 0;
-				while actions.len() < action_count as usize {
-					let mut action_buf = get_slice!(1)[0];
-					for i in 1..5 {
-						match action_buf >> (8 - 2*i) {
-							0b01 => {
-								let n = get_slice!(1)[0];
-								actions.push(WeakBlockAction::SkipN { n });
-								break;
-							},
-							0b10 => {
-								actions.push(WeakBlockAction::IncludeTx{});
-							},
-							0b11 => {
-								let txlen = slice_to_le32(get_slice!(4));
-								if txlen > 4000000 || total_tx_len + txlen > 4000000 {
-									return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
-								}
-								total_tx_len += txlen;
-								actions.push(WeakBlockAction::NewTx { tx: match network::serialize::deserialize(get_slice!(txlen)) {
-									Ok(tx) => tx,
-									Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
-								} });
-							},
-							0b00 => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
-							_ => panic!("Shift aint right?"),
+
+				{
+					let action_count = slice_to_le32(get_slice!(4));
+					let action_bits = get_slice!((action_count + 3) / 4);
+
+					let mut total_tx_len = 0;
+					for action_byte in action_bits {
+						for i in 1..5 {
+							match (action_byte >> (8 - 2*i)) as u8 & (0b11 as u8) {
+								0b00 => {
+									let n = get_slice!(1)[0];
+									actions.push(WeakBlockAction::SkipN { n });
+								},
+								0b01 => {
+									actions.push(WeakBlockAction::IncludeTx{});
+								},
+								0b10 => {
+									let n = slice_to_le16(get_slice!(2));
+									actions.push(WeakBlockAction::TakeTx { n });
+								},
+								0b11 => {
+									let txlen = slice_to_le32(get_slice!(4));
+									if txlen > 4000000 || total_tx_len + txlen > 4000000 {
+										return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+									}
+									total_tx_len += txlen;
+									actions.push(WeakBlockAction::NewTx { tx: match network::serialize::deserialize(get_slice!(txlen)) {
+										Ok(tx) => tx,
+										Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
+									} });
+								},
+								_ => unimplemented!(),
+							}
+							if actions.len() >= action_count as usize { break; }
 						}
 					}
 				}
@@ -1122,6 +1166,7 @@ impl codec::Decoder for PoolMsgFramer {
 						header_time,
 						header_nbits,
 						header_nonce,
+						user_tag,
 						txn: actions,
 					}
 				}))
