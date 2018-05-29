@@ -312,7 +312,7 @@ impl StratumServer {
 		let (client, mut send_sink) = {
 			let (send_sink, send_stream) = mpsc::channel(5);
 			tokio::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
-				panic!("mpsc streams cant generate errors!");
+				unreachable!();
 			})).then(|_| {
 				future::result(Ok(()))
 			}));
@@ -497,7 +497,7 @@ impl StratumServer {
 									user_tag: user_tag,
 								}, block_hash))) {
 									Ok(_) => {},
-									Err(_) => { panic!(); },
+									Err(_) => { unreachable!(); },
 								};
 								send_response!(serde_json::Value::Null, true);
 							} else if utils::does_hash_meet_target_div4(&block_hash[..], &job.template.target[..]) {
