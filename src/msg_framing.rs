@@ -15,9 +15,42 @@ use secp256k1::Secp256k1;
 use secp256k1::Signature;
 
 use std::error::Error;
-use std::fmt;
-use std::io;
+use std::{cmp, fmt, io};
 use std::sync::Arc;
+
+fn le16_into_slice(u: u16, v: &mut [u8]) {
+	assert_eq!(v.len(), 2);
+	v[0] = ((u >> 8*0) & 0xff) as u8;
+	v[1] = ((u >> 8*1) & 0xff) as u8;
+}
+
+fn le24_into_slice(u: usize, v: &mut [u8]) -> bool {
+	if u > 0xffffff { return false; }
+	assert_eq!(v.len(), 3);
+	v[0] = ((u >> 8*0) & 0xff) as u8;
+	v[1] = ((u >> 8*1) & 0xff) as u8;
+	v[2] = ((u >> 8*2) & 0xff) as u8;
+	true
+}
+
+fn push_compact_size(u: usize, v: &mut bytes::BytesMut) {
+	match u {
+		0...253 => {
+			v.reserve(1);
+			v.put_u8(u as u8);
+		},
+		253...0x10000 => {
+			v.reserve(3);
+			v.put_u8(253);
+			v.put_u16_le(u as u16);
+		},
+		_ => {
+			v.reserve(5);
+			v.put_u8(254);
+			v.put_u32_le(u as u32);
+		},
+	}
+}
 
 #[derive(Clone)]
 pub struct BlockTemplate {
@@ -39,32 +72,9 @@ pub struct BlockTemplate {
 	pub appended_coinbase_outputs: Vec<TxOut>,
 	pub coinbase_locktime: u32,
 }
-fn le32_into_slice(u: u16, v: &mut [u8]) {
-	assert_eq!(v.len(), 2);
-	v[0] = ((u >> 8*0) & 0xff) as u8;
-	v[1] = ((u >> 8*1) & 0xff) as u8;
-}
-fn push_compact_size(u: usize, v: &mut bytes::BytesMut) {
-	match u {
-		0...253 => {
-			v.reserve(1);
-			v.put_u8(u as u8);
-		},
-		253...0x10000 => {
-			v.reserve(3);
-			v.put_u8(253);
-			v.put_u16_le(u as u16);
-		},
-		_ => {
-			v.reserve(5);
-			v.put_u8(254);
-			v.put_u32_le(u as u32);
-		},
-	}
-}
 impl BlockTemplate {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
-		res.reserve(850); // Round upper bound assuming 2, 33-byte-sPK outputs
+		res.reserve(650); // Round upper bound assuming 1, 33-byte-sPK output
 		res.put_u64_le(self.template_timestamp);
 		res.put_slice(&self.target);
 
@@ -98,7 +108,7 @@ impl BlockTemplate {
 		}
 		res.put_u32_le(self.coinbase_locktime);
 
-		le32_into_slice((res.len() - remaining_len_pos) as u16, &mut res[remaining_len_pos - 2..remaining_len_pos]);
+		le16_into_slice((res.len() - remaining_len_pos) as u16, &mut res[remaining_len_pos - 2..remaining_len_pos]);
 	}
 }
 
@@ -232,16 +242,30 @@ pub enum WorkMessage {
 		header_nonce: u32,
 		user_tag: Vec<u8>,
 	},
+	NewWorkServer {
+		signature: Signature,
+		new_host_port: String,
+	},
+	VendorMessage {
+		signature: Option<Signature>,
+		vendor: Vec<u8>,
+		message: Vec<u8>,
+	},
 }
 
+/// Decoder for work messages, not that we simply skip decoding Vendor messages to avoid creating a
+/// 16MB read buffer for them.
 pub struct WorkMsgFramer {
 	secp_ctx: Secp256k1,
+	/// Used to avoid reading large useless vendor messages into memory
+	skip_bytes: usize,
 }
 
 impl WorkMsgFramer {
 	pub fn new() -> WorkMsgFramer {
 		WorkMsgFramer {
 			secp_ctx: Secp256k1::new(),
+			skip_bytes: 0,
 		}
 	}
 }
@@ -266,56 +290,109 @@ impl codec::Encoder for WorkMsgFramer {
 	fn encode(&mut self, msg: WorkMessage, res: &mut bytes::BytesMut) -> Result<(), io::Error> {
 		match msg {
 			WorkMessage::ProtocolSupport { max_version, min_version, flags } => {
-				res.reserve(1 + 2*3);
+				res.reserve(1 + 3 + 2*3);
 				res.put_u8(1);
+				res.put_u8(0x06);
+				res.put_u16_le(0);
 				res.put_u16_le(max_version);
 				res.put_u16_le(min_version);
 				res.put_u16_le(flags);
 			},
 			WorkMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
-				res.reserve(1 + 2 + 33);
+				res.reserve(1 + 3 + 2 + 33);
 				res.put_u8(2);
+				res.put_u8(0x25);
+				res.put_u16_le(0);
 				res.put_u16_le(selected_version);
 				res.put_u16_le(flags);
 				res.put_slice(&auth_key.serialize());
 			},
 			WorkMessage::BlockTemplate { ref signature, ref template } => {
-				res.reserve(1 + 33);
+				res.reserve(1 + 3 + 33);
 				res.put_u8(3);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				template.encode_unsigned(res);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
 			},
 			WorkMessage::WinningNonce { ref nonces } => {
-				res.reserve(1);
+				res.reserve(1 + 3);
 				res.put_u8(4);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				nonces.encode(res);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
 			},
 			WorkMessage::TransactionDataRequest { template_timestamp } => {
-				res.reserve(1 + 8);
+				res.reserve(1 + 3 + 8);
 				res.put_u8(5);
+				res.put_u8(8);
+				res.put_u16_le(0);
 				res.put_u64_le(template_timestamp);
 			}
 			WorkMessage::TransactionData { ref signature, ref data } => {
-				res.reserve(1 + 33);
+				res.reserve(1 + 3 + 33);
 				res.put_u8(6);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				data.encode_unsigned(res);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
 			},
 			WorkMessage::CoinbasePrefixPostfix { ref signature, ref coinbase_prefix_postfix } => {
-				res.reserve(1 + 33);
+				res.reserve(1 + 3 + 33);
 				res.put_u8(7);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				coinbase_prefix_postfix.encode_unsigned(res);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
 			},
 			WorkMessage::BlockTemplateHeader { ref signature, ref template } => {
-				res.reserve(1 + 33);
+				res.reserve(1 + 3 + 33);
 				res.put_u8(8);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				template.encode_unsigned(res);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				}
 			},
 			WorkMessage::WinningNonceHeader { template_timestamp, template_variant, header_version, header_time, header_nonce, ref user_tag } => {
-				res.reserve(30 + user_tag.len());
+				res.reserve(33 + user_tag.len());
 				res.put_u8(9);
+				res.put_u16_le(29 + user_tag.len() as u16);
+				res.put_u8(0);
 				res.put_u64_le(template_timestamp);
 				res.put_u64_le(template_variant);
 				res.put_u32_le(header_version);
@@ -323,6 +400,39 @@ impl codec::Encoder for WorkMsgFramer {
 				res.put_u32_le(header_nonce);
 				res.put_u8(user_tag.len() as u8);
 				res.put_slice(&user_tag[..]);
+			},
+			WorkMessage::NewWorkServer { ref signature, ref new_host_port } => {
+				res.reserve(1 + 3 + 33 + 1 + new_host_port.len());
+				res.put_u8(10);
+				res.put_u16_le(33 + 1 + new_host_port.len() as u16);
+				res.put_u8(0);
+				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
+				res.put_u8(new_host_port.len() as u8);
+				res.put_slice(new_host_port.as_bytes());
+			},
+			WorkMessage::VendorMessage { ref signature, ref vendor, ref message } => {
+				let len = 1 + if signature.is_some() { 33 } else { 0 } + 1 + vendor.len() + message.len();
+				if len > 0xffffff {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
+
+				res.reserve(1 + 3 + len);
+				res.put_u8(11);
+				res.put_u8(((len >> 8*0) & 0xff) as u8);
+				res.put_u8(((len >> 8*1) & 0xff) as u8);
+				res.put_u8(((len >> 8*2) & 0xff) as u8);
+
+				match signature {
+					&Some(ref sig) => {
+						res.put_u8(1);
+						res.put_slice(&sig.serialize_compact(&self.secp_ctx));
+					},
+					&None => res.put_u8(0),
+				}
+
+				res.put_u8(vendor.len() as u8);
+				res.put_slice(&vendor);
+				res.put_slice(&message);
 			},
 		}
 		Ok(())
@@ -360,24 +470,67 @@ impl codec::Decoder for WorkMsgFramer {
 	type Error = io::Error;
 
 	fn decode(&mut self, bytes: &mut bytes::BytesMut) -> Result<Option<WorkMessage>, io::Error> {
-		if bytes.len() == 0 { return Ok(None); }
+		if self.skip_bytes != 0 {
+			let read = cmp::min(self.skip_bytes, bytes.len());
+			bytes.advance(read);
+			self.skip_bytes -= read;
+			if self.skip_bytes != 0 { return Ok(None); }
+		}
 
-		let mut read_pos = 1;
+		if bytes.len() < 4 { return Ok(None); }
+
+		let len = ((((bytes[3] as usize) << 8) | (bytes[2] as usize)) << 8) | bytes[1] as usize;
+
+		if match bytes[0] {
+			1 => len != 6,
+			2 => len != 37,
+			3 => len > 1000202,
+			4 => len > 1000280,
+			5 => len != 8,
+			6 => len > 4000076,
+			7 => len > 169,
+			8 => len > 188,
+			9 => len > 284,
+			10 => len > 320,
+			11 => false,
+			_ => true,
+		} {
+			return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+		}
+
+		if bytes[0] == 11 { // Vendor message
+			if bytes.len() >= 4 + len {
+				bytes.advance(4 + len);
+				return Ok(None);
+			}
+			self.skip_bytes = len + 4 - bytes.len();
+			let skip = bytes.len();
+			bytes.advance(skip);
+			return Ok(None);
+		}
+
+		if bytes.len() < 4 + len { return Ok(None); }
+
+		let mut read_pos = 4;
 		macro_rules! get_slice {
 			( $size: expr ) => {
 				{
-					if bytes.len() < read_pos + $size as usize {
-						return Ok(None);
+					if read_pos as u64 + $size as u64 > len as u64 + 4 {
+						return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 					}
 					read_pos += $size as usize;
 					&bytes[read_pos - ($size as usize)..read_pos]
 				}
 			}
 		}
-
 		macro_rules! advance_bytes {
 			() => {
-				bytes.advance(read_pos);
+				{
+					if read_pos != len + 4 {
+						return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+					}
+					bytes.advance(read_pos);
+				}
 			}
 		}
 
@@ -627,6 +780,23 @@ impl codec::Decoder for WorkMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
+			10 => {
+				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
+					Ok(sig) => sig,
+					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				};
+				let new_host_port = match String::from_utf8(get_slice!(get_slice!(1)[0]).to_vec()) {
+					Ok(string) => string,
+					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				};
+				let msg = WorkMessage::NewWorkServer {
+					signature,
+					new_host_port,
+				};
+				advance_bytes!();
+				Ok(Some(msg))
+			},
+			// 11 (VendorMessage) handled pre-match
 			_ => {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 			}
@@ -833,12 +1003,6 @@ pub enum PoolMessage {
 		signature: Signature,
 		new_host_port: String,
 	},
-	/*TODO:
-	BitcoindAddNode {
-		signature: Signature,
-		bitcoind_add_nodes: Vec<String>,
-	},
-*/
 }
 
 pub struct PoolMsgFramer {

@@ -343,6 +343,13 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 				println!("Received WinningNonceHeader?");
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
+			WorkMessage::NewWorkServer { .. } => {
+				unimplemented!();
+			},
+			WorkMessage::VendorMessage { .. } => {
+				println!("Got vendor message");
+				return Ok(());
+			},
 		}
 		Ok(())
 	}

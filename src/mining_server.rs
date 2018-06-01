@@ -352,6 +352,14 @@ impl MiningServer {
 						}
 					}
 				},
+				WorkMessage::NewWorkServer { .. } => {
+					println!("Got NewWorkServer?");
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+				},
+				WorkMessage::VendorMessage { .. } => {
+					println!("Got vendor message");
+					return future::result(Ok(()));
+				},
 			}
 			future::result(Ok(()))
 		}).then(move |_| {
