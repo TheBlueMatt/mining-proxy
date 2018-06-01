@@ -237,7 +237,9 @@ fn main() {
 								println!("Got ProtocolVersion?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
-							PoolMessage::GetPayoutInfo { user_id, user_auth } => {
+							PoolMessage::GetPayoutInfo { suggested_target, minimum_target, user_id, user_auth } => {
+								//TODO: Use suggested_target and minimum_target for stuff
+
 								let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 								let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
@@ -246,7 +248,8 @@ fn main() {
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 								if client_user_id.is_some() {
-									println!("Client sent duplicative GetPayoutInfo");
+									//TODO: This needs to be supported
+									println!("We don't yet support proxies with multiple clients!");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 								if !check_user_auth(&user_id, &user_auth) {
@@ -255,29 +258,40 @@ fn main() {
 								client_user_id = Some(user_id.clone());
 
 								let payout_info = PoolPayoutInfo {
-									user_id,
+									user_id: user_id.clone(),
 									timestamp,
 									coinbase_postfix: client_coinbase_postfix.clone(),
 									remaining_payout: payout_addr_clone.clone(),
 									appended_outputs: vec![],
 								};
 								send_response!(PoolMessage::PayoutInfo {
-									signature: sign_message!(payout_info, 11),
+									signature: sign_message!(payout_info, 13),
 									payout_info,
 								});
 
-								let difficulty = PoolDifficulty {
-									share_target: SHARE_TARGET,
-									weak_block_target: WEAK_BLOCK_TARGET,
-								};
 								send_response!(PoolMessage::ShareDifficulty {
-									signature: sign_message!(difficulty, 12),
-									difficulty,
+									user_id,
+									difficulty: PoolDifficulty {
+										timestamp,
+										share_target: SHARE_TARGET,
+										weak_block_target: WEAK_BLOCK_TARGET,
+									},
 								});
 							},
 							PoolMessage::PayoutInfo { .. } => {
 								println!("Got PayoutInfo?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
+							PoolMessage::RejectUserAuth { .. } => {
+								println!("Got RejectUserAuth?");
+								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
+							PoolMessage::DropUser { user_id } => {
+								if client_user_id.is_none() || *client_user_id.as_ref().unwrap() != user_id {
+									println!("Got DropUser for an un-authed user");
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+								client_user_id = None;
 							},
 							PoolMessage::ShareDifficulty { .. } => {
 								println!("Got ShareDifficulty?");
@@ -354,6 +368,10 @@ fn main() {
 							PoolMessage::NewPoolServer { .. } => {
 								println!("Got NewPoolServer?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
+							PoolMessage::VendorMessage { .. } => {
+								println!("Got vendor message");
+								return future::result(Ok(()));
 							},
 						}
 						future::result(Ok(()))

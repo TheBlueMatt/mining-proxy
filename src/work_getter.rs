@@ -7,7 +7,6 @@ use utils;
 
 use futures::sync::{mpsc,oneshot};
 
-use bitcoin;
 use bitcoin::blockdata::transaction::{TxOut,Transaction};
 use bitcoin::blockdata::script::Script;
 use bitcoin::network::serialize::BitcoinHash;
@@ -31,7 +30,7 @@ use secp256k1;
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
-use std::collections::{HashSet, HashMap};
+use std::collections::HashMap;
 use std::{io,marker};
 use std::net::{SocketAddr,ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,8 +40,8 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 struct EventualTxData {
 	// We dont really want Fn here, we want FnOnce, but we can't because that'd require a move of
 	// the function onto stack, which is of unknown size, so we cant...
-	callees: Mutex<Vec<Box<Fn(&Vec<(Transaction, Sha256dHash, usize)>) + Send>>>,
-	value: RwLock<Option<Vec<(Transaction, Sha256dHash, usize)>>>,
+	callees: Mutex<Vec<Box<Fn(&Vec<(Transaction, Sha256dHash)>) + Send>>>,
+	value: RwLock<Option<Vec<(Transaction, Sha256dHash)>>>,
 }
 impl EventualTxData {
 	fn new() -> (Arc<Self>, oneshot::Sender<TransactionData>) {
@@ -55,10 +54,8 @@ impl EventualTxData {
 		tokio::spawn(rx.and_then(move |mut res: TransactionData| {
 			let mut value = Vec::with_capacity(res.transactions.len());
 			for tx in res.transactions.drain(..) {
-				// TODO: This is both redundant, and a terrible way to calculate serialized length
-				let len = bitcoin::network::serialize::serialize(&tx).unwrap().len();
 				let hash = tx.bitcoin_hash();
-				value.push((tx, hash, len));
+				value.push((tx, hash));
 			}
 			*us_rx.value.write().unwrap() = Some(value);
 			let v_lock = us_rx.value.read().unwrap();
@@ -74,7 +71,7 @@ impl EventualTxData {
 		(us, tx)
 	}
 
-	fn get_and<F: Fn(&Vec<(Transaction, Sha256dHash, usize)>) + 'static + Send>(&self, then: F) {
+	fn get_and<F: Fn(&Vec<(Transaction, Sha256dHash)>) + 'static + Send>(&self, then: F) {
 		let value = self.value.read().unwrap();
 		match &(*value) {
 			&Some(ref value) => {
@@ -365,7 +362,7 @@ struct PoolHandlerState {
 
 	cur_payout_info: Option<PoolPayoutInfo>,
 	cur_difficulty: Option<PoolDifficulty>,
-	last_weak_block: Option<Vec<(Transaction, Sha256dHash, usize)>>,
+	last_weak_block: Option<Vec<(Transaction, Sha256dHash)>>,
 
 	job_stream: mpsc::Sender<(PoolPayoutInfo, Option<PoolDifficulty>)>,
 }
@@ -406,7 +403,7 @@ impl PoolHandler {
 		self.state.lock().unwrap().pool_priority
 	}
 
-	fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash, usize)>) {
+	fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash)>) {
 		let mut us = self.state.lock().unwrap();
 		match us.cur_difficulty {
 			Some(ref difficulty) => {
@@ -442,59 +439,19 @@ impl PoolHandler {
 
 							match us.last_weak_block {
 								Some(ref last_weak_block) => {
-									let mut old_txids_set = HashSet::with_capacity(last_weak_block.len());
-									for &(_, ref txid, _) in last_weak_block {
-										old_txids_set.insert(txid.clone());
-									}
-									let mut total_len = 0;
-									let mut new_txids_posn = HashMap::with_capacity(post_coinbase_txn.len());
-									for &(_, ref txid, ref txlen) in post_coinbase_txn {
-										if old_txids_set.contains(txid) {
-											new_txids_posn.insert(txid.clone(), total_len);
-											total_len += txlen;
-										}
-									}
-									total_len = 0;
 									let mut old_txids_posn = HashMap::with_capacity(last_weak_block.len());
-									for (idx, &(_, ref txid, ref txlen)) in last_weak_block.iter().enumerate() {
-										if new_txids_posn.contains_key(txid) {
-											old_txids_posn.insert(txid.clone(), (total_len, idx));
-											total_len += txlen;
-										}
+									for (idx, &(_, ref txid)) in last_weak_block.iter().enumerate() {
+										old_txids_posn.insert(txid.clone(), idx + 1); // offset by coinbase tx
 									}
-									actions.push(WeakBlockAction::SkipN { n: 1 }); // Skip original coinbase tx
-									let mut old_tx_idx = 0;
-									let mut old_tx_posn = 0;
-									for &(ref tx, ref txid, ref txlen) in post_coinbase_txn {
+									for &(ref tx, ref txid) in post_coinbase_txn {
 										match old_txids_posn.get(txid) {
 											None => actions.push(WeakBlockAction::NewTx { tx: tx.clone() }),
-											Some(&(potential_new_posn, potential_new_idx)) => {
-												if potential_new_idx >= old_tx_idx && old_tx_posn + (txlen * 3)/2 >= potential_new_posn {
-													let mut skip_count = potential_new_idx - old_tx_idx;
-													while skip_count > 0xff {
-														actions.push(WeakBlockAction::SkipN { n: 0xff });
-														skip_count -= 0xff;
-													}
-													if skip_count != 0 {
-														actions.push(WeakBlockAction::SkipN { n: skip_count as u8 });
-													}
-													actions.push(WeakBlockAction::IncludeTx{});
-
-													old_tx_idx = potential_new_idx + 1;
-												} else {
-													if potential_new_idx > 0xffff {
-														actions.push(WeakBlockAction::NewTx { tx: tx.clone() });
-													} else {
-														actions.push(WeakBlockAction::TakeTx { n: potential_new_idx as u16 });
-													}
-												}
-												old_tx_posn += txlen;
-											},
+											Some(&idx) => actions.push(WeakBlockAction::TakeTx { n: idx as u16 }),
 										}
 									}
 								},
 								None => {
-									for &(ref tx, _, _) in post_coinbase_txn {
+									for &(ref tx, _) in post_coinbase_txn {
 										actions.push(WeakBlockAction::NewTx { tx: tx.clone() });
 									}
 								}
@@ -611,6 +568,8 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				println!("Received ProtocolVersion, using version {}", selected_version);
 
 				match us.stream.as_ref().unwrap().start_send(PoolMessage::GetPayoutInfo {
+					suggested_target: [0xff; 32],
+					minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
 					user_id: us.user_id.clone(),
 					user_auth: us.user_auth.clone(),
 				}) {
@@ -625,7 +584,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::PayoutInfo { signature, payout_info } => {
-				check_msg_sig!(11, payout_info, signature);
+				check_msg_sig!(13, payout_info, signature);
 
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
@@ -652,19 +611,34 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					us.cur_payout_info = Some(payout_info);
 				}
 			},
-			PoolMessage::ShareDifficulty { signature, difficulty } => {
-				check_msg_sig!(12, difficulty, signature);
+			PoolMessage::RejectUserAuth { .. } => {
+				println!("Received RejectUserAuth for single-user connection, pool should have disconnected us, but either way, auth must be bad.");
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+			},
+			PoolMessage::DropUser { .. } => {
+				println!("Received DropUser?");
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+			},
+			PoolMessage::ShareDifficulty { difficulty, .. } => {
+				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+				if difficulty.timestamp < timestamp - 1000*60*20 || difficulty.timestamp > timestamp + 1000*60*1 {
+					println!("Got ShareDifficulty with unreasonable timestamp ({}, our time is {})", difficulty.timestamp, timestamp);
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
 
-				println!("Received new difficulty!");
-				us.cur_difficulty = Some(difficulty);
-				if us.cur_payout_info.is_some() {
-					let cur_difficulty = us.cur_difficulty.clone();
-					let payout_info = us.cur_payout_info.as_ref().unwrap().clone();
-					match us.job_stream.start_send((payout_info, cur_difficulty)) {
-						Ok(_) => {},
-						Err(_) => {
-							println!("Pool updating difficulty too quickly");
-							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				if us.cur_difficulty.is_none() || us.cur_difficulty.as_ref().unwrap().timestamp < difficulty.timestamp {
+					println!("Received new difficulty!");
+					us.cur_difficulty = Some(difficulty);
+					if us.cur_payout_info.is_some() {
+						let cur_difficulty = us.cur_difficulty.clone();
+						let payout_info = us.cur_payout_info.as_ref().unwrap().clone();
+						match us.job_stream.start_send((payout_info, cur_difficulty)) {
+							Ok(_) => {},
+							Err(_) => {
+								println!("Pool updating difficulty too quickly");
+								return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+							}
 						}
 					}
 				}
@@ -683,6 +657,10 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 			},
 			PoolMessage::NewPoolServer { .. } => {
 				unimplemented!();
+			},
+			PoolMessage::VendorMessage { .. } => {
+				println!("Got vendor message");
+				return Ok(());
 			},
 		}
 		Ok(())

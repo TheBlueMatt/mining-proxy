@@ -564,11 +564,6 @@ impl codec::Decoder for WorkMsgFramer {
 				Ok(Some(msg))
 			},
 			3 => {
-				// Quick check to make sure we dont try to fill in a struct partially
-				if bytes.len() < 64+8+32+4+32+4+4+1+8+4+1+4+1+4 {
-					return Ok(None);
-				}
-
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -838,15 +833,9 @@ impl PoolPayoutInfo {
 
 #[derive(Clone)]
 pub struct PoolDifficulty {
+	pub timestamp: u64,
 	pub share_target: [u8; 32],
 	pub weak_block_target: [u8; 32],
-}
-impl PoolDifficulty {
-	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
-		res.reserve(2*32);
-		res.put_slice(&self.share_target[..]);
-		res.put_slice(&self.weak_block_target[..]);
-	}
 }
 
 #[derive(Clone)]
@@ -865,18 +854,12 @@ pub struct PoolShare {
 
 #[derive(Clone)]
 pub enum WeakBlockAction {
-	/// Skips the next n transactions from the original sketch
-	SkipN { // 0b00
-		n: u8,
-	},
-	/// Includes the transaction at the current index from the original sketch
-	IncludeTx {}, // 0b01
 	/// Takes tx at index n from the original sketch (without effecting SkipN/IncludeTx position)
-	TakeTx { // 0b10
+	TakeTx {
 		n: u16
 	},
 	/// Adds a new transaction not in the original sketch
-	NewTx { // 0b11
+	NewTx {
 		tx: Transaction
 	},
 }
@@ -896,7 +879,7 @@ pub struct WeakBlock {
 
 impl WeakBlock {
 	pub fn encode(&self, res: &mut bytes::BytesMut) {
-		res.reserve(4*5 + 32 + 1 + self.user_tag.len() + self.txn.len()/4);
+		res.reserve(4*4 + 32 + 1 + self.user_tag.len() + 2 + self.txn.len()*2);
 
 		res.put_u32_le(self.header_version);
 		res.put_slice(&self.header_prevblock);
@@ -907,60 +890,18 @@ impl WeakBlock {
 		res.put_u8(self.user_tag.len() as u8);
 		res.put_slice(&self.user_tag);
 
-		res.put_u32_le(self.txn.len() as u32);
-
-		let mut action_buff = 0;
-		let mut action_count = 0;
-		macro_rules! push_action {
-			($v: expr) => {
-				{
-					action_buff <<= 2;
-					action_buff |= $v;
-					action_count += 1;
-					if action_count == 4 {
-						res.reserve(1);
-						res.put_u8(action_buff);
-						action_count = 0;
-						action_buff = 0;
-					}
-				}
-			}
-		}
-		for tx in self.txn.iter() {
-			match tx {
-				&WeakBlockAction::SkipN { .. } => {
-					push_action!(0b00);
-				},
-				&WeakBlockAction::IncludeTx {} => {
-					push_action!(0b01);
-				},
-				&WeakBlockAction::TakeTx { .. } => {
-					push_action!(0b10);
-				},
-				&WeakBlockAction::NewTx { .. } => {
-					push_action!(0b11);
-				}
-			}
-		}
-		if action_count != 0 {
-			res.reserve(1);
-			res.put_u8(action_buff << (8 - 2*action_count));
-		}
+		res.put_u16_le(self.txn.len() as u16);
 
 		for tx in self.txn.iter() {
 			match tx {
-				&WeakBlockAction::SkipN { n } => {
-					res.reserve(1);
-					res.put_u8(n);
-				},
-				&WeakBlockAction::IncludeTx {} => {},
 				&WeakBlockAction::TakeTx { n } => {
 					res.reserve(2);
 					res.put_u16_le(n);
 				},
 				&WeakBlockAction::NewTx { ref tx } => {
 					let tx_enc = network::serialize::serialize(tx).unwrap();
-					res.reserve(4 + tx_enc.len());
+					res.reserve(2 + 4 + tx_enc.len());
+					res.put_u16_le(0);
 					res.put_u32_le(tx_enc.len() as u32);
 					res.put_slice(&tx_enc[..]);
 				}
@@ -981,6 +922,8 @@ pub enum PoolMessage {
 		auth_key: PublicKey,
 	},
 	GetPayoutInfo {
+		suggested_target: [u8; 32],
+		minimum_target: [u8; 32],
 		user_id: Vec<u8>,
 		user_auth: Vec<u8>,
 	},
@@ -988,8 +931,14 @@ pub enum PoolMessage {
 		signature: Signature,
 		payout_info: PoolPayoutInfo,
 	},
+	RejectUserAuth {
+		user_id: Vec<u8>,
+	},
+	DropUser {
+		user_id: Vec<u8>,
+	},
 	ShareDifficulty {
-		signature: Signature,
+		user_id: Vec<u8>,
 		difficulty: PoolDifficulty,
 	},
 	Share {
@@ -1003,16 +952,26 @@ pub enum PoolMessage {
 		signature: Signature,
 		new_host_port: String,
 	},
+	VendorMessage {
+		signature: Option<Signature>,
+		vendor: Vec<u8>,
+		message: Vec<u8>,
+	},
 }
 
+/// Decoder for pool messages, not that we simply skip decoding Vendor messages to avoid creating a
+/// 16MB read buffer for them.
 pub struct PoolMsgFramer {
 	secp_ctx: Secp256k1,
+	/// Used to avoid reading large useless vendor messages into memory
+	skip_bytes: usize,
 }
 
 impl PoolMsgFramer {
 	pub fn new() -> PoolMsgFramer {
 		PoolMsgFramer {
 			secp_ctx: Secp256k1::new(),
+			skip_bytes: 0,
 		}
 	}
 }
@@ -1024,43 +983,87 @@ impl codec::Encoder for PoolMsgFramer {
 	fn encode(&mut self, msg: PoolMessage, res: &mut bytes::BytesMut) -> Result<(), io::Error> {
 		match msg {
 			PoolMessage::ProtocolSupport { max_version, min_version, flags } => {
-				res.reserve(1 + 2*3);
+				res.reserve(1 + 3 + 2*3);
 				res.put_u8(1);
+				res.put_u8(0x06);
+				res.put_u16_le(0);
 				res.put_u16_le(max_version);
 				res.put_u16_le(min_version);
 				res.put_u16_le(flags);
 			},
 			PoolMessage::ProtocolVersion { selected_version, flags, ref auth_key } => {
-				res.reserve(1 + 2*2 + 33);
+				res.reserve(1 + 3 + 2 + 33);
 				res.put_u8(2);
+				res.put_u8(0x25);
+				res.put_u16_le(0);
 				res.put_u16_le(selected_version);
 				res.put_u16_le(flags);
 				res.put_slice(&auth_key.serialize());
 			},
-			PoolMessage::GetPayoutInfo { ref user_id, ref user_auth } => {
-				res.reserve(3 + user_id.len() + user_auth.len());
-				res.put_u8(10);
+			PoolMessage::GetPayoutInfo { ref suggested_target, ref minimum_target, ref user_id, ref user_auth } => {
+				res.reserve(1 + 3 + 2*1 + 2*32 + user_id.len() + user_auth.len());
+				res.put_u8(12);
+				res.put_u16_le((2 + 2*32 + user_id.len() + user_auth.len()) as u16);
+				res.put_u8(0);
+
+				res.put_slice(suggested_target);
+				res.put_slice(minimum_target);
 				res.put_u8(user_id.len() as u8);
 				res.put_slice(&user_id);
 				res.put_u8(user_auth.len() as u8);
 				res.put_slice(&user_auth);
 			},
 			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
-				res.reserve(1 + 33);
-				res.put_u8(11);
+				res.reserve(1 + 3 + 33);
+				res.put_u8(13);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				payout_info.encode_unsigned(res);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
 			},
-			PoolMessage::ShareDifficulty { ref signature, ref difficulty } => {
-				res.reserve(1 + 33 + 32*2);
-				res.put_u8(12);
-				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
-				difficulty.encode_unsigned(res);
+			PoolMessage::RejectUserAuth { ref user_id } => {
+				res.reserve(1 + 3 + 1 + user_id.len());
+				res.put_u8(14);
+				res.put_u16_le(1 + user_id.len() as u16);
+				res.put_u8(0);
+				res.put_u8(user_id.len() as u8);
+				res.put_slice(user_id);
+			},
+			PoolMessage::DropUser { ref user_id } => {
+				res.reserve(1 + 3 + 1 + user_id.len());
+				res.put_u8(15);
+				res.put_u16_le(1 + user_id.len() as u16);
+				res.put_u8(0);
+				res.put_u8(user_id.len() as u8);
+				res.put_slice(user_id);
+			},
+			PoolMessage::ShareDifficulty { ref user_id, ref difficulty } => {
+				res.reserve(1 + 3 + 1 + user_id.len() + 8 + 32*2);
+				res.put_u8(16);
+				res.put_u16_le(1 + user_id.len() as u16 + 8 + 32*2);
+				res.put_u8(0);
+				res.put_u8(user_id.len() as u8);
+				res.put_slice(user_id);
+				res.put_u64_le(difficulty.timestamp);
+				res.put_slice(&difficulty.share_target);
+				res.put_slice(&difficulty.weak_block_target);
 			},
 			PoolMessage::Share { ref share } => {
 				let tx_enc = network::serialize::serialize(&share.coinbase_tx).unwrap();
-				res.reserve(1 + 4*4 + 32 + 1 + share.merkle_rhss.len()*32 + 4 + tx_enc.len() + 1 + share.user_tag.len());
-				res.put_u8(13);
+				res.reserve(1 + 3 + 4*4 + 32 + 1 + share.merkle_rhss.len()*32 + 4 + tx_enc.len() + 1 + share.user_tag.len());
+				res.put_u8(17);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				res.put_u32_le(share.header_version);
 				res.put_slice(&share.header_prevblock);
 				res.put_u32_le(share.header_time);
@@ -1074,52 +1077,136 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_slice(&tx_enc[..]);
 				res.put_u8(share.user_tag.len() as u8);
 				res.put_slice(&share.user_tag[..]);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
 			},
 			PoolMessage::WeakBlock { ref sketch } => {
-				res.reserve(1);
-				res.put_u8(14);
+				res.reserve(1 + 3);
+				res.put_u8(18);
+
+				let len_pos = res.len();
+				res.put_u8(0);
+				res.put_u16_le(0);
+
 				sketch.encode(res);
+
+				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
 			},
 			PoolMessage::WeakBlockStateReset { } => {
-				res.reserve(1);
-				res.put_u8(15);
+				res.reserve(1 + 3);
+				res.put_u8(19);
+				res.put_u8(0);
+				res.put_u16_le(0);
 			},
 			PoolMessage::NewPoolServer { ref signature, ref new_host_port } => {
-				res.reserve(1 + 33 + 1 + new_host_port.len());
-				res.put_u8(16);
+				res.reserve(1 + 3 + 33 + 1 + new_host_port.len());
+				res.put_u8(10);
+				res.put_u16_le(33 + 1 + new_host_port.len() as u16);
+				res.put_u8(0);
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				res.put_u8(new_host_port.len() as u8);
 				res.put_slice(new_host_port.as_bytes());
+			},
+			PoolMessage::VendorMessage { ref signature, ref vendor, ref message } => {
+				let len = 1 + if signature.is_some() { 33 } else { 0 } + 1 + vendor.len() + message.len();
+				if len > 0xffffff {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
+
+				res.reserve(1 + 3 + len);
+				res.put_u8(11);
+				res.put_u8(((len >> 8*0) & 0xff) as u8);
+				res.put_u8(((len >> 8*1) & 0xff) as u8);
+				res.put_u8(((len >> 8*2) & 0xff) as u8);
+
+				match signature {
+					&Some(ref sig) => {
+						res.put_u8(1);
+						res.put_slice(&sig.serialize_compact(&self.secp_ctx));
+					},
+					&None => res.put_u8(0),
+				}
+
+				res.put_u8(vendor.len() as u8);
+				res.put_slice(&vendor);
+				res.put_slice(&message);
 			},
 		}
 		Ok(())
 	}
 }
 
-
 impl codec::Decoder for PoolMsgFramer {
 	type Item = PoolMessage;
 	type Error = io::Error;
 
 	fn decode(&mut self, bytes: &mut bytes::BytesMut) -> Result<Option<PoolMessage>, io::Error> {
-		if bytes.len() == 0 { return Ok(None); }
+		if self.skip_bytes != 0 {
+			let read = cmp::min(self.skip_bytes, bytes.len());
+			bytes.advance(read);
+			self.skip_bytes -= read;
+			if self.skip_bytes != 0 { return Ok(None); }
+		}
 
-		let mut read_pos = 1;
+		if bytes.len() < 4 { return Ok(None); }
+
+		let len = ((((bytes[3] as usize) << 8) | (bytes[2] as usize)) << 8) | bytes[1] as usize;
+
+		if match bytes[0] {
+			1 => len != 6,
+			2 => len != 37,
+			12 => len > 576,
+			13 => len > 1000331,
+			14 => len > 256,
+			15 => len > 256,
+			16 => len > 328,
+			17 => len > 1000341,
+			18 => len > 4000306,
+			19 => len != 0,
+			10 => len > 320,
+			11 => false,
+			_ => true,
+		} {
+			return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+		}
+
+		if bytes[0] == 11 { // Vendor message
+			if bytes.len() >= 4 + len {
+				bytes.advance(4 + len);
+				return Ok(None);
+			}
+			self.skip_bytes = len + 4 - bytes.len();
+			let skip = bytes.len();
+			bytes.advance(skip);
+			return Ok(None);
+		}
+
+		if bytes.len() < 4 + len { return Ok(None); }
+
+		let mut read_pos = 4;
 		macro_rules! get_slice {
 			( $size: expr ) => {
 				{
-					if bytes.len() < read_pos + $size as usize {
-						return Ok(None);
+					if read_pos as u64 + $size as u64 > len as u64 + 4 {
+						return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 					}
 					read_pos += $size as usize;
 					&bytes[read_pos - ($size as usize)..read_pos]
 				}
 			}
 		}
-
 		macro_rules! advance_bytes {
 			() => {
-				bytes.advance(read_pos);
+				{
+					if read_pos != len + 4 {
+						return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+					}
+					bytes.advance(read_pos);
+				}
 			}
 		}
 
@@ -1153,7 +1240,12 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			10 => {
+			12 => {
+				let mut suggested_target = [0; 32];
+				suggested_target.copy_from_slice(get_slice!(32));
+				let mut minimum_target = [0; 32];
+				minimum_target.copy_from_slice(get_slice!(32));
+
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
 				let user_auth_len = get_slice!(1)[0];
@@ -1161,11 +1253,13 @@ impl codec::Decoder for PoolMsgFramer {
 
 				advance_bytes!();
 				Ok(Some(PoolMessage::GetPayoutInfo {
+					suggested_target,
+					minimum_target,
 					user_id,
 					user_auth,
 				}))
 			},
-			11 => {
+			13 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -1179,6 +1273,9 @@ impl codec::Decoder for PoolMsgFramer {
 				let coinbase_postfix = get_slice!(coinbase_postfix_len).to_vec();
 
 				let script_len = slice_to_le16(get_slice!(2));
+				if script_len > 8192 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
 				let script = Script::from(get_slice!(script_len).to_vec());
 
 				let coinbase_output_count = get_slice!(1)[0] as usize;
@@ -1205,19 +1302,32 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			12 => {
-				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
-					Ok(sig) => sig,
-					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
-				};
+			14 => {
+				let user_id_len = get_slice!(1)[0];
+				let user_id = get_slice!(user_id_len).to_vec();
+				advance_bytes!();
+				Ok(Some(PoolMessage::RejectUserAuth { user_id }))
+			},
+			15 => {
+				let user_id_len = get_slice!(1)[0];
+				let user_id = get_slice!(user_id_len).to_vec();
+				advance_bytes!();
+				Ok(Some(PoolMessage::DropUser { user_id }))
+			},
+			16 => {
+				let user_id_len = get_slice!(1)[0];
+				let user_id = get_slice!(user_id_len).to_vec();
+				let timestamp = slice_to_le64(get_slice!(8));
+
 				let mut share_target = [0; 32];
 				share_target.copy_from_slice(get_slice!(32));
 				let mut weak_block_target = [0; 32];
 				weak_block_target.copy_from_slice(get_slice!(32));
 
 				let msg = PoolMessage::ShareDifficulty {
-					signature,
+					user_id,
 					difficulty: PoolDifficulty {
+						timestamp,
 						share_target,
 						weak_block_target,
 					}
@@ -1225,7 +1335,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			13 => {
+			17 => {
 				let header_version = slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
@@ -1245,9 +1355,6 @@ impl codec::Decoder for PoolMsgFramer {
 				}
 
 				let tx_len = slice_to_le32(get_slice!(4));
-				if tx_len > 1000000 {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
-				}
 				let coinbase_tx = match network::serialize::deserialize(get_slice!(tx_len)) {
 					Ok(tx) => tx,
 					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
@@ -1272,7 +1379,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			14 => {
+			18 => {
 				let header_version = slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
@@ -1283,42 +1390,19 @@ impl codec::Decoder for PoolMsgFramer {
 				let user_tag_len = get_slice!(1)[0];
 				let user_tag = get_slice!(user_tag_len).to_vec();
 
-				let mut actions = Vec::new();
+				let action_count = slice_to_le16(get_slice!(2)) as usize;
+				let mut actions = Vec::with_capacity(action_count);
 
-				{
-					let action_count = slice_to_le32(get_slice!(4));
-					let action_bits = get_slice!((action_count + 3) / 4);
-
-					let mut total_tx_len = 0;
-					for action_byte in action_bits {
-						for i in 1..5 {
-							match (action_byte >> (8 - 2*i)) as u8 & (0b11 as u8) {
-								0b00 => {
-									let n = get_slice!(1)[0];
-									actions.push(WeakBlockAction::SkipN { n });
-								},
-								0b01 => {
-									actions.push(WeakBlockAction::IncludeTx{});
-								},
-								0b10 => {
-									let n = slice_to_le16(get_slice!(2));
-									actions.push(WeakBlockAction::TakeTx { n });
-								},
-								0b11 => {
-									let txlen = slice_to_le32(get_slice!(4));
-									if txlen > 4000000 || total_tx_len + txlen > 4000000 {
-										return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
-									}
-									total_tx_len += txlen;
-									actions.push(WeakBlockAction::NewTx { tx: match network::serialize::deserialize(get_slice!(txlen)) {
-										Ok(tx) => tx,
-										Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
-									} });
-								},
-								_ => unimplemented!(),
-							}
-							if actions.len() >= action_count as usize { break; }
-						}
+				while actions.len() < action_count {
+					let action = slice_to_le16(get_slice!(2));
+					if action == 0 {
+						let txlen = slice_to_le32(get_slice!(4));
+						actions.push(WeakBlockAction::NewTx { tx: match network::serialize::deserialize(get_slice!(txlen)) {
+							Ok(tx) => tx,
+							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
+						} });
+					} else {
+						actions.push(WeakBlockAction::TakeTx { n: action });
 					}
 				}
 
@@ -1335,11 +1419,11 @@ impl codec::Decoder for PoolMsgFramer {
 					}
 				}))
 			},
-			15 => {
+			19 => {
 				advance_bytes!();
 				Ok(Some(PoolMessage::WeakBlockStateReset {}))
 			},
-			16 => {
+			10 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -1355,6 +1439,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
+			// 11 (VendorMessage) handled pre-match
 			_ => {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 			}
