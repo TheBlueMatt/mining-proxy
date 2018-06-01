@@ -13,11 +13,12 @@ use msg_framing::*;
 
 mod utils;
 
+use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::network::serialize::BitcoinHash;
 use bitcoin::util::address::Address;
 use bitcoin::util::privkey;
-use bitcoin::util::hash::Sha256dHash;
+use bitcoin::util::hash::{Sha256dHash, bitcoin_merkle_root};
 
 use bytes::BufMut;
 
@@ -34,7 +35,7 @@ use tokio_io::AsyncRead;
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
-use std::{env,io};
+use std::{env, io, mem};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,6 +49,10 @@ fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
 
 fn share_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64) {
 	println!("Got valid share with value {} from {} from machine identified as: {}", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag));
+}
+
+fn weak_block_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64, _header: &BlockHeader, txn: &Vec<Transaction>) {
+	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag));
 }
 
 const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
@@ -203,6 +208,7 @@ fn main() {
 
 					let mut client_version = None;
 					let mut client_user_id = None;
+					let mut last_weak_block = None;
 
 					tokio::spawn(rx.for_each(move |msg| {
 						macro_rules! send_response {
@@ -357,9 +363,109 @@ fn main() {
 									println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&SHARE_TARGET[..]));
 								}
 							},
-							PoolMessage::WeakBlock { .. } => {
-								println!("Received WeakBlock");
-								//TODO: Check WeakBlock
+							PoolMessage::WeakBlock { mut sketch } => {
+								if client_version.is_none() || client_user_id.is_none() {
+									println!("Client sent Share before version/id handshake");
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+								if sketch.txn.len() < 1 {
+									println!("Client sent WeakBlock with no transactions");
+									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+								}
+
+								let mut our_payout = 0;
+								match &sketch.txn[0] {
+									&WeakBlockAction::TakeTx { .. } => {
+										println!("Client sent WeakBlock with an invalid coinbase");
+										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+									},
+									&WeakBlockAction::NewTx { ref tx } => {
+										if tx.input.len() != 1 || tx.output.len() < 1 {
+											println!("Client sent share with a coinbase tx which had an input count other than 1 or no payout");
+											return future::result(Ok(()));
+										}
+
+										for (idx, out) in tx.output.iter().enumerate() {
+											if idx == 0 {
+												our_payout = out.value;
+												if out.script_pubkey != payout_addr_clone {
+													println!("Got share which paid out to an unknown location");
+													return future::result(Ok(()));
+												}
+											} else if out.value != 0 {
+												println!("Got share which paid out excess to unkown location");
+												return future::result(Ok(()));
+											}
+										}
+									},
+								}
+
+								let mut dummy_last_weak_block = Vec::new();
+
+								let merkle_root = {
+									let mut txids = Vec::with_capacity(sketch.txn.len());
+									let last_weak_ref: &Vec<Transaction> = if last_weak_block.is_some() {
+										last_weak_block.as_ref().unwrap()
+									} else { &dummy_last_weak_block };
+
+									for action in sketch.txn.iter() {
+										match action {
+											&WeakBlockAction::TakeTx { n } => {
+												if n as usize >= last_weak_ref.len() {
+													println!("Got weak block with bad tx reference");
+													return future::result(Ok(()));
+												}
+												txids.push(last_weak_ref[n as usize].txid());
+											},
+											&WeakBlockAction::NewTx { ref tx } => {
+												txids.push(tx.txid());
+											}
+										}
+									}
+
+									bitcoin_merkle_root(txids)
+								};
+
+								let header = BlockHeader {
+									version: sketch.header_version,
+									prev_blockhash: Sha256dHash::from(&sketch.header_prevblock[..]),
+									merkle_root: merkle_root,
+									time: sketch.header_time,
+									bits: sketch.header_nbits,
+									nonce: sketch.header_nonce,
+								};
+
+								let mut new_txn = Vec::with_capacity(sketch.txn.len());
+								{
+									let last_weak_ref = if last_weak_block.is_some() {
+										last_weak_block.as_mut().unwrap()
+									} else { &mut dummy_last_weak_block };
+
+									for action in sketch.txn.drain(..) {
+										match action {
+											WeakBlockAction::TakeTx { n } => {
+												if n as usize >= last_weak_ref.len() {
+													println!("Got weak block with bad tx reference");
+													return future::result(Ok(()));
+												}
+												new_txn.push(Transaction { version: 0, lock_time: 0, input: Vec::new(), output: Vec::new() });
+												mem::swap(&mut last_weak_ref[n as usize], &mut new_txn.last_mut().unwrap());
+											},
+											WeakBlockAction::NewTx { tx } => {
+												new_txn.push(tx);
+											}
+										}
+									}
+								}
+
+								let block_hash = header.bitcoin_hash();
+								if utils::does_hash_meet_target(&block_hash[..], &WEAK_BLOCK_TARGET) {
+									weak_block_submitted(client_user_id.as_ref().unwrap(), &sketch.user_tag, our_payout, &header, &new_txn);
+								} else {
+									println!("Got weak block that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&WEAK_BLOCK_TARGET[..]));
+								}
+
+								last_weak_block = Some(new_txn);
 							},
 							PoolMessage::WeakBlockStateReset { } => {
 								println!("Got WeakBlockStateReset?");
