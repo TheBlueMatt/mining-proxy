@@ -555,6 +555,9 @@ impl StratumServer {
 					}
 					send_response!(serde_json::Value::Null, {});
 				},
+				"mining.multi_version" => {
+					// Some insane bitmain ASICBoost thing?
+				},
 				_ => {
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError)))
 				}
