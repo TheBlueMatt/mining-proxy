@@ -38,6 +38,7 @@ use secp256k1::Secp256k1;
 use std::{env, io, mem};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{hash_map, HashMap};
 
 use tokio_threadpool::park::DefaultPark;
 use tokio_executor::park::Park;
@@ -77,6 +78,11 @@ impl Park for LoadMeasuringPark {
 	fn park_timeout(&mut self, time: std::time::Duration) -> Result<(), Self::Error> {
 		self.inner.park_timeout(time)
 	}
+}
+
+struct PerUserClientRef {
+	send_stream: mpsc::Sender<PoolMessage>,
+	client_id: u64,
 }
 
 fn main() {
@@ -196,18 +202,16 @@ fn main() {
 						}
 					}
 
-					let payout_addr_clone = payout_addr.as_ref().unwrap().clone();
-					let client_id = max_client_id;
-					max_client_id += 1;
-
-					let mut client_coinbase_postfix = utils::le64_to_array(client_id).to_vec();
-					match server_id {
-						Some(ref id) => client_coinbase_postfix.extend_from_slice(id.clone().as_bytes()),
-						None => {},
+					let server_id_vec = match server_id {
+						Some(ref id) => id.as_bytes().to_vec(),
+						None => vec![],
 					};
+					let payout_addr_clone = payout_addr.as_ref().unwrap().clone();
+
+					let mut connection_clients = HashMap::new();
+					let mut client_ids = HashMap::new();
 
 					let mut client_version = None;
-					let mut client_user_id = None;
 					let mut last_weak_block = None;
 
 					tokio::spawn(rx.for_each(move |msg| {
@@ -216,6 +220,46 @@ fn main() {
 								match send_sink.start_send($msg) {
 									Ok(_) => {},
 									Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)))
+								}
+							}
+						}
+
+						macro_rules! check_coinbase_tx {
+							($coinbase_tx: expr) => {
+								{
+									if $coinbase_tx.input.len() != 1 || $coinbase_tx.output.len() < 1 {
+										println!("Client sent share with a coinbase_tx which had an input count other than 1 or no payout");
+										return future::result(Ok(()));
+									}
+
+									let mut our_payout = 0;
+									for (idx, out) in $coinbase_tx.output.iter().enumerate() {
+										if idx == 0 {
+											our_payout = out.value;
+											if out.script_pubkey != payout_addr_clone {
+												println!("Got share which paid out to an unknown location");
+												return future::result(Ok(()));
+											}
+										} else if out.value != 0 {
+											println!("Got share which paid out excess to unkown location");
+											return future::result(Ok(()));
+										}
+									}
+
+									let coinbase = &$coinbase_tx.input[0].script_sig[..];
+									if coinbase.len() < 8 {
+										println!("Client sent share which failed to include the required coinbase postfix");
+										return future::result(Ok(()));
+									}
+
+									let client_id = if let Some(client_id) = client_ids.get(&utils::slice_to_le64(&coinbase[coinbase.len() - 8..])) {
+										client_id
+									} else {
+										println!("Got share for unknown client");
+										return future::result(Ok(()));
+									};
+
+									(our_payout, client_id)
 								}
 							}
 						}
@@ -253,36 +297,55 @@ fn main() {
 									println!("Client sent GetPayoutInfo before ProtocolSupport");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
-								if client_user_id.is_some() {
-									//TODO: This needs to be supported
-									println!("We don't yet support proxies with multiple clients!");
-									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
-								}
-								if !check_user_auth(&user_id, &user_auth) {
-									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
-								}
-								client_user_id = Some(user_id.clone());
+								if {
+									let connection_entry = connection_clients.entry(user_id.clone());
+									if let hash_map::Entry::Occupied(_) = connection_entry {
+										println!("Got a GetPayoutInfo for an already-registered client, disconencting proxy!");
+										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+									}
+									if check_user_auth(&user_id, &user_auth) {
+										let client_id = max_client_id;
+										max_client_id += 1;
 
-								let payout_info = PoolPayoutInfo {
-									user_id: user_id.clone(),
-									timestamp,
-									coinbase_postfix: client_coinbase_postfix.clone(),
-									remaining_payout: payout_addr_clone.clone(),
-									appended_outputs: vec![],
-								};
-								send_response!(PoolMessage::PayoutInfo {
-									signature: sign_message!(payout_info, 13),
-									payout_info,
-								});
+										let mut client_coinbase_postfix = server_id_vec.clone();
+										client_coinbase_postfix.extend_from_slice(&utils::le64_to_array(client_id));
 
-								send_response!(PoolMessage::ShareDifficulty {
-									user_id,
-									difficulty: PoolDifficulty {
-										timestamp,
-										share_target: SHARE_TARGET,
-										weak_block_target: WEAK_BLOCK_TARGET,
-									},
-								});
+										client_ids.insert(client_id, user_id.clone());
+										connection_entry.or_insert(PerUserClientRef {
+											send_stream: send_sink.clone(),
+											client_id,
+										});
+
+										let payout_info = PoolPayoutInfo {
+											user_id: user_id.clone(),
+											timestamp,
+											coinbase_postfix: client_coinbase_postfix.clone(),
+											remaining_payout: payout_addr_clone.clone(),
+											appended_outputs: vec![],
+										};
+										send_response!(PoolMessage::PayoutInfo {
+											signature: sign_message!(payout_info, 13),
+											payout_info,
+										});
+
+										send_response!(PoolMessage::ShareDifficulty {
+											user_id: user_id.clone(),
+											difficulty: PoolDifficulty {
+												timestamp,
+												share_target: SHARE_TARGET,
+												weak_block_target: WEAK_BLOCK_TARGET,
+											},
+										});
+										false
+									} else { true }
+								} {
+									if connection_clients.is_empty() {
+										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+									} else {
+										send_response!(PoolMessage::RejectUserAuth { user_id });
+										return future::result(Ok(()));
+									}
+								}
 							},
 							PoolMessage::PayoutInfo { .. } => {
 								println!("Got PayoutInfo?");
@@ -293,45 +356,24 @@ fn main() {
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
 							PoolMessage::DropUser { user_id } => {
-								if client_user_id.is_none() || *client_user_id.as_ref().unwrap() != user_id {
+								if let Some(client_ref) = connection_clients.remove(&user_id) {
+									client_ids.remove(&client_ref.client_id);
+								} else {
 									println!("Got DropUser for an un-authed user");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
-								client_user_id = None;
 							},
 							PoolMessage::ShareDifficulty { .. } => {
 								println!("Got ShareDifficulty?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
 							PoolMessage::Share { ref share } => {
-								if client_version.is_none() || client_user_id.is_none() {
+								if client_version.is_none() || connection_clients.is_empty() {
 									println!("Client sent Share before version/id handshake");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 
-								if share.coinbase_tx.input.len() != 1 || share.coinbase_tx.output.len() < 1 {
-									println!("Client sent share with a coinbase_tx which had an input count other than 1 or no payout");
-									return future::result(Ok(()));
-								}
-
-								if !share.coinbase_tx.input[0].script_sig[..].ends_with(&client_coinbase_postfix[..]) {
-									println!("Client sent share which failed to include the required coinbase postfix");
-									return future::result(Ok(()));
-								}
-
-								let mut our_payout = 0;
-								for (idx, out) in share.coinbase_tx.output.iter().enumerate() {
-									if idx == 0 {
-										our_payout = out.value;
-										if out.script_pubkey != payout_addr_clone {
-											println!("Got share which paid out to an unknown location");
-											return future::result(Ok(()));
-										}
-									} else if out.value != 0 {
-										println!("Got share which paid out excess to unkown location");
-										return future::result(Ok(()));
-									}
-								}
+								let (our_payout, client_id) = check_coinbase_tx!(share.coinbase_tx);
 
 								let mut merkle_lhs = [0; 32];
 								merkle_lhs.copy_from_slice(&share.coinbase_tx.txid()[..]);
@@ -358,13 +400,13 @@ fn main() {
 								if utils::does_hash_meet_target(&block_hash[..], &WEAK_BLOCK_TARGET) {
 									println!("Got share that met weak block target, ignored as we'll check the weak block");
 								} else if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
-									share_submitted(client_user_id.as_ref().unwrap(), &share.user_tag, our_payout);
+									share_submitted(client_id, &share.user_tag, our_payout);
 								} else {
 									println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&SHARE_TARGET[..]));
 								}
 							},
 							PoolMessage::WeakBlock { mut sketch } => {
-								if client_version.is_none() || client_user_id.is_none() {
+								if client_version.is_none() || connection_clients.is_empty() {
 									println!("Client sent Share before version/id handshake");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
@@ -373,32 +415,15 @@ fn main() {
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 
-								let mut our_payout = 0;
-								match &sketch.txn[0] {
+								let (our_payout, client_id) = match &sketch.txn[0] {
 									&WeakBlockAction::TakeTx { .. } => {
 										println!("Client sent WeakBlock with an invalid coinbase");
 										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 									},
 									&WeakBlockAction::NewTx { ref tx } => {
-										if tx.input.len() != 1 || tx.output.len() < 1 {
-											println!("Client sent share with a coinbase tx which had an input count other than 1 or no payout");
-											return future::result(Ok(()));
-										}
-
-										for (idx, out) in tx.output.iter().enumerate() {
-											if idx == 0 {
-												our_payout = out.value;
-												if out.script_pubkey != payout_addr_clone {
-													println!("Got share which paid out to an unknown location");
-													return future::result(Ok(()));
-												}
-											} else if out.value != 0 {
-												println!("Got share which paid out excess to unkown location");
-												return future::result(Ok(()));
-											}
-										}
+										check_coinbase_tx!(tx)
 									},
-								}
+								};
 
 								let mut dummy_last_weak_block = Vec::new();
 
@@ -460,7 +485,7 @@ fn main() {
 
 								let block_hash = header.bitcoin_hash();
 								if utils::does_hash_meet_target(&block_hash[..], &WEAK_BLOCK_TARGET) {
-									weak_block_submitted(client_user_id.as_ref().unwrap(), &sketch.user_tag, our_payout, &header, &new_txn);
+									weak_block_submitted(client_id, &sketch.user_tag, our_payout, &header, &new_txn);
 								} else {
 									println!("Got weak block that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&WEAK_BLOCK_TARGET[..]));
 								}

@@ -593,8 +593,8 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 
-				if payout_info.coinbase_postfix.len() > 42 {
-					println!("Pool sent payout_info larger than 42 bytes");
+				if payout_info.coinbase_postfix.len() > 50 {
+					println!("Pool sent payout_info larger than 50 bytes");
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 

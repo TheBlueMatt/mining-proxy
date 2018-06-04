@@ -18,6 +18,8 @@ use std::error::Error;
 use std::{cmp, fmt, io};
 use std::sync::Arc;
 
+use utils;
+
 fn le16_into_slice(u: u16, v: &mut [u8]) {
 	assert_eq!(v.len(), 2);
 	v[0] = ((u >> 8*0) & 0xff) as u8;
@@ -439,32 +441,6 @@ impl codec::Encoder for WorkMsgFramer {
 	}
 }
 
-#[inline]
-fn slice_to_le16(v: &[u8]) -> u16 {
-	((v[1] as u16) << 8*1) |
-	((v[0] as u16) << 8*0)
-}
-
-#[inline]
-fn slice_to_le32(v: &[u8]) -> u32 {
-	((v[3] as u32) << 8*3) |
-	((v[2] as u32) << 8*2) |
-	((v[1] as u32) << 8*1) |
-	((v[0] as u32) << 8*0)
-}
-
-#[inline]
-fn slice_to_le64(v: &[u8]) -> u64 {
-	((v[7] as u64) << 8*7) |
-	((v[6] as u64) << 8*6) |
-	((v[5] as u64) << 8*5) |
-	((v[4] as u64) << 8*4) |
-	((v[3] as u64) << 8*3) |
-	((v[2] as u64) << 8*2) |
-	((v[1] as u64) << 8*1) |
-	((v[0] as u64) << 8*0)
-}
-
 impl codec::Decoder for WorkMsgFramer {
 	type Item = WorkMessage;
 	type Error = io::Error;
@@ -537,22 +513,22 @@ impl codec::Decoder for WorkMsgFramer {
 		match bytes[0] {
 			1 => {
 				let msg = WorkMessage::ProtocolSupport {
-					max_version: slice_to_le16(get_slice!(2)),
-					min_version: slice_to_le16(get_slice!(2)),
-					flags: slice_to_le16(get_slice!(2)),
+					max_version: utils::slice_to_le16(get_slice!(2)),
+					min_version: utils::slice_to_le16(get_slice!(2)),
+					flags: utils::slice_to_le16(get_slice!(2)),
 				};
 				advance_bytes!();
 				Ok(Some(msg))
 			},
 			2 => {
-				let selected_version = slice_to_le16(get_slice!(2));
+				let selected_version = utils::slice_to_le16(get_slice!(2));
 				if selected_version != 1 {
 					// We don't know how to deserialize anything else...
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
 				let msg = WorkMessage::ProtocolVersion {
 					selected_version: selected_version,
-					flags: slice_to_le16(get_slice!(2)),
+					flags: utils::slice_to_le16(get_slice!(2)),
 					auth_key: match PublicKey::from_slice(&self.secp_ctx, get_slice!(33)) {
 						Ok(key) => key,
 						Err(_) => {
@@ -568,15 +544,15 @@ impl codec::Decoder for WorkMsgFramer {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let template_timestamp = slice_to_le64(get_slice!(8));
+				let template_timestamp = utils::slice_to_le64(get_slice!(8));
 				let mut target = [0; 32];
 				target[..].copy_from_slice(get_slice!(32));
 
-				let header_version = slice_to_le32(get_slice!(4));
+				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock[..].copy_from_slice(get_slice!(32));
-				let header_time = slice_to_le32(get_slice!(4));
-				let header_nbits = slice_to_le32(get_slice!(4));
+				let header_time = utils::slice_to_le32(get_slice!(4));
+				let header_nbits = utils::slice_to_le32(get_slice!(4));
 
 				let merkle_rhss_count = get_slice!(1)[0] as usize;
 				if merkle_rhss_count > 16 {
@@ -589,9 +565,9 @@ impl codec::Decoder for WorkMsgFramer {
 					merkle_rhss.push(merkle_rhs);
 				}
 
-				let coinbase_value_remaining = slice_to_le64(get_slice!(8));
+				let coinbase_value_remaining = utils::slice_to_le64(get_slice!(8));
 
-				let coinbase_version = slice_to_le32(get_slice!(4));
+				let coinbase_version = utils::slice_to_le32(get_slice!(4));
 				let coinbase_prefix_len = get_slice!(1)[0] as usize;
 				if coinbase_prefix_len > 92 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -604,9 +580,9 @@ impl codec::Decoder for WorkMsgFramer {
 				}
 				let coinbase_postfix = get_slice!(coinbase_postfix_len).to_vec();
 
-				let coinbase_input_sequence = slice_to_le32(get_slice!(4));
+				let coinbase_input_sequence = utils::slice_to_le32(get_slice!(4));
 
-				let remaining_coinbase_tx_len = slice_to_le16(get_slice!(2));
+				let remaining_coinbase_tx_len = utils::slice_to_le16(get_slice!(2));
 				if remaining_coinbase_tx_len > 32767 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
@@ -643,12 +619,12 @@ impl codec::Decoder for WorkMsgFramer {
 				Ok(Some(msg))
 			},
 			4 => {
-				let template_timestamp = slice_to_le64(get_slice!(8));
-				let header_version = slice_to_le32(get_slice!(4));
-				let header_time = slice_to_le32(get_slice!(4));
-				let header_nonce = slice_to_le32(get_slice!(4));
+				let template_timestamp = utils::slice_to_le64(get_slice!(8));
+				let header_version = utils::slice_to_le32(get_slice!(4));
+				let header_time = utils::slice_to_le32(get_slice!(4));
+				let header_nonce = utils::slice_to_le32(get_slice!(4));
 				let user_tag = get_slice!(get_slice!(1)[0]).to_vec();
-				let tx_len = slice_to_le32(get_slice!(4));
+				let tx_len = utils::slice_to_le32(get_slice!(4));
 				if tx_len > 1000000 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
@@ -671,7 +647,7 @@ impl codec::Decoder for WorkMsgFramer {
 			},
 			5 => {
 				let msg = WorkMessage::TransactionDataRequest {
-					template_timestamp: slice_to_le64(get_slice!(8)),
+					template_timestamp: utils::slice_to_le64(get_slice!(8)),
 				};
 				advance_bytes!();
 				Ok(Some(msg))
@@ -681,15 +657,15 @@ impl codec::Decoder for WorkMsgFramer {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let template_timestamp = slice_to_le64(get_slice!(8));
+				let template_timestamp = utils::slice_to_le64(get_slice!(8));
 
-				let tx_count = slice_to_le32(get_slice!(4)) as usize;
+				let tx_count = utils::slice_to_le32(get_slice!(4)) as usize;
 				if bytes.len() < 64 + 8 + 4 + tx_count * 4 {
 					return Ok(None)
 				}
 				let mut txn = Vec::with_capacity(tx_count);
 				for _ in 0..tx_count {
-					let tx_len = slice_to_le32(get_slice!(4));
+					let tx_len = utils::slice_to_le32(get_slice!(4));
 					let tx_data = match network::serialize::deserialize(get_slice!(tx_len)) {
 						Ok(tx) => tx,
 						Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -712,7 +688,7 @@ impl codec::Decoder for WorkMsgFramer {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let timestamp = slice_to_le64(get_slice!(8));
+				let timestamp = utils::slice_to_le64(get_slice!(8));
 				let prefix_postfix_len = get_slice!(1)[0];
 				if prefix_postfix_len > 100 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -732,13 +708,13 @@ impl codec::Decoder for WorkMsgFramer {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let template_timestamp = slice_to_le64(get_slice!(8));
-				let template_variant = slice_to_le64(get_slice!(8));
+				let template_timestamp = utils::slice_to_le64(get_slice!(8));
+				let template_variant = utils::slice_to_le64(get_slice!(8));
 
 				let mut target = [0; 32];
 				target[..].copy_from_slice(get_slice!(32));
 
-				let header_version = slice_to_le32(get_slice!(4));
+				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock[..].copy_from_slice(get_slice!(32));
 				let mut header_merkle_root = [0; 32];
@@ -754,8 +730,8 @@ impl codec::Decoder for WorkMsgFramer {
 						header_version: header_version,
 						header_prevblock: header_prevblock,
 						header_merkle_root: header_merkle_root,
-						header_time: slice_to_le32(get_slice!(4)),
-						header_nbits: slice_to_le32(get_slice!(4)),
+						header_time: utils::slice_to_le32(get_slice!(4)),
+						header_nbits: utils::slice_to_le32(get_slice!(4)),
 					},
 				};
 				advance_bytes!();
@@ -763,12 +739,12 @@ impl codec::Decoder for WorkMsgFramer {
 			},
 			9 => {
 				let msg = WorkMessage::WinningNonceHeader {
-					template_timestamp: slice_to_le64(get_slice!(8)),
-					template_variant: slice_to_le64(get_slice!(8)),
+					template_timestamp: utils::slice_to_le64(get_slice!(8)),
+					template_variant: utils::slice_to_le64(get_slice!(8)),
 
-					header_version: slice_to_le32(get_slice!(4)),
-					header_time: slice_to_le32(get_slice!(4)),
-					header_nonce: slice_to_le32(get_slice!(4)),
+					header_version: utils::slice_to_le32(get_slice!(4)),
+					header_time: utils::slice_to_le32(get_slice!(4)),
+					header_nonce: utils::slice_to_le32(get_slice!(4)),
 
 					user_tag: get_slice!(get_slice!(1)[0]).to_vec(),
 				};
@@ -854,7 +830,7 @@ pub struct PoolShare {
 
 #[derive(Clone)]
 pub enum WeakBlockAction {
-	/// Takes tx at index n from the original sketch (without effecting SkipN/IncludeTx position)
+	/// Takes tx at index n from the original sketch
 	TakeTx {
 		n: u16
 	},
@@ -1213,22 +1189,22 @@ impl codec::Decoder for PoolMsgFramer {
 		match bytes[0] {
 			1 => {
 				let msg = PoolMessage::ProtocolSupport {
-					max_version: slice_to_le16(get_slice!(2)),
-					min_version: slice_to_le16(get_slice!(2)),
-					flags: slice_to_le16(get_slice!(2)),
+					max_version: utils::slice_to_le16(get_slice!(2)),
+					min_version: utils::slice_to_le16(get_slice!(2)),
+					flags: utils::slice_to_le16(get_slice!(2)),
 				};
 				advance_bytes!();
 				Ok(Some(msg))
 			},
 			2 => {
-				let selected_version = slice_to_le16(get_slice!(2));
+				let selected_version = utils::slice_to_le16(get_slice!(2));
 				if selected_version != 1 {
 					// We don't know how to deserialize anything else...
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				}
 				let msg = PoolMessage::ProtocolVersion {
 					selected_version: selected_version,
-					flags: slice_to_le16(get_slice!(2)),
+					flags: utils::slice_to_le16(get_slice!(2)),
 					auth_key: match PublicKey::from_slice(&self.secp_ctx, get_slice!(33)) {
 						Ok(key) => key,
 						Err(_) => {
@@ -1267,12 +1243,12 @@ impl codec::Decoder for PoolMsgFramer {
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
 
-				let timestamp = slice_to_le64(get_slice!(8));
+				let timestamp = utils::slice_to_le64(get_slice!(8));
 
 				let coinbase_postfix_len = get_slice!(1)[0];
 				let coinbase_postfix = get_slice!(coinbase_postfix_len).to_vec();
 
-				let script_len = slice_to_le16(get_slice!(2));
+				let script_len = utils::slice_to_le16(get_slice!(2));
 				if script_len > 8192 {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 				}
@@ -1281,8 +1257,8 @@ impl codec::Decoder for PoolMsgFramer {
 				let coinbase_output_count = get_slice!(1)[0] as usize;
 				let mut appended_coinbase_outputs = Vec::with_capacity(coinbase_output_count);
 				for _ in 0..coinbase_output_count {
-					let value = slice_to_le64(get_slice!(8));
-					let script_len = slice_to_le16(get_slice!(2));
+					let value = utils::slice_to_le64(get_slice!(8));
+					let script_len = utils::slice_to_le16(get_slice!(2));
 					appended_coinbase_outputs.push(TxOut {
 						value: value,
 						script_pubkey: Script::from(get_slice!(script_len).to_vec()),
@@ -1317,7 +1293,7 @@ impl codec::Decoder for PoolMsgFramer {
 			16 => {
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
-				let timestamp = slice_to_le64(get_slice!(8));
+				let timestamp = utils::slice_to_le64(get_slice!(8));
 
 				let mut share_target = [0; 32];
 				share_target.copy_from_slice(get_slice!(32));
@@ -1336,12 +1312,12 @@ impl codec::Decoder for PoolMsgFramer {
 				Ok(Some(msg))
 			},
 			17 => {
-				let header_version = slice_to_le32(get_slice!(4));
+				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
-				let header_time = slice_to_le32(get_slice!(4));
-				let header_nbits = slice_to_le32(get_slice!(4));
-				let header_nonce = slice_to_le32(get_slice!(4));
+				let header_time = utils::slice_to_le32(get_slice!(4));
+				let header_nbits = utils::slice_to_le32(get_slice!(4));
+				let header_nonce = utils::slice_to_le32(get_slice!(4));
 
 				let merkle_rhss_count = get_slice!(1)[0] as usize;
 				if merkle_rhss_count > 16 {
@@ -1354,7 +1330,7 @@ impl codec::Decoder for PoolMsgFramer {
 					merkle_rhss.push(merkle_rhs);
 				}
 
-				let tx_len = slice_to_le32(get_slice!(4));
+				let tx_len = utils::slice_to_le32(get_slice!(4));
 				let coinbase_tx = match network::serialize::deserialize(get_slice!(tx_len)) {
 					Ok(tx) => tx,
 					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
@@ -1380,23 +1356,23 @@ impl codec::Decoder for PoolMsgFramer {
 				Ok(Some(msg))
 			},
 			18 => {
-				let header_version = slice_to_le32(get_slice!(4));
+				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
-				let header_time = slice_to_le32(get_slice!(4));
-				let header_nbits = slice_to_le32(get_slice!(4));
-				let header_nonce = slice_to_le32(get_slice!(4));
+				let header_time = utils::slice_to_le32(get_slice!(4));
+				let header_nbits = utils::slice_to_le32(get_slice!(4));
+				let header_nonce = utils::slice_to_le32(get_slice!(4));
 
 				let user_tag_len = get_slice!(1)[0];
 				let user_tag = get_slice!(user_tag_len).to_vec();
 
-				let action_count = slice_to_le16(get_slice!(2)) as usize;
+				let action_count = utils::slice_to_le16(get_slice!(2)) as usize;
 				let mut actions = Vec::with_capacity(action_count);
 
 				while actions.len() < action_count {
-					let action = slice_to_le16(get_slice!(2));
+					let action = utils::slice_to_le16(get_slice!(2));
 					if action == 0 {
-						let txlen = slice_to_le32(get_slice!(4));
+						let txlen = utils::slice_to_le32(get_slice!(4));
 						actions.push(WeakBlockAction::NewTx { tx: match network::serialize::deserialize(get_slice!(txlen)) {
 							Ok(tx) => tx,
 							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),

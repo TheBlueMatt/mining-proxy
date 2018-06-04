@@ -73,6 +73,32 @@ pub fn le64_to_array(u: u64) -> [u8; 8] {
 	v
 }
 
+#[inline]
+pub fn slice_to_le16(v: &[u8]) -> u16 {
+	((v[1] as u16) << 8*1) |
+	((v[0] as u16) << 8*0)
+}
+
+#[inline]
+pub fn slice_to_le32(v: &[u8]) -> u32 {
+	((v[3] as u32) << 8*3) |
+	((v[2] as u32) << 8*2) |
+	((v[1] as u32) << 8*1) |
+	((v[0] as u32) << 8*0)
+}
+
+#[inline]
+pub fn slice_to_le64(v: &[u8]) -> u64 {
+	((v[7] as u64) << 8*7) |
+	((v[6] as u64) << 8*6) |
+	((v[5] as u64) << 8*5) |
+	((v[4] as u64) << 8*4) |
+	((v[3] as u64) << 8*3) |
+	((v[2] as u64) << 8*2) |
+	((v[1] as u64) << 8*1) |
+	((v[0] as u64) << 8*0)
+}
+
 pub fn push_bytes_hex(bytes: &[u8], out: &mut String) {
 	for i in 0..bytes.len() {
 		out.push(std::char::from_digit((bytes[i] >> 4) as u32, 16).unwrap());
