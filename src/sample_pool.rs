@@ -28,21 +28,24 @@ use crypto::sha2::Sha256;
 use futures::{future,Stream,Sink,Future};
 use futures::sync::mpsc;
 
-use tokio::net;
+use tokio::{net, timer};
 
 use tokio_io::AsyncRead;
 
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
-use std::{env, io, mem};
+use std::{cmp, env, io, mem};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Weak, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::collections::{hash_map, HashMap};
 
 use tokio_threadpool::park::DefaultPark;
 use tokio_executor::park::Park;
 
+// These are useful to plug in business logic into:
 fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
 	println!("User {} authed with pass {}", String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_auth));
 	true
@@ -56,8 +59,17 @@ fn weak_block_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64, _head
 	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag));
 }
 
-const SHARE_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
-const WEAK_BLOCK_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]; // Diff 65536
+// Note that because leading_0s_to_target gets the *largest* number with the given number of
+// leading 0s, we offset by 1 higher than we really want (this limits stratum false-positives
+// in the naive difficulty converter).
+
+const MIN_TARGET_LEADING_0S: u8 = 49; // Diff ~65536
+const WEAK_BLOCK_RATIO_0S: u8 = 8; // 2**8x harder to mine weak blocks
+const MAX_USER_SHARES_PER_30_SEC: usize = 30;
+const MIN_USER_SHARES_PER_30_SEC: usize = 1;
+
+// Dont change anything below...
+const MAX_TARGET_LEADING_0S: u8 = 71 - WEAK_BLOCK_RATIO_0S; // Roughly network diff/16 at the time of writing, should be more than sufficiently high for any use-case
 
 struct LoadMeasuringPark {
 	inner: DefaultPark,
@@ -83,6 +95,10 @@ impl Park for LoadMeasuringPark {
 struct PerUserClientRef {
 	send_stream: mpsc::Sender<PoolMessage>,
 	client_id: u64,
+	user_id: Vec<u8>,
+	min_target: u8,
+	cur_target: AtomicUsize,
+	accepted_shares: AtomicUsize,
 }
 
 fn main() {
@@ -170,6 +186,50 @@ fn main() {
 		match net::TcpListener::bind(&listen_bind.unwrap()) {
 			Ok(listener) => {
 				let mut max_client_id = 0;
+				let mut users: Arc<Mutex<Vec<Weak<PerUserClientRef>>>> = Arc::new(Mutex::new(Vec::new()));
+
+				let users_timer_ref = users.clone();
+				tokio::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(30)).for_each(move |_| {
+					let mut users_lock = users_timer_ref.lock().unwrap();
+					let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+					let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+
+					users_lock.retain(|weak_user| {
+						match weak_user.upgrade() {
+							Some(user) => {
+								let shares = user.accepted_shares.swap(0, Ordering::AcqRel);
+								let cur_target = user.cur_target.load(Ordering::Acquire) as u8;
+								println!("In last 30 seconds, user with id {} submitted {} shares with {} leading zeros", user.client_id, shares, cur_target);
+
+								let new_target = if shares > MAX_USER_SHARES_PER_30_SEC && cur_target < MAX_TARGET_LEADING_0S {
+									cur_target + 1
+								} else if shares < MIN_USER_SHARES_PER_30_SEC && cur_target > MIN_TARGET_LEADING_0S && cur_target > user.min_target {
+									cur_target - 1
+								} else {
+									cur_target
+								};
+								if new_target != cur_target {
+									let _ = user.send_stream.clone().start_send(PoolMessage::ShareDifficulty {
+										user_id: user.user_id.clone(),
+										difficulty: PoolDifficulty {
+											timestamp,
+											share_target: utils::leading_0s_to_target(new_target as u8),
+											weak_block_target: utils::leading_0s_to_target(new_target + WEAK_BLOCK_RATIO_0S),
+										},
+									});
+									user.cur_target.store(new_target as usize, Ordering::Release);
+								}
+
+								true
+							},
+							None => { false }
+						}
+					});
+
+					future::result(Ok(()))
+				}).then(|_| {
+					future::result(Ok(()))
+				}));
 
 				tokio::spawn(listener.incoming().for_each(move |sock| {
 					sock.set_nodelay(true).unwrap();
@@ -202,6 +262,7 @@ fn main() {
 						}
 					}
 
+					let users_ref = users.clone();
 					let server_id_vec = match server_id {
 						Some(ref id) => id.as_bytes().to_vec(),
 						None => vec![],
@@ -310,11 +371,17 @@ fn main() {
 										let mut client_coinbase_postfix = server_id_vec.clone();
 										client_coinbase_postfix.extend_from_slice(&utils::le64_to_array(client_id));
 
-										client_ids.insert(client_id, user_id.clone());
-										connection_entry.or_insert(PerUserClientRef {
+										let user = Arc::new(PerUserClientRef {
 											send_stream: send_sink.clone(),
 											client_id,
+											user_id: user_id.clone(),
+											min_target: utils::count_leading_zeros(&minimum_target) + 1,
+											cur_target: AtomicUsize::new(cmp::min(MAX_TARGET_LEADING_0S, cmp::max(MIN_TARGET_LEADING_0S, utils::count_leading_zeros(&suggested_target) + 1)) as usize),
+											accepted_shares: AtomicUsize::new(0),
 										});
+										client_ids.insert(client_id, user_id.clone());
+										connection_entry.or_insert(user.clone());
+										users_ref.lock().unwrap().push(Arc::downgrade(&user));
 
 										let payout_info = PoolPayoutInfo {
 											user_id: user_id.clone(),
@@ -332,8 +399,8 @@ fn main() {
 											user_id: user_id.clone(),
 											difficulty: PoolDifficulty {
 												timestamp,
-												share_target: SHARE_TARGET,
-												weak_block_target: WEAK_BLOCK_TARGET,
+												share_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8),
+												weak_block_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8 + WEAK_BLOCK_RATIO_0S),
 											},
 										});
 										false
@@ -396,13 +463,18 @@ fn main() {
 									bits: share.header_nbits,
 									nonce: share.header_nonce,
 								}.bitcoin_hash();
+								let leading_zeros = utils::count_leading_zeros(&block_hash[..]);
 
-								if utils::does_hash_meet_target(&block_hash[..], &WEAK_BLOCK_TARGET) {
+								let client = connection_clients.get(client_id).unwrap();
+								let client_target = client.cur_target.load(Ordering::Acquire) as u8;
+
+								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									println!("Got share that met weak block target, ignored as we'll check the weak block");
-								} else if utils::does_hash_meet_target(&block_hash[..], &SHARE_TARGET) {
+								} else if leading_zeros >= client_target {
 									share_submitted(client_id, &share.user_tag, our_payout);
+									client.accepted_shares.fetch_add(1, Ordering::AcqRel);
 								} else {
-									println!("Got work that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&SHARE_TARGET[..]));
+									println!("Got work that missed target (had {} leading 0s, which is less than {})", leading_zeros, client_target);
 								}
 							},
 							PoolMessage::WeakBlock { mut sketch } => {
@@ -484,10 +556,16 @@ fn main() {
 								}
 
 								let block_hash = header.bitcoin_hash();
-								if utils::does_hash_meet_target(&block_hash[..], &WEAK_BLOCK_TARGET) {
+								let leading_zeros = utils::count_leading_zeros(&block_hash[..]);
+
+								let client = connection_clients.get(client_id).unwrap();
+								let client_target = client.cur_target.load(Ordering::Acquire) as u8;
+
+								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									weak_block_submitted(client_id, &sketch.user_tag, our_payout, &header, &new_txn);
+									client.accepted_shares.fetch_add(1, Ordering::AcqRel);
 								} else {
-									println!("Got weak block that missed target (hashed to {}, which is greater than {})", utils::bytes_to_hex(&block_hash[..]), utils::bytes_to_hex(&WEAK_BLOCK_TARGET[..]));
+									println!("Got weak block that missed target (had {} leading 0s, which is less than {})", leading_zeros, client_target + WEAK_BLOCK_RATIO_0S);
 								}
 
 								last_weak_block = Some(new_txn);

@@ -45,6 +45,31 @@ pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 	a
 }
 
+/// Returns the highest value with the given number of leading 0s
+#[inline]
+pub fn leading_0s_to_target(zeros: u8) -> [u8; 32] {
+	let mut res = [0xff; 32];
+	for i in 0..zeros/8 {
+		res[(31 - i) as usize] = 0;
+	}
+	if zeros & 7 != 0 {
+		res[31 - (zeros/8) as usize] = 0xff >> (zeros & 7);
+	}
+	res
+}
+
+#[inline]
+pub fn count_leading_zeros(target: &[u8]) -> u8 {
+	assert_eq!(target.len(), 32);
+	for i in 0..32 {
+		if target[31 - i] != 0 {
+			return 8*(i as u8) + (target[31 - i].leading_zeros() as u8);
+		}
+	}
+	return 255;
+}
+
+#[inline]
 pub fn target_to_diff_lb(target: &[u8; 32]) -> f64 {
 	// We use a shitty approximation for a lower-bound on difficulty by simply calculating the
 	// number of leading 0 bits in the target and applying a fudge factor...this will result in
@@ -60,6 +85,7 @@ pub fn target_to_diff_lb(target: &[u8; 32]) -> f64 {
 	return std::f64::INFINITY;
 }
 
+#[inline]
 pub fn le64_to_array(u: u64) -> [u8; 8] {
 	let mut v = [0; 8];
 	v[0] = ((u >> 8*0) & 0xff) as u8;
