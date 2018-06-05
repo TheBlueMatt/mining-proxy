@@ -1,3 +1,6 @@
+// Simple sample pool server that implements most of what you need, note that it does NOT currently
+// check for duplicate shares...
+
 extern crate bitcoin;
 extern crate bytes;
 extern crate crypto;
@@ -325,6 +328,29 @@ fn main() {
 							}
 						}
 
+						macro_rules! share_received {
+							($user: expr, $cur_target: expr) => {
+								{
+									let accepted_shares = $user.accepted_shares.fetch_add(1, Ordering::AcqRel);
+									if accepted_shares + 1 > MAX_USER_SHARES_PER_30_SEC && $cur_target < MAX_TARGET_LEADING_0S {
+										let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+										let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+
+										send_response!(PoolMessage::ShareDifficulty {
+											user_id: $user.user_id.clone(),
+											difficulty: PoolDifficulty {
+												timestamp,
+												share_target: utils::leading_0s_to_target($cur_target + 1),
+												weak_block_target: utils::leading_0s_to_target($cur_target + 1 + WEAK_BLOCK_RATIO_0S),
+											},
+										});
+										$user.cur_target.store(($cur_target + 1) as usize, Ordering::Release);
+										$user.accepted_shares.store((accepted_shares + 1) / 2, Ordering::Release);
+									}
+								}
+							}
+						}
+
 						match msg {
 							PoolMessage::ProtocolSupport { max_version, min_version, flags } => {
 								if client_version.is_some() {
@@ -472,7 +498,7 @@ fn main() {
 									println!("Got share that met weak block target, ignored as we'll check the weak block");
 								} else if leading_zeros >= client_target {
 									share_submitted(client_id, &share.user_tag, our_payout);
-									client.accepted_shares.fetch_add(1, Ordering::AcqRel);
+									share_received!(client, client_target);
 								} else {
 									println!("Got work that missed target (had {} leading 0s, which is less than {})", leading_zeros, client_target);
 								}
@@ -563,7 +589,7 @@ fn main() {
 
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									weak_block_submitted(client_id, &sketch.user_tag, our_payout, &header, &new_txn);
-									client.accepted_shares.fetch_add(1, Ordering::AcqRel);
+									share_received!(client, client_target);
 								} else {
 									println!("Got weak block that missed target (had {} leading 0s, which is less than {})", leading_zeros, client_target + WEAK_BLOCK_RATIO_0S);
 								}
