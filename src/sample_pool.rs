@@ -54,12 +54,12 @@ fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
 	true
 }
 
-fn share_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64) {
-	println!("Got valid share with value {} from {} from machine identified as: {}", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag));
+fn share_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64) {
+	println!("Got valid share with value {} from \"{}\" from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag_1));
 }
 
-fn weak_block_submitted(user_id: &Vec<u8>, user_tag: &Vec<u8>, value: u64, _header: &BlockHeader, txn: &Vec<Transaction>) {
-	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag));
+fn weak_block_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _header: &BlockHeader, txn: &Vec<Transaction>) {
+	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag_1));
 }
 
 // Note that because leading_0s_to_target gets the *largest* number with the given number of
@@ -288,11 +288,24 @@ fn main() {
 							}
 						}
 
+						macro_rules! reject_share {
+							($share_msg: expr, $reason: expr) => {
+								{
+									send_response!(PoolMessage::ShareRejected {
+										user_tag_1: $share_msg.user_tag_1.clone(),
+										user_tag_2: $share_msg.user_tag_2.clone(),
+										reason: $reason,
+									});
+								}
+							}
+						}
+
 						macro_rules! check_coinbase_tx {
-							($coinbase_tx: expr) => {
+							($coinbase_tx: expr, $share_msg: expr, $extra_fail_cmd: expr) => {
 								{
 									if $coinbase_tx.input.len() != 1 || $coinbase_tx.output.len() < 1 {
-										println!("Client sent share with a coinbase_tx which had an input count other than 1 or no payout");
+										reject_share!($share_msg, ShareRejectedReason::BadPayoutInfo);
+										$extra_fail_cmd;
 										return future::result(Ok(()));
 									}
 
@@ -301,25 +314,29 @@ fn main() {
 										if idx == 0 {
 											our_payout = out.value;
 											if out.script_pubkey != payout_addr_clone {
-												println!("Got share which paid out to an unknown location");
+												reject_share!($share_msg, ShareRejectedReason::BadPayoutInfo);
+												$extra_fail_cmd;
 												return future::result(Ok(()));
 											}
 										} else if out.value != 0 {
-											println!("Got share which paid out excess to unkown location");
+											reject_share!($share_msg, ShareRejectedReason::BadPayoutInfo);
+											$extra_fail_cmd;
 											return future::result(Ok(()));
 										}
 									}
 
 									let coinbase = &$coinbase_tx.input[0].script_sig[..];
 									if coinbase.len() < 8 {
-										println!("Client sent share which failed to include the required coinbase postfix");
+										reject_share!($share_msg, ShareRejectedReason::BadPayoutInfo);
+										$extra_fail_cmd;
 										return future::result(Ok(()));
 									}
 
 									let client_id = if let Some(client_id) = client_ids.get(&utils::slice_to_le64(&coinbase[coinbase.len() - 8..])) {
 										client_id
 									} else {
-										println!("Got share for unknown client");
+										reject_share!($share_msg, ShareRejectedReason::BadPayoutInfo);
+										$extra_fail_cmd;
 										return future::result(Ok(()));
 									};
 
@@ -329,8 +346,12 @@ fn main() {
 						}
 
 						macro_rules! share_received {
-							($user: expr, $cur_target: expr) => {
+							($user: expr, $cur_target: expr, $share_msg: expr) => {
 								{
+									send_response!(PoolMessage::ShareAccepted {
+										user_tag_1: $share_msg.user_tag_1.clone(),
+										user_tag_2: $share_msg.user_tag_2.clone(),
+									});
 									let accepted_shares = $user.accepted_shares.fetch_add(1, Ordering::AcqRel);
 									if accepted_shares + 1 > MAX_USER_SHARES_PER_30_SEC && $cur_target < MAX_TARGET_LEADING_0S {
 										let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -394,6 +415,8 @@ fn main() {
 										let client_id = max_client_id;
 										max_client_id += 1;
 
+										println!("Got new user with id {} for client id {}", utils::bytes_to_hex(&user_id), client_id);
+
 										let mut client_coinbase_postfix = server_id_vec.clone();
 										client_coinbase_postfix.extend_from_slice(&utils::le64_to_array(client_id));
 
@@ -417,7 +440,7 @@ fn main() {
 											appended_outputs: vec![],
 										};
 										send_response!(PoolMessage::PayoutInfo {
-											signature: sign_message!(payout_info, 13),
+											signature: sign_message!(payout_info, 14),
 											payout_info,
 										});
 
@@ -466,7 +489,7 @@ fn main() {
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 
-								let (our_payout, client_id) = check_coinbase_tx!(share.coinbase_tx);
+								let (our_payout, client_id) = check_coinbase_tx!(share.coinbase_tx, share, {});
 
 								let mut merkle_lhs = [0; 32];
 								merkle_lhs.copy_from_slice(&share.coinbase_tx.txid()[..]);
@@ -497,10 +520,10 @@ fn main() {
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									println!("Got share that met weak block target, ignored as we'll check the weak block");
 								} else if leading_zeros >= client_target {
-									share_submitted(client_id, &share.user_tag, our_payout);
-									share_received!(client, client_target);
+									share_submitted(client_id, &share.user_tag_1, our_payout);
+									share_received!(client, client_target, share);
 								} else {
-									println!("Got work that missed target (had {} leading 0s, which is less than {})", leading_zeros, client_target);
+									reject_share!(share, ShareRejectedReason::BadHash);
 								}
 							},
 							PoolMessage::WeakBlock { mut sketch } => {
@@ -515,11 +538,12 @@ fn main() {
 
 								let (our_payout, client_id) = match &sketch.txn[0] {
 									&WeakBlockAction::TakeTx { .. } => {
-										println!("Client sent WeakBlock with an invalid coinbase");
-										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+										reject_share!(sketch, ShareRejectedReason::BadWork);
+										send_response!(PoolMessage::WeakBlockStateReset {});
+										return future::result(Ok(()));
 									},
 									&WeakBlockAction::NewTx { ref tx } => {
-										check_coinbase_tx!(tx)
+										check_coinbase_tx!(tx, sketch, send_response!(PoolMessage::WeakBlockStateReset {}))
 									},
 								};
 
@@ -535,7 +559,8 @@ fn main() {
 										match action {
 											&WeakBlockAction::TakeTx { n } => {
 												if n as usize >= last_weak_ref.len() {
-													println!("Got weak block with bad tx reference");
+													reject_share!(sketch, ShareRejectedReason::BadWork);
+													send_response!(PoolMessage::WeakBlockStateReset {});
 													return future::result(Ok(()));
 												}
 												txids.push(last_weak_ref[n as usize].txid());
@@ -568,7 +593,8 @@ fn main() {
 										match action {
 											WeakBlockAction::TakeTx { n } => {
 												if n as usize >= last_weak_ref.len() {
-													println!("Got weak block with bad tx reference");
+													reject_share!(sketch, ShareRejectedReason::BadWork);
+													send_response!(PoolMessage::WeakBlockStateReset {});
 													return future::result(Ok(()));
 												}
 												new_txn.push(Transaction { version: 0, lock_time: 0, input: Vec::new(), output: Vec::new() });
@@ -588,16 +614,24 @@ fn main() {
 								let client_target = client.cur_target.load(Ordering::Acquire) as u8;
 
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
-									weak_block_submitted(client_id, &sketch.user_tag, our_payout, &header, &new_txn);
-									share_received!(client, client_target);
+									weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn);
+									share_received!(client, client_target, sketch);
 								} else {
-									println!("Got weak block that missed target (had {} leading 0s, which is less than {})", leading_zeros, client_target + WEAK_BLOCK_RATIO_0S);
+									reject_share!(sketch, ShareRejectedReason::BadHash);
 								}
 
 								last_weak_block = Some(new_txn);
 							},
 							PoolMessage::WeakBlockStateReset { } => {
 								println!("Got WeakBlockStateReset?");
+								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
+							PoolMessage::ShareAccepted { .. } => {
+								println!("Got ShareAccepted?");
+								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
+							PoolMessage::ShareRejected { .. } => {
+								println!("Got ShareRejected?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
 							PoolMessage::NewPoolServer { .. } => {

@@ -212,8 +212,12 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 				}
 				println!("Received ProtocolVersion, using version {}", selected_version);
 			},
+			WorkMessage::AdditionalCoinbaseLength { .. } => {
+				println!("Received AdditionalCoinbaseLength?");
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+			},
 			WorkMessage::BlockTemplate { signature, template } => {
-				check_msg_sig!(3, template, signature);
+				check_msg_sig!(4, template, signature);
 
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
@@ -264,7 +268,7 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			WorkMessage::TransactionData { signature, data } => {
-				check_msg_sig!(6, data, signature);
+				check_msg_sig!(7, data, signature);
 
 				match us.pending_tx_data_requests.remove(&data.template_timestamp) {
 					Some(chan) => {
@@ -281,7 +285,7 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 				}
 			},
 			WorkMessage::CoinbasePrefixPostfix { signature, coinbase_prefix_postfix } => {
-				check_msg_sig!(7, coinbase_prefix_postfix, signature);
+				check_msg_sig!(8, coinbase_prefix_postfix, signature);
 
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
@@ -419,7 +423,9 @@ impl PoolHandler {
 									header_nonce: work.0.header_nonce,
 									merkle_rhss: template.merkle_rhss.clone(),
 									coinbase_tx: work.0.coinbase_tx.clone(),
-									user_tag: work.0.user_tag.clone(),
+									user_tag_1: work.0.user_tag.clone(),
+									user_tag_2: Vec::new(),
+									previous_header: None,
 								}
 							}) {
 								Ok(_) => { println!("Submitted share!"); },
@@ -463,7 +469,8 @@ impl PoolHandler {
 									header_time: work.0.header_time,
 									header_nbits: template.header_nbits,
 									header_nonce: work.0.header_nonce,
-									user_tag: work.0.user_tag.clone(),
+									user_tag_1: work.0.user_tag.clone(),
+									user_tag_2: Vec::new(),
 									txn: actions,
 								},
 							}) {
@@ -584,7 +591,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::PayoutInfo { signature, payout_info } => {
-				check_msg_sig!(13, payout_info, signature);
+				check_msg_sig!(14, payout_info, signature);
 
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
@@ -654,6 +661,14 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 			PoolMessage::WeakBlockStateReset { } => {
 				println!("Received WeakBlockStateReset");
 				us.last_weak_block = None;
+			},
+			PoolMessage::ShareAccepted { .. } => {
+				println!("Share ACCEPTED!");
+				return Ok(());
+			},
+			PoolMessage::ShareRejected { .. } => {
+				println!("Share REJECTED!");
+				return Ok(());
 			},
 			PoolMessage::NewPoolServer { .. } => {
 				unimplemented!();

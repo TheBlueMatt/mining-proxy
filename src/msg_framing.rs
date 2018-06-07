@@ -1,5 +1,6 @@
 use bitcoin::blockdata::transaction::{TxOut,Transaction};
 use bitcoin::blockdata::script::Script;
+use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::util::hash::Sha256dHash;
 use bitcoin::network;
 
@@ -153,13 +154,15 @@ impl WinningNonce {
 }
 
 pub struct TransactionData {
+	pub previous_header: BlockHeader,
 	pub template_timestamp: u64,
 	pub transactions: Vec<Transaction>,
 }
 impl TransactionData {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
-		res.reserve(8+4);
+		res.reserve(8+80+4);
 		res.put_u64_le(self.template_timestamp);
+		res.put_slice(&network::serialize::serialize(&self.previous_header).unwrap());
 		res.put_u32_le(self.transactions.len() as u32);
 		for tx in self.transactions.iter() {
 			let tx_enc = network::serialize::serialize(tx).unwrap();
@@ -213,6 +216,9 @@ pub enum WorkMessage {
 		selected_version: u16,
 		flags: u16,
 		auth_key: PublicKey,
+	},
+	AdditionalCoinbaseLength {
+		additional_length: u16
 	},
 	BlockTemplate {
 		signature: Signature,
@@ -309,9 +315,16 @@ impl codec::Encoder for WorkMsgFramer {
 				res.put_u16_le(flags);
 				res.put_slice(&auth_key.serialize());
 			},
-			WorkMessage::BlockTemplate { ref signature, ref template } => {
-				res.reserve(1 + 3 + 33);
+			WorkMessage::AdditionalCoinbaseLength { additional_length } => {
+				res.reserve(1 + 3 + 2);
 				res.put_u8(3);
+				res.put_u8(0x02);
+				res.put_u16_le(0);
+				res.put_u16_le(additional_length);
+			},
+			WorkMessage::BlockTemplate { ref signature, ref template } => {
+				res.reserve(1 + 3 + 64);
+				res.put_u8(4);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -326,7 +339,7 @@ impl codec::Encoder for WorkMsgFramer {
 			},
 			WorkMessage::WinningNonce { ref nonces } => {
 				res.reserve(1 + 3);
-				res.put_u8(4);
+				res.put_u8(5);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -340,14 +353,14 @@ impl codec::Encoder for WorkMsgFramer {
 			},
 			WorkMessage::TransactionDataRequest { template_timestamp } => {
 				res.reserve(1 + 3 + 8);
-				res.put_u8(5);
+				res.put_u8(6);
 				res.put_u8(8);
 				res.put_u16_le(0);
 				res.put_u64_le(template_timestamp);
 			}
 			WorkMessage::TransactionData { ref signature, ref data } => {
-				res.reserve(1 + 3 + 33);
-				res.put_u8(6);
+				res.reserve(1 + 3 + 64);
+				res.put_u8(7);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -361,8 +374,8 @@ impl codec::Encoder for WorkMsgFramer {
 				}
 			},
 			WorkMessage::CoinbasePrefixPostfix { ref signature, ref coinbase_prefix_postfix } => {
-				res.reserve(1 + 3 + 33);
-				res.put_u8(7);
+				res.reserve(1 + 3 + 64);
+				res.put_u8(8);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -376,23 +389,16 @@ impl codec::Encoder for WorkMsgFramer {
 				}
 			},
 			WorkMessage::BlockTemplateHeader { ref signature, ref template } => {
-				res.reserve(1 + 3 + 33);
-				res.put_u8(8);
-
-				let len_pos = res.len();
+				res.reserve(1 + 3 + 188);
+				res.put_u8(9);
+				res.put_u16_le(188);
 				res.put_u8(0);
-				res.put_u16_le(0);
-
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				template.encode_unsigned(res);
-
-				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
-				}
 			},
 			WorkMessage::WinningNonceHeader { template_timestamp, template_variant, header_version, header_time, header_nonce, ref user_tag } => {
 				res.reserve(33 + user_tag.len());
-				res.put_u8(9);
+				res.put_u8(10);
 				res.put_u16_le(29 + user_tag.len() as u16);
 				res.put_u8(0);
 				res.put_u64_le(template_timestamp);
@@ -404,22 +410,22 @@ impl codec::Encoder for WorkMsgFramer {
 				res.put_slice(&user_tag[..]);
 			},
 			WorkMessage::NewWorkServer { ref signature, ref new_host_port } => {
-				res.reserve(1 + 3 + 33 + 1 + new_host_port.len());
-				res.put_u8(10);
-				res.put_u16_le(33 + 1 + new_host_port.len() as u16);
+				res.reserve(1 + 3 + 64 + 1 + new_host_port.len());
+				res.put_u8(11);
+				res.put_u16_le(64 + 1 + new_host_port.len() as u16);
 				res.put_u8(0);
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				res.put_u8(new_host_port.len() as u8);
 				res.put_slice(new_host_port.as_bytes());
 			},
 			WorkMessage::VendorMessage { ref signature, ref vendor, ref message } => {
-				let len = 1 + if signature.is_some() { 33 } else { 0 } + 1 + vendor.len() + message.len();
+				let len = 1 + if signature.is_some() { 64 } else { 0 } + 1 + vendor.len() + message.len();
 				if len > 0xffffff {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 				}
 
 				res.reserve(1 + 3 + len);
-				res.put_u8(11);
+				res.put_u8(12);
 				res.put_u8(((len >> 8*0) & 0xff) as u8);
 				res.put_u8(((len >> 8*1) & 0xff) as u8);
 				res.put_u8(((len >> 8*2) & 0xff) as u8);
@@ -460,21 +466,22 @@ impl codec::Decoder for WorkMsgFramer {
 		if match bytes[0] {
 			1 => len != 6,
 			2 => len != 37,
-			3 => len > 1000202,
-			4 => len > 1000280,
-			5 => len != 8,
-			6 => len > 4000076,
-			7 => len > 169,
-			8 => len > 188,
-			9 => len > 284,
-			10 => len > 320,
-			11 => false,
+			3 => len != 2,
+			4 => len > 1000500,
+			5 => len > 1000500,
+			6 => len != 8,
+			7 => len > 4000500,
+			8 => len > 169,
+			9 => len != 188,
+			10 => len > 284,
+			11 => len > 320,
+			12 => false,
 			_ => true,
 		} {
 			return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 		}
 
-		if bytes[0] == 11 { // Vendor message
+		if bytes[0] == 12 { // Vendor message
 			if bytes.len() >= 4 + len {
 				bytes.advance(4 + len);
 				return Ok(None);
@@ -540,6 +547,13 @@ impl codec::Decoder for WorkMsgFramer {
 				Ok(Some(msg))
 			},
 			3 => {
+				let msg = WorkMessage::AdditionalCoinbaseLength {
+					additional_length: utils::slice_to_le16(get_slice!(2)),
+				};
+				advance_bytes!();
+				Ok(Some(msg))
+			},
+			4 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -618,7 +632,7 @@ impl codec::Decoder for WorkMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			4 => {
+			5 => {
 				let template_timestamp = utils::slice_to_le64(get_slice!(8));
 				let header_version = utils::slice_to_le32(get_slice!(4));
 				let header_time = utils::slice_to_le32(get_slice!(4));
@@ -645,19 +659,21 @@ impl codec::Decoder for WorkMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			5 => {
+			6 => {
 				let msg = WorkMessage::TransactionDataRequest {
 					template_timestamp: utils::slice_to_le64(get_slice!(8)),
 				};
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			6 => {
+			7 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
 				let template_timestamp = utils::slice_to_le64(get_slice!(8));
+
+				let previous_header = network::serialize::deserialize(get_slice!(80)).unwrap();
 
 				let tx_count = utils::slice_to_le32(get_slice!(4)) as usize;
 				if bytes.len() < 64 + 8 + 4 + tx_count * 4 {
@@ -677,13 +693,14 @@ impl codec::Decoder for WorkMsgFramer {
 					signature: signature,
 					data: TransactionData {
 						template_timestamp,
+						previous_header,
 						transactions: txn,
 					},
 				};
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			7 => {
+			8 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -703,7 +720,7 @@ impl codec::Decoder for WorkMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			8 => {
+			9 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -737,7 +754,7 @@ impl codec::Decoder for WorkMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			9 => {
+			10 => {
 				let msg = WorkMessage::WinningNonceHeader {
 					template_timestamp: utils::slice_to_le64(get_slice!(8)),
 					template_variant: utils::slice_to_le64(get_slice!(8)),
@@ -751,7 +768,7 @@ impl codec::Decoder for WorkMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			10 => {
+			11 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -767,7 +784,7 @@ impl codec::Decoder for WorkMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			// 11 (VendorMessage) handled pre-match
+			// 12 (VendorMessage) handled pre-match
 			_ => {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 			}
@@ -785,7 +802,7 @@ pub struct PoolPayoutInfo {
 }
 impl PoolPayoutInfo {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
-		res.reserve(13 + self.user_id.len() + self.coinbase_postfix.len() + self.remaining_payout.len());
+		res.reserve(12 + self.user_id.len() + self.coinbase_postfix.len() + self.remaining_payout.len());
 		res.put_u8(self.user_id.len() as u8);
 		res.put_slice(&self.user_id[..]);
 
@@ -794,14 +811,16 @@ impl PoolPayoutInfo {
 		res.put_u8(self.coinbase_postfix.len() as u8);
 		res.put_slice(&self.coinbase_postfix[..]);
 
-		res.put_u16_le(self.remaining_payout.len() as u16);
+		res.put_u8(self.remaining_payout.len() as u8);
 		res.put_slice(&self.remaining_payout[..]);
 
+		assert!(self.appended_outputs.len() <= 250);
 		res.put_u8(self.appended_outputs.len() as u8);
 		for txout in self.appended_outputs.iter() {
-			res.reserve(8 + 2 + txout.script_pubkey.len());
+			res.reserve(8 + 1 + txout.script_pubkey.len());
 			res.put_u64_le(txout.value);
-			res.put_u16_le(txout.script_pubkey.len() as u16);
+			assert!(txout.script_pubkey.len() <= 252);
+			res.put_u8(txout.script_pubkey.len() as u8);
 			res.put_slice(&txout.script_pubkey[..]);
 		}
 	}
@@ -825,7 +844,10 @@ pub struct PoolShare {
 	pub merkle_rhss: Vec<[u8; 32]>,
 	pub coinbase_tx: Transaction,
 
-	pub user_tag: Vec<u8>,
+	pub user_tag_1: Vec<u8>,
+	pub user_tag_2: Vec<u8>,
+
+	pub previous_header: Option<BlockHeader>,
 }
 
 #[derive(Clone)]
@@ -848,14 +870,15 @@ pub struct WeakBlock {
 	pub header_nbits: u32,
 	pub header_nonce: u32,
 
-	pub user_tag: Vec<u8>,
+	pub user_tag_1: Vec<u8>,
+	pub user_tag_2: Vec<u8>,
 
 	pub txn: Vec<WeakBlockAction>,
 }
 
 impl WeakBlock {
 	pub fn encode(&self, res: &mut bytes::BytesMut) {
-		res.reserve(4*4 + 32 + 1 + self.user_tag.len() + 2 + self.txn.len()*2);
+		res.reserve(4*4 + 32 + 1 + self.user_tag_1.len() + 1 + self.user_tag_2.len() + 2 + self.txn.len()*2);
 
 		res.put_u32_le(self.header_version);
 		res.put_slice(&self.header_prevblock);
@@ -863,8 +886,10 @@ impl WeakBlock {
 		res.put_u32_le(self.header_nbits);
 		res.put_u32_le(self.header_nonce);
 
-		res.put_u8(self.user_tag.len() as u8);
-		res.put_slice(&self.user_tag);
+		res.put_u8(self.user_tag_1.len() as u8);
+		res.put_slice(&self.user_tag_1);
+		res.put_u8(self.user_tag_2.len() as u8);
+		res.put_slice(&self.user_tag_2);
 
 		res.put_u16_le(self.txn.len() as u16);
 
@@ -884,6 +909,15 @@ impl WeakBlock {
 			}
 		}
 	}
+}
+
+pub enum ShareRejectedReason {
+	StalePrevBlock,
+	BadHash,
+	Duplicate,
+	BadPayoutInfo,
+	BadWork,
+	Other(u8),
 }
 
 pub enum PoolMessage {
@@ -924,6 +958,15 @@ pub enum PoolMessage {
 		sketch: WeakBlock,
 	},
 	WeakBlockStateReset { },
+	ShareAccepted {
+		user_tag_1: Vec<u8>,
+		user_tag_2: Vec<u8>,
+	},
+	ShareRejected {
+		reason: ShareRejectedReason,
+		user_tag_1: Vec<u8>,
+		user_tag_2: Vec<u8>,
+	},
 	NewPoolServer {
 		signature: Signature,
 		new_host_port: String,
@@ -978,7 +1021,7 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::GetPayoutInfo { ref suggested_target, ref minimum_target, ref user_id, ref user_auth } => {
 				res.reserve(1 + 3 + 2*1 + 2*32 + user_id.len() + user_auth.len());
-				res.put_u8(12);
+				res.put_u8(13);
 				res.put_u16_le((2 + 2*32 + user_id.len() + user_auth.len()) as u16);
 				res.put_u8(0);
 
@@ -990,8 +1033,8 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_slice(&user_auth);
 			},
 			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
-				res.reserve(1 + 3 + 33);
-				res.put_u8(13);
+				res.reserve(1 + 3 + 64);
+				res.put_u8(14);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -1006,7 +1049,7 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::RejectUserAuth { ref user_id } => {
 				res.reserve(1 + 3 + 1 + user_id.len());
-				res.put_u8(14);
+				res.put_u8(15);
 				res.put_u16_le(1 + user_id.len() as u16);
 				res.put_u8(0);
 				res.put_u8(user_id.len() as u8);
@@ -1014,7 +1057,7 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::DropUser { ref user_id } => {
 				res.reserve(1 + 3 + 1 + user_id.len());
-				res.put_u8(15);
+				res.put_u8(16);
 				res.put_u16_le(1 + user_id.len() as u16);
 				res.put_u8(0);
 				res.put_u8(user_id.len() as u8);
@@ -1022,7 +1065,7 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::ShareDifficulty { ref user_id, ref difficulty } => {
 				res.reserve(1 + 3 + 1 + user_id.len() + 8 + 32*2);
-				res.put_u8(16);
+				res.put_u8(17);
 				res.put_u16_le(1 + user_id.len() as u16 + 8 + 32*2);
 				res.put_u8(0);
 				res.put_u8(user_id.len() as u8);
@@ -1033,8 +1076,9 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::Share { ref share } => {
 				let tx_enc = network::serialize::serialize(&share.coinbase_tx).unwrap();
-				res.reserve(1 + 3 + 4*4 + 32 + 1 + share.merkle_rhss.len()*32 + 4 + tx_enc.len() + 1 + share.user_tag.len());
-				res.put_u8(17);
+				let header_len = if share.previous_header.is_some() { 80 } else { 0 };
+				res.reserve(1 + 3 + 4*4 + 32 + 1 + share.merkle_rhss.len()*32 + 4 + tx_enc.len() + 1 + share.user_tag_1.len() + 1 + share.user_tag_2.len() + header_len);
+				res.put_u8(18);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -1051,8 +1095,15 @@ impl codec::Encoder for PoolMsgFramer {
 				}
 				res.put_u32_le(tx_enc.len() as u32);
 				res.put_slice(&tx_enc[..]);
-				res.put_u8(share.user_tag.len() as u8);
-				res.put_slice(&share.user_tag[..]);
+
+				res.put_u8(share.user_tag_1.len() as u8);
+				res.put_slice(&share.user_tag_1[..]);
+				res.put_u8(share.user_tag_2.len() as u8);
+				res.put_slice(&share.user_tag_2[..]);
+
+				if let Some(ref header) = share.previous_header {
+					res.put_slice(&network::serialize::serialize(header).unwrap());
+				}
 
 				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
@@ -1060,7 +1111,7 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::WeakBlock { ref sketch } => {
 				res.reserve(1 + 3);
-				res.put_u8(18);
+				res.put_u8(19);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -1074,27 +1125,55 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::WeakBlockStateReset { } => {
 				res.reserve(1 + 3);
-				res.put_u8(19);
+				res.put_u8(20);
 				res.put_u8(0);
 				res.put_u16_le(0);
 			},
+			PoolMessage::ShareAccepted { ref user_tag_1, ref user_tag_2 } => {
+				res.reserve(1 + 3 + 1 + user_tag_1.len() + 1 + user_tag_2.len());
+				res.put_u8(21);
+				res.put_u16_le((2 + user_tag_1.len() + user_tag_2.len()) as u16);
+				res.put_u8(0);
+				res.put_u8(user_tag_1.len() as u8);
+				res.put_slice(user_tag_1);
+				res.put_u8(user_tag_2.len() as u8);
+				res.put_slice(user_tag_2);
+			},
+			PoolMessage::ShareRejected { ref reason, ref user_tag_1, ref user_tag_2 } => {
+				res.reserve(1 + 3 + 1 + 1 + user_tag_1.len() + 1 + user_tag_2.len());
+				res.put_u8(22);
+				res.put_u16_le((3 + user_tag_1.len() + user_tag_2.len()) as u16);
+				res.put_u8(0);
+				match *reason {
+					ShareRejectedReason::StalePrevBlock => res.put_u8(1),
+					ShareRejectedReason::BadHash => res.put_u8(2),
+					ShareRejectedReason::Duplicate => res.put_u8(3),
+					ShareRejectedReason::BadPayoutInfo => res.put_u8(4),
+					ShareRejectedReason::BadWork => res.put_u8(5),
+					ShareRejectedReason::Other(val) => res.put_u8(val),
+				}
+				res.put_u8(user_tag_1.len() as u8);
+				res.put_slice(user_tag_1);
+				res.put_u8(user_tag_2.len() as u8);
+				res.put_slice(user_tag_2);
+			},
 			PoolMessage::NewPoolServer { ref signature, ref new_host_port } => {
-				res.reserve(1 + 3 + 33 + 1 + new_host_port.len());
-				res.put_u8(10);
-				res.put_u16_le(33 + 1 + new_host_port.len() as u16);
+				res.reserve(1 + 3 + 64 + 1 + new_host_port.len());
+				res.put_u8(11);
+				res.put_u16_le(64 + 1 + new_host_port.len() as u16);
 				res.put_u8(0);
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
 				res.put_u8(new_host_port.len() as u8);
 				res.put_slice(new_host_port.as_bytes());
 			},
 			PoolMessage::VendorMessage { ref signature, ref vendor, ref message } => {
-				let len = 1 + if signature.is_some() { 33 } else { 0 } + 1 + vendor.len() + message.len();
+				let len = 1 + if signature.is_some() { 64 } else { 0 } + 1 + vendor.len() + message.len();
 				if len > 0xffffff {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 				}
 
 				res.reserve(1 + 3 + len);
-				res.put_u8(11);
+				res.put_u8(12);
 				res.put_u8(((len >> 8*0) & 0xff) as u8);
 				res.put_u8(((len >> 8*1) & 0xff) as u8);
 				res.put_u8(((len >> 8*2) & 0xff) as u8);
@@ -1135,22 +1214,24 @@ impl codec::Decoder for PoolMsgFramer {
 		if match bytes[0] {
 			1 => len != 6,
 			2 => len != 37,
-			12 => len > 576,
-			13 => len > 1000331,
-			14 => len > 256,
+			13 => len > 576,
+			14 => len > 65886,
 			15 => len > 256,
-			16 => len > 328,
-			17 => len > 1000341,
-			18 => len > 4000306,
-			19 => len != 0,
-			10 => len > 320,
-			11 => false,
+			16 => len > 256,
+			17 => len > 328,
+			18 => len > 1000500,
+			19 => len > 4000500,
+			20 => len != 0,
+			21 => len > 512,
+			22 => len > 513,
+			11 => len > 320,
+			12 => false,
 			_ => true,
 		} {
 			return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 		}
 
-		if bytes[0] == 11 { // Vendor message
+		if bytes[0] == 12 { // Vendor message
 			if bytes.len() >= 4 + len {
 				bytes.advance(4 + len);
 				return Ok(None);
@@ -1173,6 +1254,11 @@ impl codec::Decoder for PoolMsgFramer {
 					read_pos += $size as usize;
 					&bytes[read_pos - ($size as usize)..read_pos]
 				}
+			}
+		}
+		macro_rules! bytes_left {
+			() => {
+				len + 4 - read_pos
 			}
 		}
 		macro_rules! advance_bytes {
@@ -1216,7 +1302,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			12 => {
+			13 => {
 				let mut suggested_target = [0; 32];
 				suggested_target.copy_from_slice(get_slice!(32));
 				let mut minimum_target = [0; 32];
@@ -1235,7 +1321,7 @@ impl codec::Decoder for PoolMsgFramer {
 					user_auth,
 				}))
 			},
-			13 => {
+			14 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -1248,17 +1334,20 @@ impl codec::Decoder for PoolMsgFramer {
 				let coinbase_postfix_len = get_slice!(1)[0];
 				let coinbase_postfix = get_slice!(coinbase_postfix_len).to_vec();
 
-				let script_len = utils::slice_to_le16(get_slice!(2));
-				if script_len > 8192 {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
-				}
+				let script_len = get_slice!(1)[0];
 				let script = Script::from(get_slice!(script_len).to_vec());
 
 				let coinbase_output_count = get_slice!(1)[0] as usize;
+				if coinbase_output_count > 250 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
 				let mut appended_coinbase_outputs = Vec::with_capacity(coinbase_output_count);
 				for _ in 0..coinbase_output_count {
 					let value = utils::slice_to_le64(get_slice!(8));
-					let script_len = utils::slice_to_le16(get_slice!(2));
+					let script_len = get_slice!(1)[0];
+					if script_len > 252 {
+						return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+					}
 					appended_coinbase_outputs.push(TxOut {
 						value: value,
 						script_pubkey: Script::from(get_slice!(script_len).to_vec()),
@@ -1278,19 +1367,19 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			14 => {
+			15 => {
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
 				advance_bytes!();
 				Ok(Some(PoolMessage::RejectUserAuth { user_id }))
 			},
-			15 => {
+			16 => {
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
 				advance_bytes!();
 				Ok(Some(PoolMessage::DropUser { user_id }))
 			},
-			16 => {
+			17 => {
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
 				let timestamp = utils::slice_to_le64(get_slice!(8));
@@ -1311,7 +1400,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			17 => {
+			18 => {
 				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
@@ -1336,8 +1425,14 @@ impl codec::Decoder for PoolMsgFramer {
 					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e))
 				};
 
-				let user_tag_len = get_slice!(1)[0];
-				let user_tag = get_slice!(user_tag_len).to_vec();
+				let user_tag_1_len = get_slice!(1)[0];
+				let user_tag_1 = get_slice!(user_tag_1_len).to_vec();
+				let user_tag_2_len = get_slice!(1)[0];
+				let user_tag_2 = get_slice!(user_tag_2_len).to_vec();
+
+				let previous_header = if bytes_left!() != 0 {
+					Some(network::serialize::deserialize(get_slice!(80)).unwrap())
+				} else { None };
 
 				let msg = PoolMessage::Share {
 					share: PoolShare {
@@ -1349,13 +1444,16 @@ impl codec::Decoder for PoolMsgFramer {
 
 						merkle_rhss,
 						coinbase_tx,
-						user_tag,
+
+						user_tag_1,
+						user_tag_2,
+						previous_header,
 					},
 				};
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			18 => {
+			19 => {
 				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
@@ -1363,8 +1461,10 @@ impl codec::Decoder for PoolMsgFramer {
 				let header_nbits = utils::slice_to_le32(get_slice!(4));
 				let header_nonce = utils::slice_to_le32(get_slice!(4));
 
-				let user_tag_len = get_slice!(1)[0];
-				let user_tag = get_slice!(user_tag_len).to_vec();
+				let user_tag_1_len = get_slice!(1)[0];
+				let user_tag_1 = get_slice!(user_tag_1_len).to_vec();
+				let user_tag_2_len = get_slice!(1)[0];
+				let user_tag_2 = get_slice!(user_tag_2_len).to_vec();
 
 				let action_count = utils::slice_to_le16(get_slice!(2)) as usize;
 				let mut actions = Vec::with_capacity(action_count);
@@ -1390,16 +1490,51 @@ impl codec::Decoder for PoolMsgFramer {
 						header_time,
 						header_nbits,
 						header_nonce,
-						user_tag,
+						user_tag_1,
+						user_tag_2,
 						txn: actions,
 					}
 				}))
 			},
-			19 => {
+			20 => {
 				advance_bytes!();
 				Ok(Some(PoolMessage::WeakBlockStateReset {}))
 			},
-			10 => {
+			21 => {
+				let user_tag_1_len = get_slice!(1)[0];
+				let user_tag_1 = get_slice!(user_tag_1_len).to_vec();
+				let user_tag_2_len = get_slice!(1)[0];
+				let user_tag_2 = get_slice!(user_tag_2_len).to_vec();
+
+				advance_bytes!();
+				Ok(Some(PoolMessage::ShareAccepted {
+					user_tag_1,
+					user_tag_2,
+				}))
+			},
+			22 => {
+				let reason_value = get_slice!(1)[0];
+				let reason = match reason_value {
+					1 => ShareRejectedReason::StalePrevBlock,
+					2 => ShareRejectedReason::BadHash,
+					3 => ShareRejectedReason::Duplicate,
+					4 => ShareRejectedReason::BadPayoutInfo,
+					5 => ShareRejectedReason::BadWork,
+					_ => ShareRejectedReason::Other(reason_value),
+				};
+				let user_tag_1_len = get_slice!(1)[0];
+				let user_tag_1 = get_slice!(user_tag_1_len).to_vec();
+				let user_tag_2_len = get_slice!(1)[0];
+				let user_tag_2 = get_slice!(user_tag_2_len).to_vec();
+
+				advance_bytes!();
+				Ok(Some(PoolMessage::ShareRejected {
+					reason,
+					user_tag_1,
+					user_tag_2,
+				}))
+			},
+			11 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
@@ -1415,7 +1550,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			// 11 (VendorMessage) handled pre-match
+			// 12 (VendorMessage) handled pre-match
 			_ => {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 			}

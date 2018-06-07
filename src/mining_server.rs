@@ -121,7 +121,7 @@ impl MiningServer {
 		let second_secp_ctx = Secp256k1::new();
 		let auth_key_copy = auth_key;
 		tokio::spawn(job_providers.for_each(move |job| {
-			let our_template_sig = sign_message!(job.template, 3, us_cp);
+			let our_template_sig = sign_message!(job.template, 4, us_cp);
 
 			{
 				let mut jobs = us_cp.jobs.write().unwrap();
@@ -145,7 +145,7 @@ impl MiningServer {
 						header_nbits: job.template.header_nbits,
 					};
 					let _ = client_stream.start_send(WorkMessage::BlockTemplateHeader {
-						signature: sign_message_ctx!(template_header, 8, second_secp_ctx, auth_key_copy),
+						signature: sign_message_ctx!(template_header, 9, second_secp_ctx, auth_key_copy),
 						template: template_header,
 					});
 				} else {
@@ -250,7 +250,7 @@ impl MiningServer {
 						};
 
 						send_response!(WorkMessage::CoinbasePrefixPostfix {
-							signature: sign_message!(prefix_postfix, 7, us),
+							signature: sign_message!(prefix_postfix, 8, us),
 							coinbase_prefix_postfix: prefix_postfix,
 						});
 					}
@@ -258,7 +258,7 @@ impl MiningServer {
 					match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 						Some(job) => {
 							send_response!(WorkMessage::BlockTemplate {
-								signature: sign_message!(job.1.template, 3, us),
+								signature: sign_message!(job.1.template, 4, us),
 								template: (*job.1.template).clone(),
 							});
 						}, None => {}
@@ -268,6 +268,10 @@ impl MiningServer {
 				},
 				WorkMessage::ProtocolVersion { .. } => {
 					println!("Received ProtocolVersion?");
+					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+				},
+				WorkMessage::AdditionalCoinbaseLength { .. } => {
+					println!("Received AdditionalCoinbaseLength for final-work client?");
 					return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 				},
 				WorkMessage::BlockTemplate { .. } => {
