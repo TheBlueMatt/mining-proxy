@@ -818,6 +818,7 @@ impl PoolPayoutInfo {
 
 #[derive(Clone)]
 pub struct PoolDifficulty {
+	pub user_id: Vec<u8>,
 	pub timestamp: u64,
 	pub share_target: [u8; 32],
 	pub weak_block_target: [u8; 32],
@@ -938,7 +939,6 @@ pub enum PoolMessage {
 		user_id: Vec<u8>,
 	},
 	ShareDifficulty {
-		user_id: Vec<u8>,
 		difficulty: PoolDifficulty,
 	},
 	Share {
@@ -1053,13 +1053,13 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_u8(user_id.len() as u8);
 				res.put_slice(user_id);
 			},
-			PoolMessage::ShareDifficulty { ref user_id, ref difficulty } => {
-				res.reserve(1 + 3 + 1 + user_id.len() + 8 + 32*2);
+			PoolMessage::ShareDifficulty { ref difficulty } => {
+				res.reserve(1 + 3 + 1 + difficulty.user_id.len() + 8 + 32*2);
 				res.put_u8(17);
-				res.put_u16_le(1 + user_id.len() as u16 + 8 + 32*2);
+				res.put_u16_le(1 + difficulty.user_id.len() as u16 + 8 + 32*2);
 				res.put_u8(0);
-				res.put_u8(user_id.len() as u8);
-				res.put_slice(user_id);
+				res.put_u8(difficulty.user_id.len() as u8);
+				res.put_slice(&difficulty.user_id);
 				res.put_u64_le(difficulty.timestamp);
 				res.put_slice(&difficulty.share_target);
 				res.put_slice(&difficulty.weak_block_target);
@@ -1380,8 +1380,8 @@ impl codec::Decoder for PoolMsgFramer {
 				weak_block_target.copy_from_slice(get_slice!(32));
 
 				let msg = PoolMessage::ShareDifficulty {
-					user_id,
 					difficulty: PoolDifficulty {
+						user_id,
 						timestamp,
 						share_target,
 						weak_block_target,

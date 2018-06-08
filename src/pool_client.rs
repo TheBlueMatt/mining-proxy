@@ -325,7 +325,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				println!("Received DropUser?");
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
-			PoolMessage::ShareDifficulty { difficulty, .. } => {
+			PoolMessage::ShareDifficulty { difficulty } => {
 				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 				if difficulty.timestamp < timestamp - 1000*60*20 || difficulty.timestamp > timestamp + 1000*60*1 {

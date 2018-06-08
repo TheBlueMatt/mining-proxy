@@ -183,8 +183,8 @@ fn main() {
 								};
 								if new_target != cur_target {
 									let _ = user.send_stream.clone().start_send(PoolMessage::ShareDifficulty {
-										user_id: user.user_id.clone(),
 										difficulty: PoolDifficulty {
+											user_id: user.user_id.clone(),
 											timestamp,
 											share_target: utils::leading_0s_to_target(new_target as u8),
 											weak_block_target: utils::leading_0s_to_target(new_target + WEAK_BLOCK_RATIO_0S),
@@ -328,8 +328,8 @@ fn main() {
 										let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
 										send_response!(PoolMessage::ShareDifficulty {
-											user_id: $user.user_id.clone(),
 											difficulty: PoolDifficulty {
+												user_id: $user.user_id.clone(),
 												timestamp,
 												share_target: utils::leading_0s_to_target($cur_target + 1),
 												weak_block_target: utils::leading_0s_to_target($cur_target + 1 + WEAK_BLOCK_RATIO_0S),
@@ -415,8 +415,8 @@ fn main() {
 										});
 
 										send_response!(PoolMessage::ShareDifficulty {
-											user_id: user_id.clone(),
 											difficulty: PoolDifficulty {
+												user_id: user_id.clone(),
 												timestamp,
 												share_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8),
 												weak_block_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8 + WEAK_BLOCK_RATIO_0S),
