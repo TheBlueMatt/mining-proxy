@@ -22,6 +22,12 @@ mod utils;
 mod work_getter;
 use work_getter::*;
 
+mod connection_maintainer;
+
+mod client_utils;
+mod pool_client;
+mod work_client;
+
 use bitcoin::util::address::Address;
 use bitcoin::util::privkey;
 

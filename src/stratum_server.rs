@@ -1,4 +1,5 @@
-use msg_framing::{BlockTemplate,WorkInfo,WinningNonce};
+use msg_framing::{BlockTemplate,WinningNonce};
+use client_utils::WorkInfo;
 use utils;
 
 use bitcoin::blockdata::transaction::{TxIn,Transaction};

@@ -1,4 +1,5 @@
-use msg_framing::{BlockTemplate,BlockTemplateHeader,CoinbasePrefixPostfix,WinningNonce,WorkInfo,WorkMessage,WorkMsgFramer};
+use msg_framing::{BlockTemplate,BlockTemplateHeader,CoinbasePrefixPostfix,WinningNonce,WorkMessage,WorkMsgFramer};
+use client_utils::WorkInfo;
 use utils;
 
 use bitcoin::blockdata::block::BlockHeader;

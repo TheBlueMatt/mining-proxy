@@ -1,13 +1,10 @@
 use bitcoin::blockdata::transaction::{TxOut,Transaction};
 use bitcoin::blockdata::script::Script;
 use bitcoin::blockdata::block::BlockHeader;
-use bitcoin::util::hash::Sha256dHash;
 use bitcoin::network;
 
 use bytes;
 use bytes::BufMut;
-
-use futures::sync::mpsc;
 
 use tokio_io::codec;
 
@@ -17,7 +14,6 @@ use secp256k1::Signature;
 
 use std::error::Error;
 use std::{cmp, fmt, io};
-use std::sync::Arc;
 
 use utils;
 
@@ -198,12 +194,6 @@ impl BlockTemplateHeader {
 		res.put_u32_le(self.header_time);
 		res.put_u32_le(self.header_nbits);
 	}
-}
-
-#[derive(Clone)]
-pub struct WorkInfo {
-	pub template: Arc<BlockTemplate>,
-	pub solutions: mpsc::UnboundedSender<Arc<(WinningNonce, Sha256dHash)>>,
 }
 
 pub enum WorkMessage {
