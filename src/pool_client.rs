@@ -114,10 +114,12 @@ impl PoolHandler {
 								}
 							}) {
 								Ok(_) => { println!("Submitted share!"); },
+								//TODO: We should queue these for sending later
 								Err(_) => { println!("Failed to submit nonce as pool connection lost"); },
 							}
 						},
 						None => {
+							//TODO: We should queue these for sending later
 							println!("Failed to submit nonce as pool connection lost");
 						}
 					}
@@ -161,12 +163,14 @@ impl PoolHandler {
 							}) {
 								Ok(_) => { println!("Submitted weak block!"); },
 								Err(_) => {
+									//TODO: We should queue these for sending later
 									println!("Failed to submit weak block as pool connection lost");
 									return;
 								},
 							}
 						},
 						None => {
+							//TODO: We should queue these for sending later
 							println!("Failed to submit weak block as pool connection lost");
 							return;
 						}

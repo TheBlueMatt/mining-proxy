@@ -7,8 +7,6 @@ extern crate crypto;
 extern crate futures;
 extern crate tokio;
 extern crate tokio_io;
-extern crate tokio_threadpool;
-extern crate tokio_executor;
 extern crate secp256k1;
 
 mod msg_framing;
@@ -45,9 +43,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::collections::{hash_map, HashMap};
 
-use tokio_threadpool::park::DefaultPark;
-use tokio_executor::park::Park;
-
 // These are useful to plug in business logic into:
 fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
 	println!("User {} authed with pass {}", String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_auth));
@@ -73,27 +68,6 @@ const MIN_USER_SHARES_PER_30_SEC: usize = 1;
 
 // Dont change anything below...
 const MAX_TARGET_LEADING_0S: u8 = 71 - WEAK_BLOCK_RATIO_0S; // Roughly network diff/16 at the time of writing, should be more than sufficiently high for any use-case
-
-struct LoadMeasuringPark {
-	inner: DefaultPark,
-}
-impl Park for LoadMeasuringPark {
-	type Unpark = <DefaultPark as Park>::Unpark;
-	type Error = <DefaultPark as Park>::Error;
-
-	fn unpark(&self) -> Self::Unpark {
-		self.inner.unpark()
-	}
-
-	fn park(&mut self) -> Result<(), Self::Error> {
-		println!("Parking...");
-		self.inner.park()
-	}
-
-	fn park_timeout(&mut self, time: std::time::Duration) -> Result<(), Self::Error> {
-		self.inner.park_timeout(time)
-	}
-}
 
 struct PerUserClientRef {
 	send_stream: mpsc::Sender<PoolMessage>,
@@ -180,11 +154,7 @@ fn main() {
 		return;
 	}
 
-	let mut tp_builder = tokio::executor::thread_pool::Builder::new();
-	tp_builder.custom_park(|_| {
-		LoadMeasuringPark { inner: DefaultPark::new() }
-	});
-	let mut rt = tokio::runtime::Builder::new().threadpool_builder(tp_builder).build().unwrap();
+	let mut rt = tokio::runtime::Builder::new().build().unwrap();
 	rt.spawn(futures::lazy(move || -> Result<(), ()> {
 		match net::TcpListener::bind(&listen_bind.unwrap()) {
 			Ok(listener) => {
