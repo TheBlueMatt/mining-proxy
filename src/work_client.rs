@@ -13,7 +13,7 @@ use bytes;
 use bytes::BufMut;
 
 use futures::future;
-use futures::{Future,Sink};
+use futures::{Future,Stream,Sink};
 
 use tokio;
 
@@ -76,6 +76,23 @@ impl EventualTxData {
 			},
 		}
 	}
+
+	pub fn has_result(&self) -> bool {
+		self.value.read().unwrap().is_some()
+	}
+}
+
+#[derive(Clone)]
+pub struct WorkProviderJob {
+	pub template: BlockTemplate,
+	pub coinbase_prefix_postfix: Option<CoinbasePrefixPostfix>,
+	pub tx_data: Arc<EventualTxData>,
+	pub provider: Arc<JobProviderHandler>,
+}
+
+enum WorkProviderAction {
+	ProviderDisconnected,
+	JobUpdate { job: WorkProviderJob },
 }
 
 struct JobProviderState {
@@ -86,7 +103,7 @@ struct JobProviderState {
 	cur_prefix_postfix: Option<CoinbasePrefixPostfix>,
 
 	pending_tx_data_requests: HashMap<u64, oneshot::Sender<TransactionData>>,
-	job_stream: mpsc::Sender<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<EventualTxData>)>,
+	job_stream: mpsc::Sender<WorkProviderAction>,
 }
 
 pub struct JobProviderHandler {
@@ -95,7 +112,7 @@ pub struct JobProviderHandler {
 }
 
 impl JobProviderHandler {
-	pub fn new(expected_auth_key: Option<PublicKey>) -> (Arc<JobProviderHandler>, mpsc::Receiver<(BlockTemplate, Option<CoinbasePrefixPostfix>, Arc<EventualTxData>)>) {
+	fn new(expected_auth_key: Option<PublicKey>) -> (Arc<JobProviderHandler>, mpsc::Receiver<WorkProviderAction>) {
 		let (work_sender, work_receiver) = mpsc::channel(10);
 
 		(Arc::new(JobProviderHandler {
@@ -151,7 +168,9 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 	}
 
 	fn connection_closed(&self) {
-		self.state.lock().unwrap().stream = None;
+		let mut us = self.state.lock().unwrap();
+		let _ = us.job_stream.start_send(WorkProviderAction::ProviderDisconnected);
+		us.stream = None;
 	}
 
 	fn handle_message(&self, msg: WorkMessage) -> Result<(), io::Error> {
@@ -233,6 +252,13 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 					None => {}
 				}
 
+				for output in template.appended_coinbase_outputs.iter() {
+					if output.value != 0 {
+						println!("Invalid non-final BlockTemplate attempted to claim value");
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+					}
+				}
+
 				if us.cur_template.is_none() || us.cur_template.as_ref().unwrap().template_timestamp < template.template_timestamp {
 					println!("Received new BlockTemplate with diff lower bound {}", utils::target_to_diff_lb(&template.target));
 					let (txn, txn_tx) = EventualTxData::new();
@@ -241,7 +267,14 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 						Err(_) => return Ok(()), // Disconnected
 					}
 					let cur_postfix_prefix = us.cur_prefix_postfix.clone();
-					match us.job_stream.start_send((template.clone(), cur_postfix_prefix.clone(), txn)) {
+					match us.job_stream.start_send(WorkProviderAction::JobUpdate {
+						job: WorkProviderJob {
+							template: template.clone(),
+							coinbase_prefix_postfix: cur_postfix_prefix.clone(),
+							tx_data: txn,
+							provider: self.clone(),
+						}
+					}) {
 						Ok(_) => {},
 						Err(_) => {
 							println!("Job provider sending jobs too quickly");
@@ -319,7 +352,14 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 						}
 						us.pending_tx_data_requests.insert(template.template_timestamp, txn_tx);
 
-						match us.job_stream.start_send((template, cur_prefix_postfix, txn)) {
+						match us.job_stream.start_send(WorkProviderAction::JobUpdate {
+							job: WorkProviderJob {
+								template,
+								coinbase_prefix_postfix: cur_prefix_postfix,
+								tx_data: txn,
+								provider: self.clone(),
+							}
+						}) {
 							Ok(_) => {},
 							Err(_) => {
 								println!("Job provider sending jobs too quickly");
@@ -346,5 +386,91 @@ impl ConnectionHandler<WorkMessage> for Arc<JobProviderHandler> {
 			},
 		}
 		Ok(())
+	}
+}
+
+struct WorkProviderHolder {
+	is_connected: bool,
+	last_job: Option<WorkProviderJob>,
+}
+
+pub struct MultiJobProvider {
+	best_job: u64,
+	jobs: Vec<WorkProviderHolder>,
+	job_tx: mpsc::UnboundedSender<WorkProviderJob>,
+}
+
+impl MultiJobProvider {
+	pub fn create(mut job_provider_hosts: Vec<String>) -> mpsc::UnboundedReceiver<WorkProviderJob> {
+		let (job_tx, job_rx) = mpsc::unbounded();
+		let cur_work_rc = Arc::new(Mutex::new(MultiJobProvider {
+			best_job: 0,
+			jobs: Vec::with_capacity(job_provider_hosts.len()),
+			job_tx: job_tx,
+		}));
+
+		tokio::spawn(future::lazy(move || -> Result<(), ()> {
+			for (idx, host) in job_provider_hosts.drain(..).enumerate() {
+				let (mut handler, mut job_rx) = JobProviderHandler::new(None);
+				cur_work_rc.lock().unwrap().jobs.push(WorkProviderHolder {
+					is_connected: false,
+					last_job: None,
+				});
+
+				let work_rc = cur_work_rc.clone();
+				tokio::spawn(job_rx.for_each(move |job| {
+					let mut cur_work = work_rc.lock().unwrap();
+					match job {
+						WorkProviderAction::JobUpdate { job } => {
+							cur_work.jobs[idx].is_connected = true;
+							if cur_work.best_job < job.template.template_timestamp {
+								cur_work.best_job = job.template.template_timestamp;
+								cur_work.job_tx.start_send(job.clone()).unwrap();
+							}
+							cur_work.jobs[idx].last_job = Some(job);
+						},
+						WorkProviderAction::ProviderDisconnected => {
+							if cur_work.jobs[idx].is_connected {
+								cur_work.jobs[idx].is_connected = false;
+								if cur_work.jobs[idx].last_job.is_some() && cur_work.jobs[idx].last_job.as_ref().unwrap().template.template_timestamp == cur_work.best_job {
+									cur_work.best_job = 0;
+
+									// Prefer jobs which are from connected providers, then jobs for which we can construct
+									// a complete weak block (which the pool could relay for us)...
+									let mut highest_timestamp = (0, 0);
+									let mut highest_connected_timestamp = (0, 0);
+									for (idx, job) in cur_work.jobs.iter().enumerate() {
+										if job.last_job.is_some() {
+											let job_template = job.last_job.as_ref().unwrap();
+											if job_template.tx_data.has_result() && job_template.template.template_timestamp > highest_timestamp.0 {
+												highest_timestamp = (job_template.template.template_timestamp, idx);
+											}
+											if job.is_connected && job_template.template.template_timestamp > highest_connected_timestamp.0 {
+												highest_connected_timestamp = (job_template.template.template_timestamp, idx);
+											}
+										}
+									}
+									if highest_connected_timestamp.0 != 0 {
+										let new_job = cur_work.jobs[highest_connected_timestamp.1].last_job.as_ref().unwrap().clone();
+										cur_work.job_tx.start_send(new_job).unwrap();
+									} else if highest_timestamp.0 != 0 {
+										let new_job = cur_work.jobs[highest_timestamp.1].last_job.as_ref().unwrap().clone();
+										cur_work.job_tx.start_send(new_job).unwrap();
+									}
+								}
+							}
+						},
+					}
+					Ok(())
+				}).then(|_| {
+					Ok(())
+				}));
+				ConnectionMaintainer::new(host, handler).make_connection();
+			}
+
+			Ok(())
+		}));
+
+		job_rx
 	}
 }

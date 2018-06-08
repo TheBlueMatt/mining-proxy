@@ -1,5 +1,5 @@
 use msg_framing::{BlockTemplate,BlockTemplateHeader,CoinbasePrefixPostfix,WinningNonce,WorkMessage,WorkMsgFramer};
-use client_utils::WorkInfo;
+use work_getter::WorkInfo;
 use utils;
 
 use bitcoin::blockdata::block::BlockHeader;
@@ -108,7 +108,7 @@ macro_rules! sign_message {
 }
 
 impl MiningServer {
-	pub fn new(job_providers: mpsc::Receiver<WorkInfo>, auth_key: SecretKey) -> Arc<Self> {
+	pub fn new(job_providers: mpsc::UnboundedReceiver<WorkInfo>, auth_key: SecretKey) -> Arc<Self> {
 		let us = Arc::new(Self {
 			secp_ctx: Secp256k1::new(),
 			auth_key: auth_key,

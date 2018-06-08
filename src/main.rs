@@ -24,8 +24,9 @@ use work_getter::*;
 
 mod connection_maintainer;
 
-mod client_utils;
 mod pool_client;
+use pool_client::PoolInfo;
+
 mod work_client;
 
 use bitcoin::util::address::Address;
@@ -224,17 +225,11 @@ fn main() {
 		} else if stratum_listen_bind.is_none() && mining_listen_bind.is_some() {
 			bind_and_handle!(mining_listen_bind, MiningServer::new(job_rx, mining_auth_key.unwrap()), MiningServer);
 		} else {
-			let (mut stratum_tx, stratum_rx) = mpsc::channel(5);
-			let (mut mining_tx, mining_rx) = mpsc::channel(5);
+			let (mut stratum_tx, stratum_rx) = mpsc::unbounded();
+			let (mut mining_tx, mining_rx) = mpsc::unbounded();
 			tokio::spawn(job_rx.for_each(move |job| {
-				match mining_tx.start_send(job.clone()) {
-					Ok(_) => {},
-					Err(_) => { println!("Dropped new job for native clients as server ran behind!"); },
-				}
-				match stratum_tx.start_send(job) {
-					Ok(_) => {},
-					Err(_) => { println!("Dropped new job for stratum clients as server ran behind!"); },
-				}
+				mining_tx.start_send(job.clone()).unwrap();
+				stratum_tx.start_send(job).unwrap();
 				Ok(())
 			}).then(|_| {
 				Ok(())

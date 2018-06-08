@@ -1,5 +1,5 @@
 use msg_framing::{BlockTemplate,WinningNonce};
-use client_utils::WorkInfo;
+use work_getter::WorkInfo;
 use utils;
 
 use bitcoin::blockdata::transaction::{TxIn,Transaction};
@@ -213,7 +213,7 @@ pub struct StratumServer {
 }
 
 impl StratumServer {
-	pub fn new(job_providers: mpsc::Receiver<WorkInfo>) -> Arc<Self> {
+	pub fn new(job_providers: mpsc::UnboundedReceiver<WorkInfo>) -> Arc<Self> {
 		let us = Arc::new(Self {
 			clients: Mutex::new((Vec::new(), 0)),
 			jobs: RwLock::new(BTreeMap::new()),

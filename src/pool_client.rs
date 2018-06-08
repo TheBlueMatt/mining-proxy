@@ -11,7 +11,10 @@ use bitcoin::util::hash::Sha256dHash;
 use bytes;
 use bytes::BufMut;
 
-use futures::Sink;
+use future;
+use futures::{Future, Stream, Sink};
+
+use tokio;
 
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
@@ -20,13 +23,25 @@ use secp256k1;
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
+use std;
 use std::collections::HashMap;
-use std::io;
-use std::sync::{Arc, RwLock};
+use std::{cmp, io};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
+pub struct PoolProviderJob {
+	pub payout_info: PoolPayoutInfo,
+	pub difficulty: PoolDifficulty,
+	pub provider: Arc<PoolHandler>,
+}
+
+pub enum PoolProviderAction {
+	ProviderDisconnected,
+	PoolUpdate { pool: PoolProviderJob },
+}
+
 struct PoolHandlerState {
-	pool_priority: usize,
 	stream: Option<mpsc::UnboundedSender<PoolMessage>>,
 	auth_key: Option<PublicKey>,
 
@@ -39,7 +54,7 @@ struct PoolHandlerState {
 	last_header_sent: [u8; 32],
 	last_weak_block: Option<Vec<(Transaction, Sha256dHash)>>,
 
-	job_stream: mpsc::Sender<(PoolPayoutInfo, Option<PoolDifficulty>)>,
+	job_stream: mpsc::Sender<PoolProviderAction>,
 }
 
 pub struct PoolHandler {
@@ -48,12 +63,11 @@ pub struct PoolHandler {
 }
 
 impl PoolHandler {
-	pub fn new(expected_auth_key: Option<PublicKey>, user_id: Vec<u8>, user_auth: Vec<u8>, pool_priority: usize) -> (Arc<PoolHandler>, mpsc::Receiver<(PoolPayoutInfo, Option<PoolDifficulty>)>) {
+	fn new(expected_auth_key: Option<PublicKey>, user_id: Vec<u8>, user_auth: Vec<u8>) -> (Arc<PoolHandler>, mpsc::Receiver<PoolProviderAction>) {
 		let (work_sender, work_receiver) = mpsc::channel(5);
 
 		(Arc::new(PoolHandler {
 			state: RwLock::new(PoolHandlerState {
-				pool_priority: pool_priority,
 				stream: None,
 				auth_key: expected_auth_key,
 
@@ -70,14 +84,6 @@ impl PoolHandler {
 			}),
 			secp_ctx: Secp256k1::new(),
 		}), work_receiver)
-	}
-
-	pub fn is_connected(&self) -> bool {
-		self.state.read().unwrap().stream.is_some()
-	}
-
-	pub fn get_priority(&self) -> usize {
-		self.state.read().unwrap().pool_priority
 	}
 
 	pub fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash)>, prev_header: &BlockHeader) {
@@ -200,7 +206,9 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 	}
 
 	fn connection_closed(&self) {
-		self.state.write().unwrap().stream = None;
+		let mut us = self.state.write().unwrap();
+		us.stream = None;
+		let _ = us.job_stream.start_send(PoolProviderAction::ProviderDisconnected);
 	}
 
 	fn handle_message(&self, msg: PoolMessage) -> Result<(), io::Error> {
@@ -286,12 +294,20 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 
 				if us.cur_payout_info.is_none() || us.cur_payout_info.as_ref().unwrap().timestamp < payout_info.timestamp {
 					println!("Received new payout info!");
-					let cur_difficulty = us.cur_difficulty.clone();
-					match us.job_stream.start_send((payout_info.clone(), cur_difficulty.clone())) {
-						Ok(_) => {},
-						Err(_) => {
-							println!("Pool updating payout info too quickly");
-							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+					if us.cur_difficulty.is_some() {
+						let cur_difficulty = us.cur_difficulty.clone();
+						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
+							pool: PoolProviderJob {
+								payout_info: payout_info.clone(),
+								difficulty: cur_difficulty.unwrap(),
+								provider: self.clone(),
+							}
+						}) {
+							Ok(_) => {},
+							Err(_) => {
+								println!("Pool updating payout info too quickly");
+								return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+							}
 						}
 					}
 					us.cur_payout_info = Some(payout_info);
@@ -317,9 +333,15 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					println!("Received new difficulty!");
 					us.cur_difficulty = Some(difficulty);
 					if us.cur_payout_info.is_some() {
-						let cur_difficulty = us.cur_difficulty.clone();
+						let cur_difficulty = us.cur_difficulty.as_ref().unwrap().clone();
 						let payout_info = us.cur_payout_info.as_ref().unwrap().clone();
-						match us.job_stream.start_send((payout_info, cur_difficulty)) {
+						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
+							pool: PoolProviderJob {
+								payout_info,
+								difficulty: cur_difficulty,
+								provider: self.clone(),
+							}
+						}) {
 							Ok(_) => {},
 							Err(_) => {
 								println!("Pool updating difficulty too quickly");
@@ -358,5 +380,90 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 			},
 		}
 		Ok(())
+	}
+}
+
+struct PoolProviderHolder {
+	is_connected: bool,
+	last_job: Option<PoolProviderJob>,
+}
+
+pub struct MultiPoolProvider {
+	cur_pool: usize,
+	pools: Vec<PoolProviderHolder>,
+	job_tx: mpsc::UnboundedSender<PoolProviderJob>,
+}
+
+pub struct PoolInfo {
+	pub host_port: String,
+	pub user_id: Vec<u8>,
+	pub user_auth: Vec<u8>,
+}
+
+impl MultiPoolProvider {
+	pub fn create(mut pool_hosts: Vec<PoolInfo>) -> mpsc::UnboundedReceiver<PoolProviderJob> {
+		let (job_tx, job_rx) = mpsc::unbounded();
+		let cur_work_rc = Arc::new(Mutex::new(MultiPoolProvider {
+			cur_pool: std::usize::MAX,
+			pools: Vec::with_capacity(pool_hosts.len()),
+			job_tx: job_tx,
+		}));
+
+		tokio::spawn(future::lazy(move || -> Result<(), ()> {
+			for (idx, pool) in pool_hosts.drain(..).enumerate() {
+				let (mut handler, mut pool_rx) = PoolHandler::new(None, pool.user_id, pool.user_auth);
+				cur_work_rc.lock().unwrap().pools.push(PoolProviderHolder {
+					is_connected: false,
+					last_job: None,
+				});
+
+				let work_rc = cur_work_rc.clone();
+				tokio::spawn(pool_rx.for_each(move |job| {
+					let mut cur_work = work_rc.lock().unwrap();
+					match job {
+						PoolProviderAction::PoolUpdate { pool } => {
+							cur_work.pools[idx].is_connected = true;
+							if cur_work.cur_pool >= idx {
+								cur_work.cur_pool = idx;
+								cur_work.job_tx.start_send(pool.clone()).unwrap();
+							}
+							cur_work.pools[idx].last_job = Some(pool);
+						},
+						PoolProviderAction::ProviderDisconnected => {
+							if cur_work.pools[idx].is_connected {
+								cur_work.pools[idx].is_connected = false;
+								if cur_work.cur_pool == idx {
+									// Prefer pools which are connected, then follow the order they
+									// were provided in...
+									let mut lowest_with_work = std::usize::MAX;
+									for (iter_idx, pool) in cur_work.pools.iter().enumerate() {
+										if pool.last_job.is_some() {
+											if pool.is_connected {
+												lowest_with_work = iter_idx;
+												break;
+											} else {
+												lowest_with_work = cmp::min(lowest_with_work, iter_idx);
+											}
+										}
+									}
+									if lowest_with_work != std::usize::MAX {
+										let new_pool = cur_work.pools[lowest_with_work].last_job.as_ref().unwrap().clone();
+										cur_work.job_tx.start_send(new_pool).unwrap();
+									}
+								}
+							}
+						},
+					}
+					Ok(())
+				}).then(|_| {
+					Ok(())
+				}));
+				ConnectionMaintainer::new(pool.host_port, handler).make_connection();
+			}
+
+			Ok(())
+		}));
+
+		job_rx
 	}
 }
