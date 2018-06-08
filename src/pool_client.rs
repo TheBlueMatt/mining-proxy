@@ -5,6 +5,7 @@ use utils;
 use futures::sync::mpsc;
 
 use bitcoin::blockdata::transaction::Transaction;
+use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::util::hash::Sha256dHash;
 
 use bytes;
@@ -34,6 +35,8 @@ struct PoolHandlerState {
 
 	cur_payout_info: Option<PoolPayoutInfo>,
 	cur_difficulty: Option<PoolDifficulty>,
+
+	last_header_sent: [u8; 32],
 	last_weak_block: Option<Vec<(Transaction, Sha256dHash)>>,
 
 	job_stream: mpsc::Sender<(PoolPayoutInfo, Option<PoolDifficulty>)>,
@@ -59,6 +62,8 @@ impl PoolHandler {
 
 				cur_payout_info: None,
 				cur_difficulty: None,
+
+				last_header_sent: [0; 32],
 				last_weak_block: None,
 
 				job_stream: work_sender,
@@ -75,8 +80,14 @@ impl PoolHandler {
 		self.state.read().unwrap().pool_priority
 	}
 
-	pub fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash)>) {
+	pub fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash)>, prev_header: &BlockHeader) {
 		let mut us = self.state.write().unwrap();
+
+		let previous_header = if us.last_header_sent == template.header_prevblock { None } else {
+			us.last_header_sent = template.header_prevblock.clone();
+			Some(prev_header.clone())
+		};
+
 		match us.cur_difficulty {
 			Some(ref difficulty) => {
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.share_target[..]) {
@@ -93,7 +104,7 @@ impl PoolHandler {
 									coinbase_tx: work.0.coinbase_tx.clone(),
 									user_tag_1: work.0.user_tag.clone(),
 									user_tag_2: Vec::new(),
-									previous_header: None,
+									previous_header,
 								}
 							}) {
 								Ok(_) => { println!("Submitted share!"); },

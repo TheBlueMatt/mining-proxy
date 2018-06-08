@@ -111,9 +111,9 @@ pub fn merge_job_pool(our_payout_script: Script, job_info: &Option<(BlockTemplat
 					Some(ref source) => {
 						let source_ref = source.clone();
 						let template_ref_2 = template_ref.clone();
-						tx_data_ref.get_and(move |txn| {
+						tx_data_ref.get_and(move |txn, prev_header| {
 							let source_clone = source_ref.clone();
-							source_clone.send_nonce(&nonces, &template_ref_2, &txn);
+							source_clone.send_nonce(&nonces, &template_ref_2, &txn, &prev_header);
 						});
 					},
 					None => {}

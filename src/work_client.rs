@@ -4,6 +4,7 @@ use utils;
 
 use futures::sync::{mpsc,oneshot};
 
+use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::network::serialize::BitcoinHash;
 use bitcoin::util::hash::Sha256dHash;
@@ -32,8 +33,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct EventualTxData {
 	// We dont really want Fn here, we want FnOnce, but we can't because that'd require a move of
 	// the function onto stack, which is of unknown size, so we cant...
-	callees: Mutex<Vec<Box<Fn(&Vec<(Transaction, Sha256dHash)>) + Send>>>,
-	value: RwLock<Option<Vec<(Transaction, Sha256dHash)>>>,
+	callees: Mutex<Vec<Box<Fn(&Vec<(Transaction, Sha256dHash)>, &BlockHeader) + Send>>>,
+	value: RwLock<Option<(Vec<(Transaction, Sha256dHash)>, BlockHeader)>>,
 }
 impl EventualTxData {
 	fn new() -> (Arc<Self>, oneshot::Sender<TransactionData>) {
@@ -49,11 +50,11 @@ impl EventualTxData {
 				let hash = tx.bitcoin_hash();
 				value.push((tx, hash));
 			}
-			*us_rx.value.write().unwrap() = Some(value);
+			*us_rx.value.write().unwrap() = Some((value, res.previous_header));
 			let v_lock = us_rx.value.read().unwrap();
 			let v = v_lock.as_ref().unwrap();
 			for callee in us_rx.callees.lock().unwrap().iter() {
-				(callee)(v);
+				(callee)(&v.0, &v.1);
 			}
 			us_rx.callees.lock().unwrap().clear();
 			future::result(Ok(()))
@@ -63,11 +64,11 @@ impl EventualTxData {
 		(us, tx)
 	}
 
-	pub fn get_and<F: Fn(&Vec<(Transaction, Sha256dHash)>) + 'static + Send>(&self, then: F) {
+	pub fn get_and<F: Fn(&Vec<(Transaction, Sha256dHash)>, &BlockHeader) + 'static + Send>(&self, then: F) {
 		let value = self.value.read().unwrap();
 		match &(*value) {
 			&Some(ref value) => {
-				then(value);
+				then(&value.0, &value.1);
 				return;
 			},
 			&None => {
