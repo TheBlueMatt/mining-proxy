@@ -296,6 +296,11 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 
+				if !payout_info.appended_outputs.is_empty() {
+					println!("We don't yet support sending ADDITIONAL_COINBASE_LENGTH messages, and pool provided a multi-output payout info! Dropping pool");
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+
 				if us.cur_payout_info.is_none() || us.cur_payout_info.as_ref().unwrap().timestamp < payout_info.timestamp {
 					println!("Received new payout info!");
 					if us.cur_difficulty.is_some() {

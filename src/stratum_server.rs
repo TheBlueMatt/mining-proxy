@@ -23,7 +23,7 @@ use tokio_io::codec;
 
 use serde_json;
 
-use std::{char, cmp, fmt, io};
+use std::{char, cmp, fmt, io, mem};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex, RwLock};
@@ -224,8 +224,9 @@ impl StratumServer {
 		let mut last_diff = [0; 32];
 		tokio::spawn(job_providers.for_each(move |job| {
 			{
+				let new_job = job.clone();
 				let mut jobs = us_cp.jobs.write().unwrap();
-				jobs.insert(job.template.template_timestamp, job.clone());
+				jobs.insert(job.template.template_timestamp, new_job);
 			}
 
 			let prev_changed = last_prevblock != job.template.header_prevblock;
@@ -260,21 +261,33 @@ impl StratumServer {
 			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
 			let last_job = {
-				let mut jobs = us_timer.jobs.write().unwrap();
-				while jobs.len() > 1 {
-					// There should be a much easier way to implement this...
-					let first_timestamp = match jobs.iter().next() {
-						Some((k, _)) => *k,
-						None => break,
-					};
-					if first_timestamp < timestamp {
-						jobs.remove(&first_timestamp);
-					} else { break; }
-				}
-				match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
+				let jobs = us_timer.jobs.read().unwrap();
+				let last_job = match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 					Some((_, v)) => Some(v.clone()),
 					None => None,
+				};
+
+				if { // Avoid write lock unless we need it
+					let res = if let Some((k, _)) = jobs.iter().next() {
+						*k < timestamp
+					} else { false };
+					mem::drop(jobs);
+					res
+				} {
+					let mut jobs = us_timer.jobs.write().unwrap();
+					loop {
+						// There should be a much easier way to implement this...
+						let first_timestamp = match jobs.iter().next() {
+							Some((k, _)) => *k,
+							None => break,
+						};
+						if first_timestamp < timestamp {
+							jobs.remove(&first_timestamp);
+						} else { break; }
+					}
 				}
+
+				last_job
 			};
 
 			match last_job {

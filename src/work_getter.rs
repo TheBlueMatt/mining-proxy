@@ -28,12 +28,16 @@ pub struct WorkInfo {
 }
 
 pub struct WorkGetter {
-	payout_script: Script,
+	payout_script: Option<Script>,
 	cur_work: Option<WorkProviderJob>,
 	cur_pool: Option<PoolProviderJob>,
 }
 
-fn merge_job_pool(our_payout_script: &Script, work: &WorkProviderJob, pool: &Option<PoolProviderJob>) -> Option<WorkInfo> {
+/// Merges some work and some pool payout information to build a job to mine on.
+/// If both pool and our_payout_script are None we can't build a job.
+/// If pool or work are invalid, None will sometimes be returned, but invalid work may also be
+/// generated. Generally, pool and work are trusted to be well-formed and compatible.
+pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob, pool: &Option<PoolProviderJob>) -> Option<WorkInfo> {
 	let mut template = work.template.clone();
 
 	let mut outputs = Vec::with_capacity(template.appended_coinbase_outputs.len() + 1);
@@ -86,11 +90,15 @@ fn merge_job_pool(our_payout_script: &Script, work: &WorkProviderJob, pool: &Opt
 			template.coinbase_postfix.extend_from_slice(&payout_info.coinbase_postfix[..]);
 		},
 		&None => {
-			println!("No available pool info! Solo mining!");
-			outputs.push(TxOut {
-				value: template.coinbase_value_remaining,
-				script_pubkey: our_payout_script.clone(),
-			});
+			if let &Some(ref script) = our_payout_script {
+				println!("No available pool info! Solo mining!");
+				outputs.push(TxOut {
+					value: template.coinbase_value_remaining,
+					script_pubkey: script.clone(),
+				});
+			} else {
+				return None;
+			}
 		}
 	}
 
@@ -137,7 +145,7 @@ impl WorkGetter {
 	pub fn create(job_provider_hosts: Vec<String>, pool_server: Vec<PoolInfo>, solo_payout_script: Script) -> mpsc::UnboundedReceiver<WorkInfo> {
 		let (mut job_tx, job_rx) = mpsc::unbounded();
 		let cur_work_rc = Arc::new(Mutex::new(WorkGetter {
-			payout_script: solo_payout_script,
+			payout_script: Some(solo_payout_script),
 			cur_work: None,
 			cur_pool: None,
 		}));
