@@ -266,10 +266,12 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				println!("Received ProtocolVersion, using version {}", selected_version);
 
 				match us.stream.as_ref().unwrap().start_send(PoolMessage::GetPayoutInfo {
-					suggested_target: [0xff; 32],
-					minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
-					user_id: us.user_id.clone(),
-					user_auth: us.user_auth.clone(),
+					info: GetPayoutInfo {
+						suggested_target: [0xff; 32],
+						minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
+						user_id: us.user_id.clone(),
+						user_auth: us.user_auth.clone(),
+					},
 				}) {
 					Ok(_) => {},
 					Err(_) => {

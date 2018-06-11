@@ -365,9 +365,7 @@ fn main() {
 								println!("Got ProtocolVersion?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
-							PoolMessage::GetPayoutInfo { suggested_target, minimum_target, user_id, user_auth } => {
-								//TODO: Use suggested_target and minimum_target for stuff
-
+							PoolMessage::GetPayoutInfo { info } => {
 								let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 								let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
@@ -376,16 +374,16 @@ fn main() {
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 								if {
-									let connection_entry = connection_clients.entry(user_id.clone());
+									let connection_entry = connection_clients.entry(info.user_id.clone());
 									if let hash_map::Entry::Occupied(_) = connection_entry {
 										println!("Got a GetPayoutInfo for an already-registered client, disconencting proxy!");
 										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 									}
-									if check_user_auth(&user_id, &user_auth) {
+									if check_user_auth(&info.user_id, &info.user_auth) {
 										let client_id = max_client_id;
 										max_client_id += 1;
 
-										println!("Got new user with id {} for client id {}", utils::bytes_to_hex(&user_id), client_id);
+										println!("Got new user with id {} for client id {}", utils::bytes_to_hex(&info.user_id), client_id);
 
 										let mut client_coinbase_postfix = server_id_vec.clone();
 										client_coinbase_postfix.extend_from_slice(&utils::le64_to_array(client_id));
@@ -393,17 +391,17 @@ fn main() {
 										let user = Arc::new(PerUserClientRef {
 											send_stream: send_sink.clone(),
 											client_id,
-											user_id: user_id.clone(),
-											min_target: utils::count_leading_zeros(&minimum_target) + 1,
-											cur_target: AtomicUsize::new(cmp::min(MAX_TARGET_LEADING_0S, cmp::max(MIN_TARGET_LEADING_0S, utils::count_leading_zeros(&suggested_target) + 1)) as usize),
+											user_id: info.user_id.clone(),
+											min_target: utils::count_leading_zeros(&info.minimum_target) + 1,
+											cur_target: AtomicUsize::new(cmp::min(MAX_TARGET_LEADING_0S, cmp::max(MIN_TARGET_LEADING_0S, utils::count_leading_zeros(&info.suggested_target) + 1)) as usize),
 											accepted_shares: AtomicUsize::new(0),
 										});
-										client_ids.insert(client_id, user_id.clone());
+										client_ids.insert(client_id, info.user_id.clone());
 										connection_entry.or_insert(user.clone());
 										users_ref.lock().unwrap().push(Arc::downgrade(&user));
 
 										let payout_info = PoolPayoutInfo {
-											user_id: user_id.clone(),
+											user_id: info.user_id.clone(),
 											timestamp,
 											coinbase_postfix: client_coinbase_postfix.clone(),
 											remaining_payout: payout_addr_clone.clone(),
@@ -416,7 +414,7 @@ fn main() {
 
 										send_response!(PoolMessage::ShareDifficulty {
 											difficulty: PoolDifficulty {
-												user_id: user_id.clone(),
+												user_id: info.user_id.clone(),
 												timestamp,
 												share_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8),
 												weak_block_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8 + WEAK_BLOCK_RATIO_0S),
@@ -428,7 +426,7 @@ fn main() {
 									if connection_clients.is_empty() {
 										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 									} else {
-										send_response!(PoolMessage::RejectUserAuth { user_id });
+										send_response!(PoolMessage::RejectUserAuth { user_id: info.user_id });
 										return future::result(Ok(()));
 									}
 								}

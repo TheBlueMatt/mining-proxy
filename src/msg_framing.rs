@@ -782,6 +782,13 @@ impl codec::Decoder for WorkMsgFramer {
 	}
 }
 
+pub struct GetPayoutInfo {
+	pub suggested_target: [u8; 32],
+	pub minimum_target: [u8; 32],
+	pub user_id: Vec<u8>,
+	pub user_auth: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct PoolPayoutInfo {
 	pub user_id: Vec<u8>,
@@ -923,10 +930,7 @@ pub enum PoolMessage {
 		auth_key: PublicKey,
 	},
 	GetPayoutInfo {
-		suggested_target: [u8; 32],
-		minimum_target: [u8; 32],
-		user_id: Vec<u8>,
-		user_auth: Vec<u8>,
+		info: GetPayoutInfo,
 	},
 	PayoutInfo {
 		signature: Signature,
@@ -1009,18 +1013,18 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_u16_le(flags);
 				res.put_slice(&auth_key.serialize());
 			},
-			PoolMessage::GetPayoutInfo { ref suggested_target, ref minimum_target, ref user_id, ref user_auth } => {
-				res.reserve(1 + 3 + 2*1 + 2*32 + user_id.len() + user_auth.len());
+			PoolMessage::GetPayoutInfo { ref info } => {
+				res.reserve(1 + 3 + 2*1 + 2*32 + info.user_id.len() + info.user_auth.len());
 				res.put_u8(13);
-				res.put_u16_le((2 + 2*32 + user_id.len() + user_auth.len()) as u16);
+				res.put_u16_le((2 + 2*32 + info.user_id.len() + info.user_auth.len()) as u16);
 				res.put_u8(0);
 
-				res.put_slice(suggested_target);
-				res.put_slice(minimum_target);
-				res.put_u8(user_id.len() as u8);
-				res.put_slice(&user_id);
-				res.put_u8(user_auth.len() as u8);
-				res.put_slice(&user_auth);
+				res.put_slice(&info.suggested_target);
+				res.put_slice(&info.minimum_target);
+				res.put_u8(info.user_id.len() as u8);
+				res.put_slice(&info.user_id);
+				res.put_u8(info.user_auth.len() as u8);
+				res.put_slice(&info.user_auth);
 			},
 			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
 				res.reserve(1 + 3 + 64);
@@ -1305,10 +1309,12 @@ impl codec::Decoder for PoolMsgFramer {
 
 				advance_bytes!();
 				Ok(Some(PoolMessage::GetPayoutInfo {
-					suggested_target,
-					minimum_target,
-					user_id,
-					user_auth,
+					info: GetPayoutInfo {
+						suggested_target,
+						minimum_target,
+						user_id,
+						user_auth,
+					},
 				}))
 			},
 			14 => {
