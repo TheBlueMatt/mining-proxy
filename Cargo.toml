@@ -5,7 +5,7 @@ authors = ["matt"]
 
 [[bin]]
 name = "mining-proxy"
-path = "src/main.rs"
+path = "src/single_user_proxy.rs"
 
 [[bin]]
 name = "sample-pool"

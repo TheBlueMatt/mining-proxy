@@ -43,7 +43,9 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 
 fn main() {
-	println!("USAGE: stratum-proxy (--job_provider=host:port)* (--pool_server=host:port)* --stratum_listen_bind=IP:port --mining_listen_bind=IP:port --mining_auth_key=base58privkey --payout_address=addr");
+	println!("USAGE: mining-proxy (--job_provider=host:port)* (--pool_server=host:port)* --stratum_listen_bind=IP:port --mining_listen_bind=IP:port --mining_auth_key=base58privkey --payout_address=addr");
+	println!("A stratum/work protocol proxy for a number of ASICs mining on a single user");
+	println!("account on a pool or for a solo miner.");
 	println!("--job_provider - bitcoind(s) running as mining server(s) to get work from");
 	println!("--pool_server - pool server(s) to get payout address from/submit shares to");
 	println!("--pool_user_id - user id (eg username) on pool");
