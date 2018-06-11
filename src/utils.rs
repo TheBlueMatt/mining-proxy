@@ -69,6 +69,7 @@ pub fn count_leading_zeros(target: &[u8]) -> u8 {
 	return 255;
 }
 
+pub const MILLION_DIFF_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0];
 #[inline]
 pub fn target_to_diff_lb(target: &[u8; 32]) -> f64 {
 	// We use a shitty approximation for a lower-bound on difficulty by simply calculating the
@@ -174,6 +175,11 @@ mod tests {
 				b = 0;
 			}
 		}
+	}
+
+	#[test]
+	fn test_1mill_target_lower_bound() {
+		assert!(utils::target_to_diff_lb(&utils::MILLION_DIFF_TARGET) >= 1000000.0);
 	}
 
 	#[test]

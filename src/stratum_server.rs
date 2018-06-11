@@ -236,6 +236,10 @@ struct StratumClient {
 	/// jobs.
 	mining: AtomicBool,
 	cur_coinbase_postfix: Mutex<Vec<u8>>,
+	/// NiceHash requires a difficulty of at least 1 million.
+	/// We rely on NiceHash only sending mining.authorize *after* mining.subscribe has been
+	/// handled (but essentially everything does this, so should be fine).
+	nicehash_quirks: AtomicBool,
 }
 impl StratumClient {
 	fn attempt_send(&self, item: String) -> bool {
@@ -257,6 +261,7 @@ impl StratumClient {
 struct StratumUser {
 	clients: Vec<Arc<StratumClient>>,
 	cur_job: Option<PoolProviderUserJob>,
+	nicehash_quirks: bool,
 }
 
 pub struct StratumServer {
@@ -514,6 +519,7 @@ impl StratumServer {
 				user_id: Mutex::new(None),
 				mining: AtomicBool::new(false),
 				cur_coinbase_postfix: Mutex::new(Vec::new()),
+				nicehash_quirks: AtomicBool::new(false),
 			});
 			println!("Got new client connection (id {})", client_list.1);
 			client_list.1 += 1;
@@ -572,6 +578,12 @@ impl StratumServer {
 
 			match msg["method"].as_str().unwrap() {
 				"mining.subscribe" => {
+					if msg["params"].is_array() {
+						let params = msg["params"].as_array().unwrap();
+						if params.len() > 0 && *params[0].as_str().unwrap() == *"NiceHash/1.0.0" {
+							client.nicehash_quirks.store(true, Ordering::Release);
+						}
+					}
 					let mut client_id_str = String::with_capacity(16);
 					push_le_32_hex(client.client_id as u32, &mut client_id_str);
 					push_le_32_hex((client.client_id >> 32) as u32, &mut client_id_str);
@@ -751,25 +763,63 @@ impl StratumServer {
 								*registered_id = Some(user_id.clone());
 							}
 
+							// Just always tell them auth worked, we'll disconnect them if it turns
+							// out it didn't
+							send_response!(serde_json::Value::Null, true);
 							let job_user_coinbase_postfix = {
+								let need_nicehash = client.nicehash_quirks.load(Ordering::Acquire);
 								let mut users = us.users.lock().unwrap();
 								match users.entry(user_id.clone()) {
 									hash_map::Entry::Occupied(mut e) => {
 										e.get_mut().clients.push(client.clone());
-										if let &Some(ref job) = &e.get().cur_job {
-											send_response!(serde_json::Value::Null, true);
-											send_message!(target_to_difficulty_string(&job.target));
-											Some(job.coinbase_postfix.clone())
+										let (need_nicehash_set, res) = if let &Some(ref job) = &e.get().cur_job {
+											if need_nicehash && !e.get().nicehash_quirks {
+												let mut sink = sink_mutex.lock().unwrap();
+												if match sink.start_send(PoolAuthAction::DropUser(user_id.clone())) {
+													Ok(sink) => sink.is_ready(),
+													Err(_) => false,
+												} {
+													let mut sink = (*sink).clone();
+													// The futures/tokio docs seem to indicate that if we clone() the
+													// Sender, our send will always succeed, and we just need to pool our
+													// newly-created Sender to make sure the message eventually makes it
+													// through. That said, the docs are kinda spotty, so this may not turn
+													// out to be the case. Hopefully this assert means we catch it in
+													// testing if it's a bug.
+													assert!(sink.start_send(PoolAuthAction::AuthUser(PoolUserAuth {
+														suggested_target: [0xff; 32], //TODO: Base on password
+														minimum_target: utils::MILLION_DIFF_TARGET.clone(),
+														user_id,
+														user_auth: Vec::new(),
+													})).unwrap().is_ready());
+													tokio::spawn(sink.flush().then(|_| { Ok(()) }));
+												} else {
+													// Our connection to the upstream pool is overloaded
+													// (or someone is DoS'ing us with auth requests)
+													return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError)));
+												}
+												(true, None)
+											} else {
+												send_message!(target_to_difficulty_string(&job.target));
+												(false, Some(job.coinbase_postfix.clone()))
+											}
 										} else {
-											None
+											(false, None)
+										};
+										if need_nicehash_set {
+											e.get_mut().cur_job = None;
+											e.get_mut().nicehash_quirks = true;
 										}
+										res
 									},
 									hash_map::Entry::Vacant(e) => {
+										let target = if need_nicehash { utils::MILLION_DIFF_TARGET.clone() }
+											else { [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0] };
 										let mut sink = sink_mutex.lock().unwrap();
 										if !{
 											match sink.start_send(PoolAuthAction::AuthUser(PoolUserAuth {
 												suggested_target: [0xff; 32], //TODO: Base on password
-												minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
+												minimum_target: target,
 												user_id,
 												user_auth: Vec::new(),
 											})) {
@@ -784,6 +834,7 @@ impl StratumServer {
 										e.insert(StratumUser {
 											clients: vec![client.clone()],
 											cur_job: None,
+											nicehash_quirks: need_nicehash,
 										});
 										None
 									}
