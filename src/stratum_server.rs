@@ -200,6 +200,9 @@ fn job_to_difficulty_string(template: &BlockTemplate) -> String {
 	}).to_string()
 }
 
+#[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
+const ERR: () = "You need at least 32 bit pointers (well, usize, but we'll assume they're the same) to use any of this stuff";
+
 struct StratumClient {
 	stream: mpsc::Sender<String>,
 	client_id: u64,

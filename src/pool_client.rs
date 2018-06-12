@@ -299,6 +299,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				}
 
 				if !payout_info.appended_outputs.is_empty() {
+					//TODO: We really should support this
 					println!("We don't yet support sending ADDITIONAL_COINBASE_LENGTH messages, and pool provided a multi-output payout info! Dropping pool");
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
