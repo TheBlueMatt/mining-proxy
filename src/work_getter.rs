@@ -60,7 +60,7 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 	let work_target = template.target.clone();
 
 	match pool {
-		&Some(PoolProviderJob { ref payout_info, ref difficulty, .. }) => {
+		&Some(PoolProviderJob { ref payout_info, ref user_payout_info, ref difficulty, .. }) => {
 			let mut constant_value_output = 0;
 			for output in payout_info.appended_outputs.iter() {
 				if output.value > 21000000*100000000 || output.value + constant_value_output > 21000000*100000000 {
@@ -87,7 +87,7 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 			template.target = utils::max_le(template.target, difficulty.weak_block_target);
 
 			if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
-			template.coinbase_postfix.extend_from_slice(&payout_info.coinbase_postfix[..]);
+			template.coinbase_postfix.extend_from_slice(&user_payout_info.coinbase_postfix[..]);
 		},
 		&None => {
 			if let &Some(ref script) = our_payout_script {

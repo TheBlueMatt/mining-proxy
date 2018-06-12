@@ -782,7 +782,7 @@ impl codec::Decoder for WorkMsgFramer {
 	}
 }
 
-pub struct GetPayoutInfo {
+pub struct PoolUserAuth {
 	pub suggested_target: [u8; 32],
 	pub minimum_target: [u8; 32],
 	pub user_id: Vec<u8>,
@@ -790,16 +790,14 @@ pub struct GetPayoutInfo {
 }
 
 #[derive(Clone)]
-pub struct PoolPayoutInfo {
+pub struct PoolUserPayoutInfo {
 	pub user_id: Vec<u8>,
 	pub timestamp: u64,
 	pub coinbase_postfix: Vec<u8>,
-	pub remaining_payout: Script,
-	pub appended_outputs: Vec<TxOut>,
 }
-impl PoolPayoutInfo {
+impl PoolUserPayoutInfo {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
-		res.reserve(12 + self.user_id.len() + self.coinbase_postfix.len() + self.remaining_payout.len());
+		res.reserve(self.get_unsigned_len());
 		res.put_u8(self.user_id.len() as u8);
 		res.put_slice(&self.user_id[..]);
 
@@ -807,7 +805,22 @@ impl PoolPayoutInfo {
 
 		res.put_u8(self.coinbase_postfix.len() as u8);
 		res.put_slice(&self.coinbase_postfix[..]);
+	}
+	pub fn get_unsigned_len(&self) -> usize {
+		10 + self.user_id.len() + self.coinbase_postfix.len()
+	}
+}
 
+#[derive(Clone)]
+pub struct PoolPayoutInfo {
+	pub timestamp: u64,
+	pub remaining_payout: Script,
+	pub appended_outputs: Vec<TxOut>,
+}
+impl PoolPayoutInfo {
+	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
+		res.reserve(self.get_unsigned_len());
+		res.put_u64_le(self.timestamp);
 		res.put_u8(self.remaining_payout.len() as u8);
 		res.put_slice(&self.remaining_payout[..]);
 
@@ -820,6 +833,9 @@ impl PoolPayoutInfo {
 			res.put_u8(txout.script_pubkey.len() as u8);
 			res.put_slice(&txout.script_pubkey[..]);
 		}
+	}
+	pub fn get_unsigned_len(&self) -> usize {
+		10 + self.remaining_payout.len()
 	}
 }
 
@@ -929,12 +945,16 @@ pub enum PoolMessage {
 		flags: u16,
 		auth_key: PublicKey,
 	},
-	GetPayoutInfo {
-		info: GetPayoutInfo,
-	},
 	PayoutInfo {
 		signature: Signature,
 		payout_info: PoolPayoutInfo,
+	},
+	UserAuth {
+		info: PoolUserAuth,
+	},
+	AcceptUserAuth {
+		signature: Signature,
+		info: PoolUserPayoutInfo,
 	},
 	RejectUserAuth {
 		user_id: Vec<u8>,
@@ -1013,9 +1033,17 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_u16_le(flags);
 				res.put_slice(&auth_key.serialize());
 			},
-			PoolMessage::GetPayoutInfo { ref info } => {
-				res.reserve(1 + 3 + 2*1 + 2*32 + info.user_id.len() + info.user_auth.len());
+			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
+				res.reserve(1 + 3 + 64 + payout_info.get_unsigned_len());
 				res.put_u8(13);
+				res.put_u16_le(64 + payout_info.get_unsigned_len() as u16);
+				res.put_u8(0);
+				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
+				payout_info.encode_unsigned(res);
+			},
+			PoolMessage::UserAuth { ref info } => {
+				res.reserve(1 + 3 + 2*1 + 2*32 + info.user_id.len() + info.user_auth.len());
+				res.put_u8(14);
 				res.put_u16_le((2 + 2*32 + info.user_id.len() + info.user_auth.len()) as u16);
 				res.put_u8(0);
 
@@ -1026,30 +1054,16 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_u8(info.user_auth.len() as u8);
 				res.put_slice(&info.user_auth);
 			},
-			PoolMessage::PayoutInfo { ref signature, ref payout_info } => {
-				res.reserve(1 + 3 + 64);
-				res.put_u8(14);
-
-				let len_pos = res.len();
+			PoolMessage::AcceptUserAuth { ref signature, ref info } => {
+				res.reserve(1 + 3 + 64 + info.get_unsigned_len());
+				res.put_u8(15);
+				res.put_u16_le(64 + info.get_unsigned_len() as u16);
 				res.put_u8(0);
-				res.put_u16_le(0);
 
 				res.put_slice(&signature.serialize_compact(&self.secp_ctx));
-				payout_info.encode_unsigned(res);
-
-				if !le24_into_slice(res.len() - len_pos - 3, &mut res[len_pos..len_pos + 3]) {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
-				}
+				info.encode_unsigned(res);
 			},
 			PoolMessage::RejectUserAuth { ref user_id } => {
-				res.reserve(1 + 3 + 1 + user_id.len());
-				res.put_u8(15);
-				res.put_u16_le(1 + user_id.len() as u16);
-				res.put_u8(0);
-				res.put_u8(user_id.len() as u8);
-				res.put_slice(user_id);
-			},
-			PoolMessage::DropUser { ref user_id } => {
 				res.reserve(1 + 3 + 1 + user_id.len());
 				res.put_u8(16);
 				res.put_u16_le(1 + user_id.len() as u16);
@@ -1057,9 +1071,17 @@ impl codec::Encoder for PoolMsgFramer {
 				res.put_u8(user_id.len() as u8);
 				res.put_slice(user_id);
 			},
+			PoolMessage::DropUser { ref user_id } => {
+				res.reserve(1 + 3 + 1 + user_id.len());
+				res.put_u8(17);
+				res.put_u16_le(1 + user_id.len() as u16);
+				res.put_u8(0);
+				res.put_u8(user_id.len() as u8);
+				res.put_slice(user_id);
+			},
 			PoolMessage::ShareDifficulty { ref difficulty } => {
 				res.reserve(1 + 3 + 1 + difficulty.user_id.len() + 8 + 32*2);
-				res.put_u8(17);
+				res.put_u8(18);
 				res.put_u16_le(1 + difficulty.user_id.len() as u16 + 8 + 32*2);
 				res.put_u8(0);
 				res.put_u8(difficulty.user_id.len() as u8);
@@ -1072,7 +1094,7 @@ impl codec::Encoder for PoolMsgFramer {
 				let tx_enc = network::serialize::serialize(&share.coinbase_tx).unwrap();
 				let header_len = if share.previous_header.is_some() { 80 } else { 0 };
 				res.reserve(1 + 3 + 4*4 + 32 + 1 + share.merkle_rhss.len()*32 + 4 + tx_enc.len() + 1 + share.user_tag_1.len() + 1 + share.user_tag_2.len() + header_len);
-				res.put_u8(18);
+				res.put_u8(19);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -1105,7 +1127,7 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::WeakBlock { ref sketch } => {
 				res.reserve(1 + 3);
-				res.put_u8(19);
+				res.put_u8(20);
 
 				let len_pos = res.len();
 				res.put_u8(0);
@@ -1119,13 +1141,13 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::WeakBlockStateReset { } => {
 				res.reserve(1 + 3);
-				res.put_u8(20);
+				res.put_u8(21);
 				res.put_u8(0);
 				res.put_u16_le(0);
 			},
 			PoolMessage::ShareAccepted { ref user_tag_1, ref user_tag_2 } => {
 				res.reserve(1 + 3 + 1 + user_tag_1.len() + 1 + user_tag_2.len());
-				res.put_u8(21);
+				res.put_u8(22);
 				res.put_u16_le((2 + user_tag_1.len() + user_tag_2.len()) as u16);
 				res.put_u8(0);
 				res.put_u8(user_tag_1.len() as u8);
@@ -1135,7 +1157,7 @@ impl codec::Encoder for PoolMsgFramer {
 			},
 			PoolMessage::ShareRejected { ref reason, ref user_tag_1, ref user_tag_2 } => {
 				res.reserve(1 + 3 + 1 + 1 + user_tag_1.len() + 1 + user_tag_2.len());
-				res.put_u8(22);
+				res.put_u8(23);
 				res.put_u16_le((3 + user_tag_1.len() + user_tag_2.len()) as u16);
 				res.put_u8(0);
 				match *reason {
@@ -1208,16 +1230,17 @@ impl codec::Decoder for PoolMsgFramer {
 		if match bytes[0] {
 			1 => len != 6,
 			2 => len != 37,
-			13 => len > 576,
-			14 => len > 65886,
-			15 => len > 256,
+			13 => len > 65579,
+			14 => len > 576,
+			15 => len > 379,
 			16 => len > 256,
-			17 => len > 328,
-			18 => len > 1000500,
-			19 => len > 4000500,
-			20 => len != 0,
-			21 => len > 512,
-			22 => len > 513,
+			17 => len > 256,
+			18 => len > 328,
+			19 => len > 1000500,
+			20 => len > 4000500,
+			21 => len != 0,
+			22 => len > 512,
+			23 => len > 513,
 			11 => len > 320,
 			12 => false,
 			_ => true,
@@ -1297,39 +1320,11 @@ impl codec::Decoder for PoolMsgFramer {
 				Ok(Some(msg))
 			},
 			13 => {
-				let mut suggested_target = [0; 32];
-				suggested_target.copy_from_slice(get_slice!(32));
-				let mut minimum_target = [0; 32];
-				minimum_target.copy_from_slice(get_slice!(32));
-
-				let user_id_len = get_slice!(1)[0];
-				let user_id = get_slice!(user_id_len).to_vec();
-				let user_auth_len = get_slice!(1)[0];
-				let user_auth = get_slice!(user_auth_len).to_vec();
-
-				advance_bytes!();
-				Ok(Some(PoolMessage::GetPayoutInfo {
-					info: GetPayoutInfo {
-						suggested_target,
-						minimum_target,
-						user_id,
-						user_auth,
-					},
-				}))
-			},
-			14 => {
 				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
 					Ok(sig) => sig,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
-				let user_id_len = get_slice!(1)[0];
-				let user_id = get_slice!(user_id_len).to_vec();
-
 				let timestamp = utils::slice_to_le64(get_slice!(8));
-
-				let coinbase_postfix_len = get_slice!(1)[0];
-				let coinbase_postfix = get_slice!(coinbase_postfix_len).to_vec();
-
 				let script_len = get_slice!(1)[0];
 				let script = Script::from(get_slice!(script_len).to_vec());
 
@@ -1353,9 +1348,7 @@ impl codec::Decoder for PoolMsgFramer {
 				let msg = PoolMessage::PayoutInfo {
 					signature: signature,
 					payout_info: PoolPayoutInfo {
-						user_id,
 						timestamp,
-						coinbase_postfix,
 						remaining_payout: script,
 						appended_outputs: appended_coinbase_outputs,
 					}
@@ -1363,19 +1356,64 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			15 => {
+			14 => {
+				let mut suggested_target = [0; 32];
+				suggested_target.copy_from_slice(get_slice!(32));
+				let mut minimum_target = [0; 32];
+				minimum_target.copy_from_slice(get_slice!(32));
+
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
+				let user_auth_len = get_slice!(1)[0];
+				let user_auth = get_slice!(user_auth_len).to_vec();
+
 				advance_bytes!();
-				Ok(Some(PoolMessage::RejectUserAuth { user_id }))
+				Ok(Some(PoolMessage::UserAuth {
+					info: PoolUserAuth {
+						suggested_target,
+						minimum_target,
+						user_id,
+						user_auth,
+					},
+				}))
+			},
+			15 => {
+				let signature = match Signature::from_compact(&self.secp_ctx, get_slice!(64)) {
+					Ok(sig) => sig,
+					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
+				};
+				let user_id_len = get_slice!(1)[0];
+				let user_id = get_slice!(user_id_len).to_vec();
+
+				let timestamp = utils::slice_to_le64(get_slice!(8));
+
+				let coinbase_postfix_len = get_slice!(1)[0];
+				let coinbase_postfix = get_slice!(coinbase_postfix_len).to_vec();
+
+				let msg = PoolMessage::AcceptUserAuth {
+					signature: signature,
+					info: PoolUserPayoutInfo {
+						user_id,
+						timestamp,
+						coinbase_postfix,
+					}
+				};
+				advance_bytes!();
+				Ok(Some(msg))
 			},
 			16 => {
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
 				advance_bytes!();
-				Ok(Some(PoolMessage::DropUser { user_id }))
+				Ok(Some(PoolMessage::RejectUserAuth { user_id }))
 			},
 			17 => {
+				let user_id_len = get_slice!(1)[0];
+				let user_id = get_slice!(user_id_len).to_vec();
+				advance_bytes!();
+				Ok(Some(PoolMessage::DropUser { user_id }))
+			},
+			18 => {
 				let user_id_len = get_slice!(1)[0];
 				let user_id = get_slice!(user_id_len).to_vec();
 				let timestamp = utils::slice_to_le64(get_slice!(8));
@@ -1396,7 +1434,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			18 => {
+			19 => {
 				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
@@ -1449,7 +1487,7 @@ impl codec::Decoder for PoolMsgFramer {
 				advance_bytes!();
 				Ok(Some(msg))
 			},
-			19 => {
+			20 => {
 				let header_version = utils::slice_to_le32(get_slice!(4));
 				let mut header_prevblock = [0; 32];
 				header_prevblock.copy_from_slice(get_slice!(32));
@@ -1492,11 +1530,11 @@ impl codec::Decoder for PoolMsgFramer {
 					}
 				}))
 			},
-			20 => {
+			21 => {
 				advance_bytes!();
 				Ok(Some(PoolMessage::WeakBlockStateReset {}))
 			},
-			21 => {
+			22 => {
 				let user_tag_1_len = get_slice!(1)[0];
 				let user_tag_1 = get_slice!(user_tag_1_len).to_vec();
 				let user_tag_2_len = get_slice!(1)[0];
@@ -1508,7 +1546,7 @@ impl codec::Decoder for PoolMsgFramer {
 					user_tag_2,
 				}))
 			},
-			22 => {
+			23 => {
 				let reason_value = get_slice!(1)[0];
 				let reason = match reason_value {
 					1 => ShareRejectedReason::StalePrevBlock,

@@ -365,18 +365,18 @@ fn main() {
 								println!("Got ProtocolVersion?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
-							PoolMessage::GetPayoutInfo { info } => {
+							PoolMessage::UserAuth { info } => {
 								let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 								let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 
 								if client_version.is_none() {
-									println!("Client sent GetPayoutInfo before ProtocolSupport");
+									println!("Client sent UserAuth before ProtocolSupport");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 								if {
 									let connection_entry = connection_clients.entry(info.user_id.clone());
 									if let hash_map::Entry::Occupied(_) = connection_entry {
-										println!("Got a GetPayoutInfo for an already-registered client, disconencting proxy!");
+										println!("Got a UserAuth for an already-registered client, disconencting proxy!");
 										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 									}
 									if check_user_auth(&info.user_id, &info.user_auth) {
@@ -401,15 +401,23 @@ fn main() {
 										users_ref.lock().unwrap().push(Arc::downgrade(&user));
 
 										let payout_info = PoolPayoutInfo {
-											user_id: info.user_id.clone(),
 											timestamp,
-											coinbase_postfix: client_coinbase_postfix.clone(),
 											remaining_payout: payout_addr_clone.clone(),
 											appended_outputs: vec![],
 										};
 										send_response!(PoolMessage::PayoutInfo {
-											signature: sign_message!(payout_info, 14),
+											signature: sign_message!(payout_info, 13),
 											payout_info,
+										});
+
+										let user_payout_info = PoolUserPayoutInfo {
+											user_id: info.user_id.clone(),
+											timestamp,
+											coinbase_postfix: client_coinbase_postfix.clone(),
+										};
+										send_response!(PoolMessage::AcceptUserAuth {
+											signature: sign_message!(user_payout_info, 15),
+											info: user_payout_info,
 										});
 
 										send_response!(PoolMessage::ShareDifficulty {
@@ -433,6 +441,10 @@ fn main() {
 							},
 							PoolMessage::PayoutInfo { .. } => {
 								println!("Got PayoutInfo?");
+								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+							},
+							PoolMessage::AcceptUserAuth { .. } => {
+								println!("Got AcceptUserAuth?");
 								return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 							},
 							PoolMessage::RejectUserAuth { .. } => {

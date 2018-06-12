@@ -32,6 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone)]
 pub struct PoolProviderJob {
 	pub payout_info: PoolPayoutInfo,
+	pub user_payout_info: PoolUserPayoutInfo,
 	pub difficulty: PoolDifficulty,
 	pub provider: Arc<PoolHandler>,
 }
@@ -49,6 +50,7 @@ struct PoolHandlerState {
 	user_auth: Vec<u8>,
 
 	cur_payout_info: Option<PoolPayoutInfo>,
+	cur_user_payout_info: Option<PoolUserPayoutInfo>,
 	cur_difficulty: Option<PoolDifficulty>,
 
 	last_header_sent: [u8; 32],
@@ -75,6 +77,7 @@ impl PoolHandler {
 				user_auth,
 
 				cur_payout_info: None,
+				cur_user_payout_info: None,
 				cur_difficulty: None,
 
 				last_header_sent: [0; 32],
@@ -243,6 +246,18 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				}
 			}
 		}
+
+		macro_rules! check_msg_timestamp {
+			($msg: expr, $msg_type_str: expr) => {
+				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+				if $msg.timestamp < timestamp - 1000*60*20 || $msg.timestamp > timestamp + 1000*60*1 {
+					println!("Got {} with unreasonable timestamp ({}, our time is {})", $msg_type_str, $msg.timestamp, timestamp);
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+			}
+		}
+
 		match msg {
 			PoolMessage::ProtocolSupport { .. } => {
 				println!("Received ProtocolSupport");
@@ -265,8 +280,8 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				}
 				println!("Received ProtocolVersion, using version {}", selected_version);
 
-				match us.stream.as_ref().unwrap().start_send(PoolMessage::GetPayoutInfo {
-					info: GetPayoutInfo {
+				match us.stream.as_ref().unwrap().start_send(PoolMessage::UserAuth {
+					info: PoolUserAuth {
 						suggested_target: [0xff; 32],
 						minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
 						user_id: us.user_id.clone(),
@@ -279,24 +294,9 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					}
 				}
 			},
-			PoolMessage::GetPayoutInfo { .. } => {
-				println!("Received GetPayoutInfo?");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
-			},
 			PoolMessage::PayoutInfo { signature, payout_info } => {
-				check_msg_sig!(14, payout_info, signature);
-
-				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
-				if payout_info.timestamp < timestamp - 1000*60*20 || payout_info.timestamp > timestamp + 1000*60*1 {
-					println!("Got payout_info with unreasonable timestamp ({}, our time is {})", payout_info.timestamp, timestamp);
-					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
-				}
-
-				if payout_info.coinbase_postfix.len() > 50 {
-					println!("Pool sent payout_info larger than 50 bytes");
-					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
-				}
+				check_msg_sig!(13, payout_info, signature);
+				check_msg_timestamp!(payout_info, "PayoutInfo");
 
 				if !payout_info.appended_outputs.is_empty() {
 					//TODO: We really should support this
@@ -305,12 +305,13 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				}
 
 				if us.cur_payout_info.is_none() || us.cur_payout_info.as_ref().unwrap().timestamp < payout_info.timestamp {
-					println!("Received new payout info!");
-					if us.cur_difficulty.is_some() {
+					if us.cur_difficulty.is_some() && us.cur_user_payout_info.is_some() {
 						let cur_difficulty = us.cur_difficulty.clone();
+						let cur_user_payout_info = us.cur_user_payout_info.clone();
 						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
 							pool: PoolProviderJob {
 								payout_info: payout_info.clone(),
+								user_payout_info: cur_user_payout_info.unwrap(),
 								difficulty: cur_difficulty.unwrap(),
 								provider: self.clone(),
 							}
@@ -322,7 +323,44 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 							}
 						}
 					}
+					println!("Received new payout info!");
 					us.cur_payout_info = Some(payout_info);
+				}
+			},
+			PoolMessage::UserAuth { .. } => {
+				println!("Received UserAuth?");
+				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+			},
+			PoolMessage::AcceptUserAuth { signature, info } => {
+				check_msg_sig!(15, info, signature);
+				check_msg_timestamp!(info, "AcceptUserAuth");
+
+				if info.coinbase_postfix.len() > 50 {
+					println!("Pool sent accept_user_auth coinbase_postfix larger than 50 bytes");
+					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				}
+
+				if us.cur_user_payout_info.is_none() || us.cur_user_payout_info.as_ref().unwrap().timestamp < info.timestamp {
+					if us.cur_difficulty.is_some() && us.cur_payout_info.is_some() {
+						let cur_difficulty = us.cur_difficulty.clone();
+						let cur_payout_info = us.cur_payout_info.clone();
+						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
+							pool: PoolProviderJob {
+								payout_info: cur_payout_info.unwrap(),
+								user_payout_info: info.clone(),
+								difficulty: cur_difficulty.unwrap(),
+								provider: self.clone(),
+							}
+						}) {
+							Ok(_) => {},
+							Err(_) => {
+								println!("Pool updating user payout info too quickly");
+								return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+							}
+						}
+					}
+					println!("Received new user payout info!");
+					us.cur_user_payout_info = Some(info);
 				}
 			},
 			PoolMessage::RejectUserAuth { .. } => {
@@ -334,23 +372,17 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 			},
 			PoolMessage::ShareDifficulty { difficulty } => {
-				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-				let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
-				if difficulty.timestamp < timestamp - 1000*60*20 || difficulty.timestamp > timestamp + 1000*60*1 {
-					println!("Got ShareDifficulty with unreasonable timestamp ({}, our time is {})", difficulty.timestamp, timestamp);
-					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
-				}
+				check_msg_timestamp!(difficulty, "ShareDifficulty");
 
 				if us.cur_difficulty.is_none() || us.cur_difficulty.as_ref().unwrap().timestamp < difficulty.timestamp {
-					println!("Received new difficulty!");
-					us.cur_difficulty = Some(difficulty);
-					if us.cur_payout_info.is_some() {
-						let cur_difficulty = us.cur_difficulty.as_ref().unwrap().clone();
-						let payout_info = us.cur_payout_info.as_ref().unwrap().clone();
+					if us.cur_payout_info.is_some() && us.cur_user_payout_info.is_some() {
+						let cur_payout_info = us.cur_payout_info.clone();
+						let cur_user_payout_info = us.cur_user_payout_info.clone();
 						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
 							pool: PoolProviderJob {
-								payout_info,
-								difficulty: cur_difficulty,
+								payout_info: cur_payout_info.unwrap(),
+								user_payout_info: cur_user_payout_info.unwrap(),
+								difficulty: difficulty.clone(),
 								provider: self.clone(),
 							}
 						}) {
@@ -361,6 +393,8 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 							}
 						}
 					}
+					println!("Received new difficulty!");
+					us.cur_difficulty = Some(difficulty);
 				}
 			},
 			PoolMessage::Share { .. } => {
