@@ -25,6 +25,7 @@ use secp256k1::Secp256k1;
 
 use std;
 use std::collections::HashMap;
+use std::collections::hash_map;
 use std::{cmp, io};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +33,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone)]
 pub struct PoolProviderJob {
 	pub payout_info: PoolPayoutInfo,
+	pub provider: Arc<PoolHandler>,
+}
+
+#[derive(Clone)]
+pub struct PoolProviderUser {
 	pub user_payout_info: PoolUserPayoutInfo,
 	pub difficulty: PoolDifficulty,
 	pub provider: Arc<PoolHandler>,
@@ -39,24 +45,51 @@ pub struct PoolProviderJob {
 
 pub enum PoolProviderAction {
 	ProviderDisconnected,
-	PoolUpdate { pool: PoolProviderJob },
+	PoolUpdate { info: PoolProviderJob },
+	UserUpdate { update: PoolProviderUser },
 }
 
 struct PoolHandlerState {
 	stream: Option<mpsc::UnboundedSender<PoolMessage>>,
 	auth_key: Option<PublicKey>,
 
-	user_id: Vec<u8>,
-	user_auth: Vec<u8>,
+	users_to_reauth: Vec<PoolUserAuth>,
+
+	coinbase_postfix_to_difficulty: HashMap<Vec<u8>, PoolDifficulty>,
+	coinbase_postfix_len: Option<u8>,
+	/// user_id -> (payout_info.timestamp, payout_info.coinbase_postfix)
+	/// Note that we keep a dummy entry with a 0 timestamp if we've started auth but haven't heard
+	/// back yet.
+	user_id_to_postfix: HashMap<Vec<u8>, (u64, Vec<u8>)>,
 
 	cur_payout_info: Option<PoolPayoutInfo>,
-	cur_user_payout_info: Option<PoolUserPayoutInfo>,
-	cur_difficulty: Option<PoolDifficulty>,
 
 	last_header_sent: [u8; 32],
 	last_weak_block: Option<Vec<Vec<u8>>>,
 
 	job_stream: mpsc::Sender<PoolProviderAction>,
+}
+struct PoolHandlerStateRefs<'a> {
+	stream: &'a mut Option<mpsc::UnboundedSender<PoolMessage>>,
+	coinbase_postfix_to_difficulty: &'a mut HashMap<Vec<u8>, PoolDifficulty>,
+	coinbase_postfix_len: &'a mut Option<u8>,
+	user_id_to_postfix: &'a mut HashMap<Vec<u8>, (u64, Vec<u8>)>,
+	last_header_sent: &'a mut [u8; 32],
+	last_weak_block: &'a mut Option<Vec<Vec<u8>>>,
+	job_stream: &'a mut mpsc::Sender<PoolProviderAction>,
+}
+impl PoolHandlerState {
+	fn borrow_mut(&mut self) -> PoolHandlerStateRefs {
+		PoolHandlerStateRefs {
+			stream: &mut self.stream,
+			coinbase_postfix_to_difficulty: &mut self.coinbase_postfix_to_difficulty,
+			coinbase_postfix_len: &mut self.coinbase_postfix_len,
+			user_id_to_postfix: &mut self.user_id_to_postfix,
+			last_header_sent: &mut self.last_header_sent,
+			last_weak_block: &mut self.last_weak_block,
+			job_stream: &mut self.job_stream,
+		}
+	}
 }
 
 pub struct PoolHandler {
@@ -66,19 +99,27 @@ pub struct PoolHandler {
 
 impl PoolHandler {
 	fn new(expected_auth_key: Option<PublicKey>, user_id: Vec<u8>, user_auth: Vec<u8>) -> (Arc<PoolHandler>, mpsc::Receiver<PoolProviderAction>) {
-		let (work_sender, work_receiver) = mpsc::channel(5);
+		let (work_sender, work_receiver) = mpsc::channel(25);
+
+		let mut user_id_to_postfix = HashMap::with_capacity(1);
+		user_id_to_postfix.insert(user_id.clone(), (0, Vec::new()));
 
 		(Arc::new(PoolHandler {
 			state: RwLock::new(PoolHandlerState {
 				stream: None,
 				auth_key: expected_auth_key,
 
-				user_id,
-				user_auth,
+				users_to_reauth: vec![PoolUserAuth {
+					suggested_target: [0xff; 32],
+					minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
+					user_id, user_auth
+				}],
+
+				coinbase_postfix_to_difficulty: HashMap::new(),
+				coinbase_postfix_len: None,
+				user_id_to_postfix,
 
 				cur_payout_info: None,
-				cur_user_payout_info: None,
-				cur_difficulty: None,
 
 				last_header_sent: [0; 32],
 				last_weak_block: None,
@@ -90,18 +131,22 @@ impl PoolHandler {
 	}
 
 	pub fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<Vec<u8>>, prev_header: &BlockHeader, extra_block_data: &Vec<u8>) {
-		let mut us = self.state.write().unwrap();
+		let mut us_lock = self.state.write().unwrap();
+		let us = us_lock.borrow_mut();
 
-		let previous_header = if us.last_header_sent == template.header_prevblock { None } else {
-			us.last_header_sent = template.header_prevblock.clone();
+		let previous_header = if *us.last_header_sent == template.header_prevblock { None } else {
+			*us.last_header_sent = template.header_prevblock.clone();
 			Some(prev_header.clone())
 		};
 
-		//TODO: This is really dumb, but we need NLL otherwise
-		let mut last_weak_block_stolen = us.last_weak_block.take();
+		if let Some(coinbase_postfix_match_len) = *us.coinbase_postfix_len {
+			let coinbase_postfix = if work.0.coinbase_tx.input.len() == 1 {
+				let coinbase = &work.0.coinbase_tx.input[0].script_sig;
+				if coinbase.len() < coinbase_postfix_match_len as usize { return; }
+				coinbase[coinbase.len() - coinbase_postfix_match_len as usize..].to_vec()
+			} else { return; };
 
-		match us.cur_difficulty {
-			Some(ref difficulty) => {
+			if let Some(ref difficulty) = us.coinbase_postfix_to_difficulty.get(&coinbase_postfix) {
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.share_target[..]) {
 					match us.stream {
 						Some(ref stream) => {
@@ -121,12 +166,16 @@ impl PoolHandler {
 							}) {
 								Ok(_) => { println!("Submitted share!"); },
 								//TODO: We should queue these for sending later
-								Err(_) => { println!("Failed to submit nonce as pool connection lost"); },
+								Err(_) => {
+									println!("Failed to submit nonce as pool connection lost");
+									return;
+								},
 							}
 						},
 						None => {
 							//TODO: We should queue these for sending later
 							println!("Failed to submit nonce as pool connection lost");
+							return;
 						}
 					}
 				}
@@ -136,7 +185,7 @@ impl PoolHandler {
 							let mut actions = Vec::with_capacity(post_coinbase_txn.len() + 1);
 							actions.push(WeakBlockAction::NewTx { tx: network::serialize::serialize(&work.0.coinbase_tx).unwrap() });
 
-							match last_weak_block_stolen {
+							match us.last_weak_block.take() {
 								Some(mut last_weak_block) => {
 									let mut old_txids_posn = HashMap::with_capacity(last_weak_block.len());
 									for (idx, tx) in last_weak_block.drain(..).enumerate() {
@@ -155,7 +204,7 @@ impl PoolHandler {
 									}
 								}
 							}
-							last_weak_block_stolen = Some(post_coinbase_txn.clone());
+							*us.last_weak_block = Some(post_coinbase_txn.clone());
 							match stream.unbounded_send(PoolMessage::WeakBlock {
 								sketch: WeakBlock {
 									header_version: work.0.header_version,
@@ -183,12 +232,12 @@ impl PoolHandler {
 						}
 					}
 				}
-			},
-			None => {
-				println!("Got share but failed to submit because pool has not yet provided difficulty information!");
+			} else {
+				println!("Got share but failed to submit because its not associated with a known user (or we don't have difficulty info for that user yet)!");
 			}
+		} else {
+			println!("Got share but failed to submit because pool has not yet provided user payout information!");
 		}
-		us.last_weak_block = last_weak_block_stolen;
 	}
 }
 
@@ -212,6 +261,8 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 		}
 
 		us.last_weak_block = None;
+		us.coinbase_postfix_len = None;
+		us.cur_payout_info = None;
 		(PoolMsgFramer::new(), rx)
 	}
 
@@ -283,17 +334,12 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				}
 				println!("Received ProtocolVersion, using version {}", selected_version);
 
-				match us.stream.as_ref().unwrap().start_send(PoolMessage::UserAuth {
-					info: PoolUserAuth {
-						suggested_target: [0xff; 32],
-						minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
-						user_id: us.user_id.clone(),
-						user_auth: us.user_auth.clone(),
-					},
-				}) {
-					Ok(_) => {},
-					Err(_) => {
-						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+				for user_auth in us.users_to_reauth.iter() {
+					match us.stream.as_ref().unwrap().start_send(PoolMessage::UserAuth { info: user_auth.clone() }) {
+						Ok(_) => {},
+						Err(_) => {
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+						}
 					}
 				}
 			},
@@ -308,22 +354,16 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				}
 
 				if us.cur_payout_info.is_none() || us.cur_payout_info.as_ref().unwrap().timestamp < payout_info.timestamp {
-					if us.cur_difficulty.is_some() && us.cur_user_payout_info.is_some() {
-						let cur_difficulty = us.cur_difficulty.clone();
-						let cur_user_payout_info = us.cur_user_payout_info.clone();
-						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
-							pool: PoolProviderJob {
-								payout_info: payout_info.clone(),
-								user_payout_info: cur_user_payout_info.unwrap(),
-								difficulty: cur_difficulty.unwrap(),
-								provider: self.clone(),
-							}
-						}) {
-							Ok(_) => {},
-							Err(_) => {
-								println!("Pool updating payout info too quickly");
-								return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
-							}
+					match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
+						info: PoolProviderJob {
+							payout_info: payout_info.clone(),
+							provider: self.clone(),
+						}
+					}) {
+						Ok(_) => {},
+						Err(_) => {
+							println!("Pool updating payout info too quickly");
+							return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 						}
 					}
 					println!("Received new payout info!");
@@ -338,32 +378,54 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				check_msg_sig!(15, info, signature);
 				check_msg_timestamp!(info, "AcceptUserAuth");
 
-				if info.coinbase_postfix.len() > 50 {
-					println!("Pool sent accept_user_auth coinbase_postfix larger than 50 bytes");
+				if info.coinbase_postfix.len() > 42 {
+					println!("Pool sent accept_user_auth coinbase_postfix larger than 42 bytes");
 					return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 				}
 
-				if us.cur_user_payout_info.is_none() || us.cur_user_payout_info.as_ref().unwrap().timestamp < info.timestamp {
-					if us.cur_difficulty.is_some() && us.cur_payout_info.is_some() {
-						let cur_difficulty = us.cur_difficulty.clone();
-						let cur_payout_info = us.cur_payout_info.clone();
-						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
-							pool: PoolProviderJob {
-								payout_info: cur_payout_info.unwrap(),
-								user_payout_info: info.clone(),
-								difficulty: cur_difficulty.unwrap(),
-								provider: self.clone(),
+				if let Some(postfix_len) = us.coinbase_postfix_len {
+					if info.coinbase_postfix.len() != postfix_len as usize {
+						println!("Pool sent accept_user_auth coinbase_postfix length not equal to previous accept_user_auths");
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+					}
+				} else {
+					us.coinbase_postfix_len = Some(info.coinbase_postfix.len() as u8);
+				}
+
+				let refs = us.borrow_mut();
+				match refs.user_id_to_postfix.get_mut(&info.user_id) {
+					Some(&mut (ref mut last_timestamp, ref mut last_postfix)) => {
+						if *last_timestamp < info.timestamp {
+							let cur_difficulty = if *last_timestamp != 0 {
+								refs.coinbase_postfix_to_difficulty.remove(last_postfix)
+							} else { None };
+							if cur_difficulty.is_some() {
+								match refs.job_stream.start_send(PoolProviderAction::UserUpdate {
+									update: PoolProviderUser {
+										user_payout_info: info.clone(),
+										difficulty: cur_difficulty.clone().unwrap(),
+										provider: self.clone(),
+									}
+								}) {
+									Ok(_) => {},
+									Err(_) => {
+										println!("Pool updating user payout info too quickly");
+										return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+									}
+								}
 							}
-						}) {
-							Ok(_) => {},
-							Err(_) => {
-								println!("Pool updating user payout info too quickly");
-								return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+							println!("Received new user payout info!");
+							*last_timestamp = info.timestamp;
+							*last_postfix = info.coinbase_postfix.clone();
+							if cur_difficulty.is_some() {
+								refs.coinbase_postfix_to_difficulty.insert(info.coinbase_postfix, cur_difficulty.unwrap());
 							}
 						}
+					},
+					None => {
+						println!("Got AcceptUserAuth for un-auth'ed user?");
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 					}
-					println!("Received new user payout info!");
-					us.cur_user_payout_info = Some(info);
 				}
 			},
 			PoolMessage::RejectUserAuth { .. } => {
@@ -377,27 +439,49 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 			PoolMessage::ShareDifficulty { difficulty } => {
 				check_msg_timestamp!(difficulty, "ShareDifficulty");
 
-				if us.cur_difficulty.is_none() || us.cur_difficulty.as_ref().unwrap().timestamp < difficulty.timestamp {
-					if us.cur_payout_info.is_some() && us.cur_user_payout_info.is_some() {
-						let cur_payout_info = us.cur_payout_info.clone();
-						let cur_user_payout_info = us.cur_user_payout_info.clone();
-						match us.job_stream.start_send(PoolProviderAction::PoolUpdate {
-							pool: PoolProviderJob {
-								payout_info: cur_payout_info.unwrap(),
-								user_payout_info: cur_user_payout_info.unwrap(),
-								difficulty: difficulty.clone(),
-								provider: self.clone(),
+				let refs = us.borrow_mut();
+				match refs.user_id_to_postfix.get(&difficulty.user_id) {
+					Some(&(ref last_timestamp, ref last_postfix)) => {
+						if *last_timestamp != 0 {
+							let entry = refs.coinbase_postfix_to_difficulty.entry(last_postfix.clone());
+							match entry {
+								hash_map::Entry::Occupied(ref e) => {
+									if e.get().timestamp >= difficulty.timestamp { return Ok(()); }
+								},
+								hash_map::Entry::Vacant(_) => {},
 							}
-						}) {
-							Ok(_) => {},
-							Err(_) => {
-								println!("Pool updating difficulty too quickly");
-								return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+							match refs.job_stream.start_send(PoolProviderAction::UserUpdate {
+								update: PoolProviderUser {
+									user_payout_info: PoolUserPayoutInfo {
+										user_id: difficulty.user_id.clone(),
+										timestamp: *last_timestamp,
+										coinbase_postfix: last_postfix.clone(),
+									},
+									difficulty: difficulty.clone(),
+									provider: self.clone(),
+								}
+							}) {
+								Ok(_) => {},
+								Err(_) => {
+									println!("Pool updating user difficulty info too quickly");
+									return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+								}
+							}
+							println!("Received new user difficulty!");
+							match entry {
+								hash_map::Entry::Occupied(mut e) => {
+									*e.get_mut() = difficulty;
+								},
+								hash_map::Entry::Vacant(e) => {
+									e.insert(difficulty);
+								},
 							}
 						}
+					},
+					None => {
+						println!("Got ShareDifficulty for un-auth'ed user?");
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
 					}
-					println!("Received new difficulty!");
-					us.cur_difficulty = Some(difficulty);
 				}
 			},
 			PoolMessage::Share { .. } => {
@@ -435,12 +519,13 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 struct PoolProviderHolder {
 	is_connected: bool,
 	last_job: Option<PoolProviderJob>,
+	last_user_job: Option<PoolProviderUser>,
 }
 
 pub struct MultiPoolProvider {
 	cur_pool: usize,
 	pools: Vec<PoolProviderHolder>,
-	job_tx: mpsc::UnboundedSender<PoolProviderJob>,
+	job_tx: mpsc::UnboundedSender<PoolProviderUserWork>,
 }
 
 pub struct PoolInfo {
@@ -449,8 +534,15 @@ pub struct PoolInfo {
 	pub user_auth: Vec<u8>,
 }
 
+pub struct PoolProviderUserWork {
+	pub payout_info: PoolPayoutInfo,
+	pub user_payout_info: PoolUserPayoutInfo,
+	pub difficulty: PoolDifficulty,
+	pub provider: Arc<PoolHandler>,
+}
+
 impl MultiPoolProvider {
-	pub fn create(mut pool_hosts: Vec<PoolInfo>) -> mpsc::UnboundedReceiver<PoolProviderJob> {
+	pub fn create(mut pool_hosts: Vec<PoolInfo>) -> mpsc::UnboundedReceiver<PoolProviderUserWork> {
 		let (job_tx, job_rx) = mpsc::unbounded();
 		let cur_work_rc = Arc::new(Mutex::new(MultiPoolProvider {
 			cur_pool: std::usize::MAX,
@@ -464,19 +556,41 @@ impl MultiPoolProvider {
 				cur_work_rc.lock().unwrap().pools.push(PoolProviderHolder {
 					is_connected: false,
 					last_job: None,
+					last_user_job: None,
 				});
 
 				let work_rc = cur_work_rc.clone();
 				tokio::spawn(pool_rx.for_each(move |job| {
 					let mut cur_work = work_rc.lock().unwrap();
 					match job {
-						PoolProviderAction::PoolUpdate { pool } => {
+						PoolProviderAction::UserUpdate { update } => {
 							cur_work.pools[idx].is_connected = true;
-							if cur_work.cur_pool >= idx {
+							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_job.is_some() {
 								cur_work.cur_pool = idx;
-								cur_work.job_tx.start_send(pool.clone()).unwrap();
+								let payout_info = cur_work.pools[idx].last_job.as_ref().unwrap().payout_info.clone();
+								cur_work.job_tx.start_send(PoolProviderUserWork {
+									payout_info,
+									user_payout_info: update.user_payout_info.clone(),
+									difficulty: update.difficulty.clone(),
+									provider: update.provider.clone(),
+								}).unwrap();
 							}
-							cur_work.pools[idx].last_job = Some(pool);
+							cur_work.pools[idx].last_user_job = Some(update);
+						},
+						PoolProviderAction::PoolUpdate { info } => {
+							cur_work.pools[idx].is_connected = true;
+							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_user_job.is_some() {
+								cur_work.cur_pool = idx;
+								let user_payout_info = cur_work.pools[idx].last_user_job.as_ref().unwrap().user_payout_info.clone();
+								let difficulty = cur_work.pools[idx].last_user_job.as_ref().unwrap().difficulty.clone();
+								cur_work.job_tx.start_send(PoolProviderUserWork {
+									payout_info: info.payout_info.clone(),
+									user_payout_info,
+									difficulty,
+									provider: info.provider.clone(),
+								}).unwrap();
+							}
+							cur_work.pools[idx].last_job = Some(info);
 						},
 						PoolProviderAction::ProviderDisconnected => {
 							if cur_work.pools[idx].is_connected {
@@ -486,7 +600,7 @@ impl MultiPoolProvider {
 									// were provided in...
 									let mut lowest_with_work = std::usize::MAX;
 									for (iter_idx, pool) in cur_work.pools.iter().enumerate() {
-										if pool.last_job.is_some() {
+										if pool.last_job.is_some() && pool.last_user_job.is_some() {
 											if pool.is_connected {
 												lowest_with_work = iter_idx;
 												break;
@@ -496,8 +610,16 @@ impl MultiPoolProvider {
 										}
 									}
 									if lowest_with_work != std::usize::MAX {
-										let new_pool = cur_work.pools[lowest_with_work].last_job.as_ref().unwrap().clone();
-										cur_work.job_tx.start_send(new_pool).unwrap();
+										let msg = {
+											let new_pool = &cur_work.pools[lowest_with_work];
+											PoolProviderUserWork {
+												payout_info: new_pool.last_job.as_ref().unwrap().payout_info.clone(),
+												user_payout_info: new_pool.last_user_job.as_ref().unwrap().user_payout_info.clone(),
+												difficulty: new_pool.last_user_job.as_ref().unwrap().difficulty.clone(),
+												provider: new_pool.last_job.as_ref().unwrap().provider.clone(),
+											}
+										};
+										cur_work.job_tx.start_send(msg).unwrap();
 									}
 								}
 							}

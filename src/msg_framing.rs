@@ -784,6 +784,7 @@ impl codec::Decoder for WorkMsgFramer {
 	}
 }
 
+#[derive(Clone)]
 pub struct PoolUserAuth {
 	pub suggested_target: [u8; 32],
 	pub minimum_target: [u8; 32],

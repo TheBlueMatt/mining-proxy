@@ -30,14 +30,14 @@ pub struct WorkInfo {
 pub struct WorkGetter {
 	payout_script: Option<Script>,
 	cur_work: Option<WorkProviderJob>,
-	cur_pool: Option<PoolProviderJob>,
+	cur_pool: Option<PoolProviderUserWork>,
 }
 
 /// Merges some work and some pool payout information to build a job to mine on.
 /// If both pool and our_payout_script are None we can't build a job.
 /// If pool or work are invalid, None will sometimes be returned, but invalid work may also be
 /// generated. Generally, pool and work are trusted to be well-formed and compatible.
-pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob, pool: &Option<PoolProviderJob>) -> Option<WorkInfo> {
+pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob, pool: &Option<PoolProviderUserWork>) -> Option<WorkInfo> {
 	let mut template = work.template.clone();
 
 	let mut outputs = Vec::with_capacity(template.appended_coinbase_outputs.len() + 1);
@@ -60,7 +60,7 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 	let work_target = template.target.clone();
 
 	match pool {
-		&Some(PoolProviderJob { ref payout_info, ref user_payout_info, ref difficulty, .. }) => {
+		&Some(PoolProviderUserWork { ref payout_info, ref user_payout_info, ref difficulty, .. }) => {
 			let mut constant_value_output = 0;
 			for output in payout_info.appended_outputs.iter() {
 				if output.value > 21000000*100000000 || output.value + constant_value_output > 21000000*100000000 {

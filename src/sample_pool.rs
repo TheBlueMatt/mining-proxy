@@ -361,6 +361,18 @@ fn main() {
 									flags: 0,
 									auth_key: PublicKey::from_secret_key(&secp_ctx, &auth_key.unwrap()).unwrap(),
 								});
+
+								let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+								let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+								let payout_info = PoolPayoutInfo {
+									timestamp,
+									remaining_payout: payout_addr_clone.clone(),
+									appended_outputs: vec![],
+								};
+								send_response!(PoolMessage::PayoutInfo {
+									signature: sign_message!(payout_info, 13),
+									payout_info,
+								});
 							},
 							PoolMessage::ProtocolVersion { .. } => {
 								println!("Got ProtocolVersion?");
@@ -400,16 +412,6 @@ fn main() {
 										client_ids.insert(client_id, info.user_id.clone());
 										connection_entry.or_insert(user.clone());
 										users_ref.lock().unwrap().push(Arc::downgrade(&user));
-
-										let payout_info = PoolPayoutInfo {
-											timestamp,
-											remaining_payout: payout_addr_clone.clone(),
-											appended_outputs: vec![],
-										};
-										send_response!(PoolMessage::PayoutInfo {
-											signature: sign_message!(payout_info, 13),
-											payout_info,
-										});
 
 										let user_payout_info = PoolUserPayoutInfo {
 											user_id: info.user_id.clone(),
