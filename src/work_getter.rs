@@ -123,9 +123,9 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 			Some(ref provider) => {
 				let provider_ref = provider.clone();
 				let template_ref_2 = template_ref.clone();
-				tx_data_ref.get_and(move |txn, prev_header| {
+				tx_data_ref.get_and(move |txn, prev_header, extra_block_data| {
 					let source_clone = provider_ref.clone();
-					source_clone.send_nonce(&nonces, &template_ref_2, &txn, &prev_header);
+					source_clone.send_nonce(&nonces, &template_ref_2, &txn, &prev_header, &extra_block_data);
 				});
 			},
 			None => {}

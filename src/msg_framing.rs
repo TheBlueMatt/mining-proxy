@@ -152,19 +152,21 @@ impl WinningNonce {
 pub struct TransactionData {
 	pub previous_header: BlockHeader,
 	pub template_timestamp: u64,
-	pub transactions: Vec<Transaction>,
+	pub extra_block_data: Vec<u8>,
+	pub transactions: Vec<Vec<u8>>,
 }
 impl TransactionData {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(8+80+4);
 		res.put_u64_le(self.template_timestamp);
 		res.put_slice(&network::serialize::serialize(&self.previous_header).unwrap());
+		res.put_u32_le(self.extra_block_data.len() as u32);
+		res.put_slice(&self.extra_block_data);
 		res.put_u32_le(self.transactions.len() as u32);
 		for tx in self.transactions.iter() {
-			let tx_enc = network::serialize::serialize(tx).unwrap();
-			res.reserve(4 + tx_enc.len());
-			res.put_u32_le(tx_enc.len() as u32);
-			res.put_slice(&tx_enc[..]);
+			res.reserve(4 + tx.len());
+			res.put_u32_le(tx.len() as u32);
+			res.put_slice(tx);
 		}
 	}
 }
@@ -665,18 +667,17 @@ impl codec::Decoder for WorkMsgFramer {
 
 				let previous_header = network::serialize::deserialize(get_slice!(80)).unwrap();
 
+				let extra_data_len = utils::slice_to_le32(get_slice!(4));
+				let extra_block_data = get_slice!(extra_data_len).to_vec();
+
 				let tx_count = utils::slice_to_le32(get_slice!(4)) as usize;
-				if bytes.len() < 64 + 8 + 4 + tx_count * 4 {
-					return Ok(None)
+				if bytes.len() < 64 + 8 + 80 + 4 + 4 + tx_count * 4 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
 				}
 				let mut txn = Vec::with_capacity(tx_count);
 				for _ in 0..tx_count {
 					let tx_len = utils::slice_to_le32(get_slice!(4));
-					let tx_data = match network::serialize::deserialize(get_slice!(tx_len)) {
-						Ok(tx) => tx,
-						Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
-					};
-					txn.push(tx_data);
+					txn.push(get_slice!(tx_len).to_vec());
 				}
 
 				let msg = WorkMessage::TransactionData {
@@ -684,6 +685,7 @@ impl codec::Decoder for WorkMsgFramer {
 					data: TransactionData {
 						template_timestamp,
 						previous_header,
+						extra_block_data,
 						transactions: txn,
 					},
 				};
@@ -872,7 +874,7 @@ pub enum WeakBlockAction {
 	},
 	/// Adds a new transaction not in the original sketch
 	NewTx {
-		tx: Transaction
+		tx: Vec<u8>
 	},
 }
 
@@ -883,10 +885,12 @@ pub struct WeakBlock {
 	pub header_time: u32,
 	pub header_nbits: u32,
 	pub header_nonce: u32,
+	pub merkle_rhss: Vec<[u8; 32]>,
 
 	pub user_tag_1: Vec<u8>,
 	pub user_tag_2: Vec<u8>,
 
+	pub extra_block_data: Vec<u8>,
 	pub txn: Vec<WeakBlockAction>,
 }
 
@@ -900,13 +904,20 @@ impl WeakBlock {
 		res.put_u32_le(self.header_nbits);
 		res.put_u32_le(self.header_nonce);
 
+		res.put_u8(self.merkle_rhss.len() as u8);
+		for rhs in self.merkle_rhss.iter() {
+			res.put_slice(rhs);
+		}
+
 		res.put_u8(self.user_tag_1.len() as u8);
 		res.put_slice(&self.user_tag_1);
 		res.put_u8(self.user_tag_2.len() as u8);
 		res.put_slice(&self.user_tag_2);
 
-		res.put_u16_le(self.txn.len() as u16);
+		res.put_u32_le(self.extra_block_data.len() as u32);
+		res.put_slice(&self.extra_block_data);
 
+		res.put_u32_le(self.txn.len() as u32);
 		for tx in self.txn.iter() {
 			match tx {
 				&WeakBlockAction::TakeTx { n } => {
@@ -914,11 +925,10 @@ impl WeakBlock {
 					res.put_u16_le(n);
 				},
 				&WeakBlockAction::NewTx { ref tx } => {
-					let tx_enc = network::serialize::serialize(tx).unwrap();
-					res.reserve(2 + 4 + tx_enc.len());
+					res.reserve(2 + 4 + tx.len());
 					res.put_u16_le(0);
-					res.put_u32_le(tx_enc.len() as u32);
-					res.put_slice(&tx_enc[..]);
+					res.put_u32_le(tx.len() as u32);
+					res.put_slice(tx);
 				}
 			}
 		}
@@ -1495,22 +1505,33 @@ impl codec::Decoder for PoolMsgFramer {
 				let header_nbits = utils::slice_to_le32(get_slice!(4));
 				let header_nonce = utils::slice_to_le32(get_slice!(4));
 
+				let merkle_rhss_count = get_slice!(1)[0] as usize;
+				if merkle_rhss_count > 16 {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError));
+				}
+				let mut merkle_rhss = Vec::with_capacity(merkle_rhss_count);
+				for _ in 0..merkle_rhss_count {
+					let mut merkle_rhs = [0; 32];
+					merkle_rhs[..].copy_from_slice(get_slice!(32));
+					merkle_rhss.push(merkle_rhs);
+				}
+
 				let user_tag_1_len = get_slice!(1)[0];
 				let user_tag_1 = get_slice!(user_tag_1_len).to_vec();
 				let user_tag_2_len = get_slice!(1)[0];
 				let user_tag_2 = get_slice!(user_tag_2_len).to_vec();
 
-				let action_count = utils::slice_to_le16(get_slice!(2)) as usize;
-				let mut actions = Vec::with_capacity(action_count);
+				let extra_data_len = utils::slice_to_le32(get_slice!(4));
+				let extra_block_data = get_slice!(extra_data_len).to_vec();
+
+				let action_count = utils::slice_to_le32(get_slice!(4)) as usize;
+				let mut actions = Vec::with_capacity(cmp::max(action_count, 1 << 16));
 
 				while actions.len() < action_count {
 					let action = utils::slice_to_le16(get_slice!(2));
 					if action == 0 {
 						let txlen = utils::slice_to_le32(get_slice!(4));
-						actions.push(WeakBlockAction::NewTx { tx: match network::serialize::deserialize(get_slice!(txlen)) {
-							Ok(tx) => tx,
-							Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError)),
-						} });
+						actions.push(WeakBlockAction::NewTx { tx: get_slice!(txlen).to_vec() });
 					} else {
 						actions.push(WeakBlockAction::TakeTx { n: action });
 					}
@@ -1524,8 +1545,12 @@ impl codec::Decoder for PoolMsgFramer {
 						header_time,
 						header_nbits,
 						header_nonce,
+						merkle_rhss,
+
 						user_tag_1,
 						user_tag_2,
+
+						extra_block_data,
 						txn: actions,
 					}
 				}))

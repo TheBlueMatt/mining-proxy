@@ -5,9 +5,6 @@ use utils;
 use futures::sync::{mpsc,oneshot};
 
 use bitcoin::blockdata::block::BlockHeader;
-use bitcoin::blockdata::transaction::Transaction;
-use bitcoin::network::serialize::BitcoinHash;
-use bitcoin::util::hash::Sha256dHash;
 
 use bytes;
 use bytes::BufMut;
@@ -33,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct EventualTxData {
 	// We dont really want Fn here, we want FnOnce, but we can't because that'd require a move of
 	// the function onto stack, which is of unknown size, so we cant...
-	callees: Mutex<Vec<Box<Fn(&Vec<(Transaction, Sha256dHash)>, &BlockHeader) + Send>>>,
-	value: RwLock<Option<(Vec<(Transaction, Sha256dHash)>, BlockHeader)>>,
+	callees: Mutex<Vec<Box<Fn(&Vec<Vec<u8>>, &BlockHeader, &Vec<u8>) + Send>>>,
+	value: RwLock<Option<(Vec<Vec<u8>>, BlockHeader, Vec<u8>)>>,
 }
 impl EventualTxData {
 	fn new() -> (Arc<Self>, oneshot::Sender<TransactionData>) {
@@ -44,17 +41,12 @@ impl EventualTxData {
 		});
 		let (tx, rx) = oneshot::channel();
 		let us_rx = us.clone();
-		tokio::spawn(rx.and_then(move |mut res: TransactionData| {
-			let mut value = Vec::with_capacity(res.transactions.len());
-			for tx in res.transactions.drain(..) {
-				let hash = tx.bitcoin_hash();
-				value.push((tx, hash));
-			}
-			*us_rx.value.write().unwrap() = Some((value, res.previous_header));
+		tokio::spawn(rx.and_then(move |res: TransactionData| {
+			*us_rx.value.write().unwrap() = Some((res.transactions, res.previous_header, res.extra_block_data));
 			let v_lock = us_rx.value.read().unwrap();
 			let v = v_lock.as_ref().unwrap();
 			for callee in us_rx.callees.lock().unwrap().iter() {
-				(callee)(&v.0, &v.1);
+				(callee)(&v.0, &v.1, &v.2);
 			}
 			us_rx.callees.lock().unwrap().clear();
 			future::result(Ok(()))
@@ -64,11 +56,11 @@ impl EventualTxData {
 		(us, tx)
 	}
 
-	pub fn get_and<F: Fn(&Vec<(Transaction, Sha256dHash)>, &BlockHeader) + 'static + Send>(&self, then: F) {
+	pub fn get_and<F: Fn(&Vec<Vec<u8>>, &BlockHeader, &Vec<u8>) + 'static + Send>(&self, then: F) {
 		let value = self.value.read().unwrap();
 		match &(*value) {
 			&Some(ref value) => {
-				then(&value.0, &value.1);
+				then(&value.0, &value.1, &value.2);
 				return;
 			},
 			&None => {

@@ -17,9 +17,10 @@ mod utils;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::network::serialize::BitcoinHash;
+use bitcoin::network;
 use bitcoin::util::address::Address;
 use bitcoin::util::privkey;
-use bitcoin::util::hash::{Sha256dHash, bitcoin_merkle_root};
+use bitcoin::util::hash::Sha256dHash;
 
 use bytes::BufMut;
 
@@ -53,7 +54,7 @@ fn share_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64) {
 	println!("Got valid share with value {} from \"{}\" from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag_1));
 }
 
-fn weak_block_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _header: &BlockHeader, txn: &Vec<Transaction>) {
+fn weak_block_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>) {
 	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag_1));
 }
 
@@ -516,48 +517,44 @@ fn main() {
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 
-								let (our_payout, client_id) = match &sketch.txn[0] {
+								let (coinbase_txid, (our_payout, client_id)) = match &sketch.txn[0] {
 									&WeakBlockAction::TakeTx { .. } => {
 										reject_share!(sketch, ShareRejectedReason::BadWork);
 										send_response!(PoolMessage::WeakBlockStateReset {});
 										return future::result(Ok(()));
 									},
 									&WeakBlockAction::NewTx { ref tx } => {
-										check_coinbase_tx!(tx, sketch, send_response!(PoolMessage::WeakBlockStateReset {}))
+										let tx_deser_attempt: Result<Transaction, _> = network::serialize::deserialize(tx);
+										match tx_deser_attempt {
+											Ok(tx_deser) => {
+												(tx_deser.txid(), check_coinbase_tx!(tx_deser, sketch, send_response!(PoolMessage::WeakBlockStateReset {})))
+											},
+											Err(_) => {
+												reject_share!(sketch, ShareRejectedReason::BadPayoutInfo);
+												send_response!(PoolMessage::WeakBlockStateReset {});
+												return future::result(Ok(()));
+											}
+										}
 									},
 								};
 
-								let mut dummy_last_weak_block = Vec::new();
-
-								let merkle_root = {
-									let mut txids = Vec::with_capacity(sketch.txn.len());
-									let last_weak_ref: &Vec<Transaction> = if last_weak_block.is_some() {
-										last_weak_block.as_ref().unwrap()
-									} else { &dummy_last_weak_block };
-
-									for action in sketch.txn.iter() {
-										match action {
-											&WeakBlockAction::TakeTx { n } => {
-												if n as usize >= last_weak_ref.len() {
-													reject_share!(sketch, ShareRejectedReason::BadWork);
-													send_response!(PoolMessage::WeakBlockStateReset {});
-													return future::result(Ok(()));
-												}
-												txids.push(last_weak_ref[n as usize].txid());
-											},
-											&WeakBlockAction::NewTx { ref tx } => {
-												txids.push(tx.txid());
-											}
-										}
-									}
-
-									bitcoin_merkle_root(txids)
-								};
+								let mut merkle_lhs = [0; 32];
+								merkle_lhs.copy_from_slice(&coinbase_txid[..]);
+								let mut sha = Sha256::new();
+								for rhs in sketch.merkle_rhss.iter() {
+									sha.reset();
+									sha.input(&merkle_lhs);
+									sha.input(&rhs[..]);
+									sha.result(&mut merkle_lhs);
+									sha.reset();
+									sha.input(&merkle_lhs);
+									sha.result(&mut merkle_lhs);
+								}
 
 								let header = BlockHeader {
 									version: sketch.header_version,
 									prev_blockhash: Sha256dHash::from(&sketch.header_prevblock[..]),
-									merkle_root: merkle_root,
+									merkle_root: Sha256dHash::from(&merkle_lhs[..]),
 									time: sketch.header_time,
 									bits: sketch.header_nbits,
 									nonce: sketch.header_nonce,
@@ -565,6 +562,7 @@ fn main() {
 
 								let mut new_txn = Vec::with_capacity(sketch.txn.len());
 								{
+									let mut dummy_last_weak_block: Vec<Vec<u8>> = Vec::new();
 									let last_weak_ref = if last_weak_block.is_some() {
 										last_weak_block.as_mut().unwrap()
 									} else { &mut dummy_last_weak_block };
@@ -577,7 +575,7 @@ fn main() {
 													send_response!(PoolMessage::WeakBlockStateReset {});
 													return future::result(Ok(()));
 												}
-												new_txn.push(Transaction { version: 0, lock_time: 0, input: Vec::new(), output: Vec::new() });
+												new_txn.push(Vec::new());
 												mem::swap(&mut last_weak_ref[n as usize], &mut new_txn.last_mut().unwrap());
 											},
 											WeakBlockAction::NewTx { tx } => {
@@ -594,7 +592,7 @@ fn main() {
 								let client_target = client.cur_target.load(Ordering::Acquire) as u8;
 
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
-									weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn);
+									weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data);
 									share_received!(client, client_target, sketch);
 								} else {
 									reject_share!(sketch, ShareRejectedReason::BadHash);

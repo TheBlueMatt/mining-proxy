@@ -4,7 +4,7 @@ use utils;
 
 use futures::sync::mpsc;
 
-use bitcoin::blockdata::transaction::Transaction;
+use bitcoin::network;
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::util::hash::Sha256dHash;
 
@@ -54,7 +54,7 @@ struct PoolHandlerState {
 	cur_difficulty: Option<PoolDifficulty>,
 
 	last_header_sent: [u8; 32],
-	last_weak_block: Option<Vec<(Transaction, Sha256dHash)>>,
+	last_weak_block: Option<Vec<Vec<u8>>>,
 
 	job_stream: mpsc::Sender<PoolProviderAction>,
 }
@@ -89,13 +89,16 @@ impl PoolHandler {
 		}), work_receiver)
 	}
 
-	pub fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<(Transaction, Sha256dHash)>, prev_header: &BlockHeader) {
+	pub fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<Vec<u8>>, prev_header: &BlockHeader, extra_block_data: &Vec<u8>) {
 		let mut us = self.state.write().unwrap();
 
 		let previous_header = if us.last_header_sent == template.header_prevblock { None } else {
 			us.last_header_sent = template.header_prevblock.clone();
 			Some(prev_header.clone())
 		};
+
+		//TODO: This is really dumb, but we need NLL otherwise
+		let mut last_weak_block_stolen = us.last_weak_block.take();
 
 		match us.cur_difficulty {
 			Some(ref difficulty) => {
@@ -131,27 +134,28 @@ impl PoolHandler {
 					match us.stream {
 						Some(ref stream) => {
 							let mut actions = Vec::with_capacity(post_coinbase_txn.len() + 1);
-							actions.push(WeakBlockAction::NewTx { tx: work.0.coinbase_tx.clone() });
+							actions.push(WeakBlockAction::NewTx { tx: network::serialize::serialize(&work.0.coinbase_tx).unwrap() });
 
-							match us.last_weak_block {
-								Some(ref last_weak_block) => {
+							match last_weak_block_stolen {
+								Some(mut last_weak_block) => {
 									let mut old_txids_posn = HashMap::with_capacity(last_weak_block.len());
-									for (idx, &(_, ref txid)) in last_weak_block.iter().enumerate() {
-										old_txids_posn.insert(txid.clone(), idx + 1); // offset by coinbase tx
+									for (idx, tx) in last_weak_block.drain(..).enumerate() {
+										old_txids_posn.insert(tx, idx + 1); // offset by coinbase tx
 									}
-									for &(ref tx, ref txid) in post_coinbase_txn {
-										match old_txids_posn.get(txid) {
+									for tx in post_coinbase_txn {
+										match old_txids_posn.get(tx) {
 											None => actions.push(WeakBlockAction::NewTx { tx: tx.clone() }),
 											Some(&idx) => actions.push(WeakBlockAction::TakeTx { n: idx as u16 }),
 										}
 									}
 								},
 								None => {
-									for &(ref tx, _) in post_coinbase_txn {
+									for tx in post_coinbase_txn {
 										actions.push(WeakBlockAction::NewTx { tx: tx.clone() });
 									}
 								}
 							}
+							last_weak_block_stolen = Some(post_coinbase_txn.clone());
 							match stream.unbounded_send(PoolMessage::WeakBlock {
 								sketch: WeakBlock {
 									header_version: work.0.header_version,
@@ -159,8 +163,10 @@ impl PoolHandler {
 									header_time: work.0.header_time,
 									header_nbits: template.header_nbits,
 									header_nonce: work.0.header_nonce,
+									merkle_rhss: template.merkle_rhss.clone(),
 									user_tag_1: work.0.user_tag.clone(),
 									user_tag_2: Vec::new(),
+									extra_block_data: extra_block_data.clone(),
 									txn: actions,
 								},
 							}) {
@@ -168,24 +174,21 @@ impl PoolHandler {
 								Err(_) => {
 									//TODO: We should queue these for sending later
 									println!("Failed to submit weak block as pool connection lost");
-									return;
 								},
 							}
 						},
 						None => {
 							//TODO: We should queue these for sending later
 							println!("Failed to submit weak block as pool connection lost");
-							return;
 						}
 					}
-				} else { return; }
+				}
 			},
 			None => {
 				println!("Got share but failed to submit because pool has not yet provided difficulty information!");
-				return;
 			}
 		}
-		us.last_weak_block = Some(post_coinbase_txn.clone());
+		us.last_weak_block = last_weak_block_stolen;
 	}
 }
 
