@@ -18,8 +18,7 @@ use futures::sync::mpsc;
 use tokio;
 use tokio::{net, timer};
 
-use tokio_io::AsyncRead;
-use tokio_io::codec;
+use tokio_codec;
 
 use serde_json;
 
@@ -321,7 +320,7 @@ impl StratumServer {
 	pub fn new_connection(us: Arc<Self>, stream: net::TcpStream) {
 		stream.set_nodelay(true).unwrap();
 
-		let (tx, rx) = stream.framed(codec::LinesCodec::new()).split();
+		let (tx, rx) = tokio_codec::Framed::new(stream, tokio_codec::LinesCodec::new()).split();
 
 		let (client, mut send_sink) = {
 			let (send_sink, send_stream) = mpsc::channel(5);

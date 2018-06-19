@@ -4,7 +4,8 @@ use futures::{Future,Stream,Sink};
 use tokio;
 use tokio::{net, timer};
 
-use tokio_io::{AsyncRead,codec};
+use tokio_io::codec;
+use tokio_codec;
 
 use std::{io,marker};
 use std::net::{SocketAddr,ToSocketAddrs};
@@ -77,7 +78,7 @@ impl<MessageType : Send + Sync, HandlerProvider : 'static + ConnectionHandler<Me
 							stream.set_nodelay(true).unwrap();
 
 							let (framer, tx_stream) = self.handler.new_connection();
-							let (tx, rx) = stream.framed(framer).split();
+							let (tx, rx) = tokio_codec::Framed::new(stream, framer).split();
 							let stream = tx_stream.map_err(|_| -> io::Error {
 								panic!("mpsc streams cant generate errors!");
 							});

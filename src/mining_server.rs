@@ -21,7 +21,7 @@ use futures::sync::mpsc;
 use tokio;
 use tokio::{net, timer};
 
-use tokio_io::AsyncRead;
+use tokio_codec;
 
 use secp256k1::key::{SecretKey,PublicKey};
 use secp256k1::Secp256k1;
@@ -188,7 +188,7 @@ impl MiningServer {
 	pub fn new_connection(us: Arc<Self>, stream: net::TcpStream) {
 		stream.set_nodelay(true).unwrap();
 
-		let (tx, rx) = stream.framed(WorkMsgFramer::new()).split();
+		let (tx, rx) = tokio_codec::Framed::new(stream, WorkMsgFramer::new()).split();
 
 		let (client, mut send_sink) = {
 			let (send_sink, send_stream) = mpsc::channel(5);

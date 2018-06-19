@@ -7,6 +7,7 @@ extern crate crypto;
 extern crate futures;
 extern crate tokio;
 extern crate tokio_io;
+extern crate tokio_codec;
 extern crate secp256k1;
 
 mod msg_framing;
@@ -31,8 +32,6 @@ use futures::{future,Stream,Sink,Future};
 use futures::sync::mpsc;
 
 use tokio::{net, timer};
-
-use tokio_io::AsyncRead;
 
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
@@ -208,7 +207,7 @@ fn main() {
 				tokio::spawn(listener.incoming().for_each(move |sock| {
 					sock.set_nodelay(true).unwrap();
 
-					let (tx, rx) = sock.framed(PoolMsgFramer::new()).split();
+					let (tx, rx) = tokio_codec::Framed::new(sock, PoolMsgFramer::new()).split();
 					let (mut send_sink, send_stream) = mpsc::channel(5);
 					tokio::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
 						panic!("mpsc streams cant generate errors!");
