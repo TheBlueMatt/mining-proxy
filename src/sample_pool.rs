@@ -61,7 +61,7 @@ fn weak_block_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _he
 // leading 0s, we offset by 1 higher than we really want (this limits stratum false-positives
 // in the naive difficulty converter).
 
-const MIN_TARGET_LEADING_0S: u8 = 49; // Diff ~65536
+const MIN_TARGET_LEADING_0S: u8 = 47; // Diff ~16384
 const WEAK_BLOCK_RATIO_0S: u8 = 8; // 2**8x harder to mine weak blocks
 const MAX_USER_SHARES_PER_30_SEC: usize = 30;
 const MIN_USER_SHARES_PER_30_SEC: usize = 1;
