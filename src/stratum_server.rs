@@ -393,14 +393,11 @@ impl StratumServer {
 
 			match msg["method"].as_str().unwrap() {
 				"mining.subscribe" => {
-					let mut client_id_str = String::with_capacity(16);
-					push_le_32_hex(client.client_id as u32, &mut client_id_str);
-					push_le_32_hex((client.client_id >> 32) as u32, &mut client_id_str);
 					send_response!(serde_json::Value::Null,
 						[
-							[ "mining.notify", &client_id_str ],
-							client_id_str,
-							EXTRANONCE2_SIZE,
+							[ "mining.notify", "42" ],
+							"00000000", // dummy value, we'll set it for real in mining.authorize
+							4,
 						]);
 					let jobs = us.jobs.read().unwrap();
 					match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
@@ -534,6 +531,20 @@ impl StratumServer {
 				},
 				"mining.authorize" => {
 					send_response!(serde_json::Value::Null, true);
+					let mut client_id_str = String::with_capacity(16);
+					push_le_32_hex(client.client_id as u32, &mut client_id_str);
+					push_le_32_hex((client.client_id >> 32) as u32, &mut client_id_str);
+					match send_sink.start_send(json!({
+						"params": [
+							client_id_str,
+							EXTRANONCE2_SIZE,
+						],
+						"id": serde_json::Value::Null,
+						"method": "mining.set_extranonce",
+					}).to_string()) {
+						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
+						Ok(_) => {}
+					}
 				},
 				"mining.get_transactions" => {
 					send_response!(serde_json::Value::Null, []);
