@@ -57,10 +57,10 @@ struct PoolHandlerState {
 
 	coinbase_postfix_to_difficulty: HashMap<Vec<u8>, PoolDifficulty>,
 	coinbase_postfix_len: Option<u8>,
-	/// user_id -> (payout_info.timestamp, payout_info.coinbase_postfix)
+	/// user_id -> (payout_info.timestamp, payout_info.coinbase_postfix, index in users_to_reauth)
 	/// Note that we keep a dummy entry with a 0 timestamp if we've started auth but haven't heard
 	/// back yet.
-	user_id_to_postfix: HashMap<Vec<u8>, (u64, Vec<u8>)>,
+	user_id_to_postfix: HashMap<Vec<u8>, (u64, Vec<u8>, usize)>,
 
 	cur_payout_info: Option<PoolPayoutInfo>,
 
@@ -71,9 +71,10 @@ struct PoolHandlerState {
 }
 struct PoolHandlerStateRefs<'a> {
 	stream: &'a mut Option<mpsc::UnboundedSender<PoolMessage>>,
+	users_to_reauth: &'a mut Vec<PoolUserAuth>,
 	coinbase_postfix_to_difficulty: &'a mut HashMap<Vec<u8>, PoolDifficulty>,
 	coinbase_postfix_len: &'a mut Option<u8>,
-	user_id_to_postfix: &'a mut HashMap<Vec<u8>, (u64, Vec<u8>)>,
+	user_id_to_postfix: &'a mut HashMap<Vec<u8>, (u64, Vec<u8>, usize)>,
 	last_header_sent: &'a mut [u8; 32],
 	last_weak_block: &'a mut Option<Vec<Vec<u8>>>,
 	job_stream: &'a mut mpsc::Sender<PoolProviderAction>,
@@ -82,6 +83,7 @@ impl PoolHandlerState {
 	fn borrow_mut(&mut self) -> PoolHandlerStateRefs {
 		PoolHandlerStateRefs {
 			stream: &mut self.stream,
+			users_to_reauth: &mut self.users_to_reauth,
 			coinbase_postfix_to_difficulty: &mut self.coinbase_postfix_to_difficulty,
 			coinbase_postfix_len: &mut self.coinbase_postfix_len,
 			user_id_to_postfix: &mut self.user_id_to_postfix,
@@ -97,27 +99,25 @@ pub struct PoolHandler {
 	secp_ctx: Secp256k1,
 }
 
+pub enum PoolAuthAction {
+	AuthUser(PoolUserAuth),
+	DropUser(Vec<u8>),
+}
+
 impl PoolHandler {
-	fn new(expected_auth_key: Option<PublicKey>, user_id: Vec<u8>, user_auth: Vec<u8>) -> (Arc<PoolHandler>, mpsc::Receiver<PoolProviderAction>) {
+	fn new(expected_auth_key: Option<PublicKey>, user_auth_requests: mpsc::UnboundedReceiver<PoolAuthAction>) -> (Arc<PoolHandler>, mpsc::Receiver<PoolProviderAction>) {
 		let (work_sender, work_receiver) = mpsc::channel(25);
 
-		let mut user_id_to_postfix = HashMap::with_capacity(1);
-		user_id_to_postfix.insert(user_id.clone(), (0, Vec::new()));
-
-		(Arc::new(PoolHandler {
+		let us = Arc::new(PoolHandler {
 			state: RwLock::new(PoolHandlerState {
 				stream: None,
 				auth_key: expected_auth_key,
 
-				users_to_reauth: vec![PoolUserAuth {
-					suggested_target: [0xff; 32],
-					minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
-					user_id, user_auth
-				}],
+				users_to_reauth: vec![],
 
 				coinbase_postfix_to_difficulty: HashMap::new(),
 				coinbase_postfix_len: None,
-				user_id_to_postfix,
+				user_id_to_postfix: HashMap::new(),
 
 				cur_payout_info: None,
 
@@ -127,7 +127,44 @@ impl PoolHandler {
 				job_stream: work_sender,
 			}),
 			secp_ctx: Secp256k1::new(),
-		}), work_receiver)
+		});
+
+		let us_auth = us.clone();
+		tokio::spawn(user_auth_requests.for_each(move |auth_action| {
+			let mut lock = us_auth.state.write().unwrap();
+			let refs = lock.borrow_mut();
+			match auth_action {
+				PoolAuthAction::AuthUser(user_id_auth) => {
+					let mut val = match refs.user_id_to_postfix.entry(user_id_auth.user_id.clone()) {
+						hash_map::Entry::Occupied(_) => panic!("Duplicate user auth request!"),
+						hash_map::Entry::Vacant(e) => e.insert((0, Vec::new(), 0)),
+					};
+
+					if let Some(stream) = refs.stream {
+						let _ = stream.start_send(PoolMessage::UserAuth { info: user_id_auth.clone() });
+					}
+
+					refs.users_to_reauth.push(user_id_auth);
+					val.2 = refs.users_to_reauth.len() - 1;
+				},
+				PoolAuthAction::DropUser(user_id) => {
+					let (timestamp, postfix, to_reauth_posn) = refs.user_id_to_postfix.remove(&user_id).unwrap();
+					if timestamp != 0 {
+						refs.coinbase_postfix_to_difficulty.remove(&postfix).unwrap();
+					}
+					refs.users_to_reauth.swap_remove(to_reauth_posn);
+					if refs.users_to_reauth.len() > to_reauth_posn {
+						refs.user_id_to_postfix.get_mut(&refs.users_to_reauth[to_reauth_posn].user_id).unwrap().2 = to_reauth_posn;
+					}
+					if let Some(stream) = refs.stream {
+						let _ = stream.start_send(PoolMessage::DropUser { user_id });
+					}
+				}
+			}
+			Ok(())
+		}));
+
+		(us, work_receiver)
 	}
 
 	pub fn send_nonce(&self, work: &(WinningNonce, Sha256dHash), template: &Arc<BlockTemplate>, post_coinbase_txn: &Vec<Vec<u8>>, prev_header: &BlockHeader, extra_block_data: &Vec<u8>) {
@@ -394,7 +431,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 
 				let refs = us.borrow_mut();
 				match refs.user_id_to_postfix.get_mut(&info.user_id) {
-					Some(&mut (ref mut last_timestamp, ref mut last_postfix)) => {
+					Some(&mut (ref mut last_timestamp, ref mut last_postfix, _)) => {
 						if *last_timestamp < info.timestamp {
 							let cur_difficulty = if *last_timestamp != 0 {
 								refs.coinbase_postfix_to_difficulty.remove(last_postfix)
@@ -424,7 +461,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					},
 					None => {
 						println!("Got AcceptUserAuth for un-auth'ed user?");
-						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+						return Ok(());
 					}
 				}
 			},
@@ -441,7 +478,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 
 				let refs = us.borrow_mut();
 				match refs.user_id_to_postfix.get(&difficulty.user_id) {
-					Some(&(ref last_timestamp, ref last_postfix)) => {
+					Some(&(ref last_timestamp, ref last_postfix, _)) => {
 						if *last_timestamp != 0 {
 							let entry = refs.coinbase_postfix_to_difficulty.entry(last_postfix.clone());
 							match entry {
@@ -480,7 +517,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					},
 					None => {
 						println!("Got ShareDifficulty for un-auth'ed user?");
-						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+						return Ok(());
 					}
 				}
 			},
@@ -552,7 +589,14 @@ impl MultiPoolProvider {
 
 		tokio::spawn(future::lazy(move || -> Result<(), ()> {
 			for (idx, pool) in pool_hosts.drain(..).enumerate() {
-				let (mut handler, mut pool_rx) = PoolHandler::new(None, pool.user_id, pool.user_auth);
+				let (mut auth_write, auth_read) = mpsc::unbounded();
+				let (mut handler, mut pool_rx) = PoolHandler::new(None, auth_read);
+				auth_write.start_send(PoolAuthAction::AuthUser(PoolUserAuth {
+					suggested_target: [0xff; 32],
+					minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
+					user_id: pool.user_id,
+					user_auth: pool.user_auth,
+				})).unwrap();
 				cur_work_rc.lock().unwrap().pools.push(PoolProviderHolder {
 					is_connected: false,
 					last_job: None,

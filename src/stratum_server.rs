@@ -395,9 +395,9 @@ impl StratumServer {
 				"mining.subscribe" => {
 					send_response!(serde_json::Value::Null,
 						[
-							[ "mining.notify", "42" ],
-							"00000000", // dummy value, we'll set it for real in mining.authorize
-							4,
+							[ "mining.notify", "" ],
+							"", // dummy value, we'll set it for real in mining.authorize
+							EXTRANONCE2_SIZE,
 						]);
 					let jobs = us.jobs.read().unwrap();
 					match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
