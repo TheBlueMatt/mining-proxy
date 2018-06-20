@@ -259,10 +259,10 @@ impl StratumServer {
 
 		let us_timer = us.clone(); // Wait, you wanted a deconstructor? LOL
 		tokio::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(1)).for_each(move |_| {
-			let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-			let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
-
 			let last_job = {
+				let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+				let timestamp = (time.as_secs() - 30) * 1000 + time.subsec_nanos() as u64 / 1_000_000;
+
 				let jobs = us_timer.jobs.read().unwrap();
 				let last_job = match jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 					Some((_, v)) => Some(v.clone()),
@@ -270,20 +270,26 @@ impl StratumServer {
 				};
 
 				if { // Avoid write lock unless we need it
-					let res = if let Some((k, _)) = jobs.iter().next() {
-						*k < timestamp
-					} else { false };
+					let res = {
+						if jobs.len() > 1 {
+							let mut iter = jobs.iter();
+							iter.next(); // We have to keep a job until the next one is 30 seconds old
+							if let Some((k, _)) = iter.next() {
+								*k < timestamp
+							} else { false }
+						} else { false }
+					};
 					mem::drop(jobs);
 					res
 				} {
 					let mut jobs = us_timer.jobs.write().unwrap();
-					loop {
+					while jobs.len() > 1 {
 						// There should be a much easier way to implement this...
-						let first_timestamp = match jobs.iter().next() {
-							Some((k, _)) => *k,
-							None => break,
+						let (first_timestamp, second_timestamp) = {
+							let mut iter = jobs.iter();
+							(*iter.next().unwrap().0, *iter.next().unwrap().0)
 						};
-						if first_timestamp < timestamp {
+						if second_timestamp < timestamp {
 							jobs.remove(&first_timestamp);
 						} else { break; }
 					}
