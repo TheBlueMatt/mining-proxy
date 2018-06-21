@@ -140,7 +140,7 @@ impl PoolHandler {
 						hash_map::Entry::Vacant(e) => e.insert((0, Vec::new(), 0)),
 					};
 
-					if let Some(stream) = refs.stream {
+					if let &mut Some(ref mut stream) = refs.stream {
 						let _ = stream.start_send(PoolMessage::UserAuth { info: user_id_auth.clone() });
 					}
 
@@ -156,7 +156,7 @@ impl PoolHandler {
 					if refs.users_to_reauth.len() > to_reauth_posn {
 						refs.user_id_to_postfix.get_mut(&refs.users_to_reauth[to_reauth_posn].user_id).unwrap().2 = to_reauth_posn;
 					}
-					if let Some(stream) = refs.stream {
+					if let &mut Some(ref mut stream) = refs.stream {
 						let _ = stream.start_send(PoolMessage::DropUser { user_id });
 					}
 				}
@@ -186,7 +186,7 @@ impl PoolHandler {
 			if let Some(ref difficulty) = us.coinbase_postfix_to_difficulty.get(&coinbase_postfix) {
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.share_target[..]) {
 					match us.stream {
-						Some(ref stream) => {
+						&mut Some(ref stream) => {
 							match stream.unbounded_send(PoolMessage::Share {
 								share: PoolShare {
 									header_version: work.0.header_version,
@@ -209,7 +209,7 @@ impl PoolHandler {
 								},
 							}
 						},
-						None => {
+						&mut None => {
 							//TODO: We should queue these for sending later
 							println!("Failed to submit nonce as pool connection lost");
 							return;
@@ -218,7 +218,7 @@ impl PoolHandler {
 				}
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.weak_block_target[..]) {
 					match us.stream {
-						Some(ref stream) => {
+						&mut Some(ref stream) => {
 							let mut actions = Vec::with_capacity(post_coinbase_txn.len() + 1);
 							actions.push(WeakBlockAction::NewTx { tx: network::serialize::serialize(&work.0.coinbase_tx).unwrap() });
 
@@ -263,7 +263,7 @@ impl PoolHandler {
 								},
 							}
 						},
-						None => {
+						&mut None => {
 							//TODO: We should queue these for sending later
 							println!("Failed to submit weak block as pool connection lost");
 						}
