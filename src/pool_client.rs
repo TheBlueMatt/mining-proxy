@@ -37,16 +37,15 @@ pub struct PoolProviderJob {
 }
 
 #[derive(Clone)]
-pub struct PoolProviderUser {
+pub struct PoolProviderUserJob {
 	pub user_payout_info: PoolUserPayoutInfo,
 	pub difficulty: PoolDifficulty,
-	pub provider: Arc<PoolHandler>,
 }
 
 pub enum PoolProviderAction {
 	ProviderDisconnected,
 	PoolUpdate { info: PoolProviderJob },
-	UserUpdate { update: PoolProviderUser },
+	UserUpdate { update: PoolProviderUserJob },
 }
 
 struct PoolHandlerState {
@@ -438,10 +437,9 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 							} else { None };
 							if cur_difficulty.is_some() {
 								match refs.job_stream.start_send(PoolProviderAction::UserUpdate {
-									update: PoolProviderUser {
+									update: PoolProviderUserJob {
 										user_payout_info: info.clone(),
 										difficulty: cur_difficulty.clone().unwrap(),
-										provider: self.clone(),
 									}
 								}) {
 									Ok(_) => {},
@@ -488,14 +486,13 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 								hash_map::Entry::Vacant(_) => {},
 							}
 							match refs.job_stream.start_send(PoolProviderAction::UserUpdate {
-								update: PoolProviderUser {
+								update: PoolProviderUserJob {
 									user_payout_info: PoolUserPayoutInfo {
 										user_id: difficulty.user_id.clone(),
 										timestamp: *last_timestamp,
 										coinbase_postfix: last_postfix.clone(),
 									},
 									difficulty: difficulty.clone(),
-									provider: self.clone(),
 								}
 							}) {
 								Ok(_) => {},
@@ -556,7 +553,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 struct PoolProviderHolder {
 	is_connected: bool,
 	last_job: Option<PoolProviderJob>,
-	last_user_job: Option<PoolProviderUser>,
+	last_user_job: Option<PoolProviderUserJob>,
 }
 
 pub struct MultiPoolProvider {
@@ -572,10 +569,8 @@ pub struct PoolInfo {
 }
 
 pub struct PoolProviderUserWork {
-	pub payout_info: PoolPayoutInfo,
-	pub user_payout_info: PoolUserPayoutInfo,
-	pub difficulty: PoolDifficulty,
-	pub provider: Arc<PoolHandler>,
+	pub payout_info: PoolProviderJob,
+	pub user_payout_info: PoolProviderUserJob,
 }
 
 impl MultiPoolProvider {
@@ -611,12 +606,10 @@ impl MultiPoolProvider {
 							cur_work.pools[idx].is_connected = true;
 							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_job.is_some() {
 								cur_work.cur_pool = idx;
-								let payout_info = cur_work.pools[idx].last_job.as_ref().unwrap().payout_info.clone();
+								let payout_info = cur_work.pools[idx].last_job.as_ref().unwrap().clone();
 								cur_work.job_tx.start_send(PoolProviderUserWork {
 									payout_info,
-									user_payout_info: update.user_payout_info.clone(),
-									difficulty: update.difficulty.clone(),
-									provider: update.provider.clone(),
+									user_payout_info: update.clone(),
 								}).unwrap();
 							}
 							cur_work.pools[idx].last_user_job = Some(update);
@@ -625,13 +618,10 @@ impl MultiPoolProvider {
 							cur_work.pools[idx].is_connected = true;
 							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_user_job.is_some() {
 								cur_work.cur_pool = idx;
-								let user_payout_info = cur_work.pools[idx].last_user_job.as_ref().unwrap().user_payout_info.clone();
-								let difficulty = cur_work.pools[idx].last_user_job.as_ref().unwrap().difficulty.clone();
+								let user_payout_info = cur_work.pools[idx].last_user_job.as_ref().unwrap().clone();
 								cur_work.job_tx.start_send(PoolProviderUserWork {
-									payout_info: info.payout_info.clone(),
+									payout_info: info.clone(),
 									user_payout_info,
-									difficulty,
-									provider: info.provider.clone(),
 								}).unwrap();
 							}
 							cur_work.pools[idx].last_job = Some(info);
@@ -657,10 +647,8 @@ impl MultiPoolProvider {
 										let msg = {
 											let new_pool = &cur_work.pools[lowest_with_work];
 											PoolProviderUserWork {
-												payout_info: new_pool.last_job.as_ref().unwrap().payout_info.clone(),
-												user_payout_info: new_pool.last_user_job.as_ref().unwrap().user_payout_info.clone(),
-												difficulty: new_pool.last_user_job.as_ref().unwrap().difficulty.clone(),
-												provider: new_pool.last_job.as_ref().unwrap().provider.clone(),
+												payout_info: new_pool.last_job.as_ref().unwrap().clone(),
+												user_payout_info: new_pool.last_user_job.as_ref().unwrap().clone(),
 											}
 										};
 										cur_work.job_tx.start_send(msg).unwrap();

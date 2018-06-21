@@ -37,7 +37,7 @@ pub struct WorkGetter {
 /// If both pool and our_payout_script are None we can't build a job.
 /// If pool or work are invalid, None will sometimes be returned, but invalid work may also be
 /// generated. Generally, pool and work are trusted to be well-formed and compatible.
-pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob, pool: &Option<PoolProviderUserWork>) -> Option<WorkInfo> {
+pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob, pool: Option<&PoolProviderJob>, user: Option<&PoolProviderUserJob>) -> Option<WorkInfo> {
 	let mut template = work.template.clone();
 
 	let mut outputs = Vec::with_capacity(template.appended_coinbase_outputs.len() + 1);
@@ -60,7 +60,7 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 	let work_target = template.target.clone();
 
 	match pool {
-		&Some(PoolProviderUserWork { ref payout_info, ref user_payout_info, ref difficulty, .. }) => {
+		Some(&PoolProviderJob { ref payout_info, .. }) => {
 			let mut constant_value_output = 0;
 			for output in payout_info.appended_outputs.iter() {
 				if output.value > 21000000*100000000 || output.value + constant_value_output > 21000000*100000000 {
@@ -83,13 +83,18 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 
 			outputs.extend_from_slice(&payout_info.appended_outputs[..]);
 
-			template.target = utils::max_le(template.target, difficulty.share_target);
-			template.target = utils::max_le(template.target, difficulty.weak_block_target);
+			match user {
+				Some(&PoolProviderUserJob { ref user_payout_info, ref difficulty }) => {
+					template.target = utils::max_le(template.target, difficulty.share_target);
+					template.target = utils::max_le(template.target, difficulty.weak_block_target);
 
-			if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
-			template.coinbase_postfix.extend_from_slice(&user_payout_info.coinbase_postfix[..]);
+					if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
+					template.coinbase_postfix.extend_from_slice(&user_payout_info.coinbase_postfix[..]);
+				},
+				None => {}
+			}
 		},
-		&None => {
+		None => {
 			if let &Some(ref script) = our_payout_script {
 				println!("No available pool info! Solo mining!");
 				outputs.push(TxOut {
@@ -112,7 +117,7 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 	let tx_data_ref = work.tx_data.clone();
 	let template_ref = template_rc.clone();
 	let work_provider = work.provider.clone();
-	let pool_provider = if let &Some(ref pool_info) = pool {
+	let pool_provider = if let Some(ref pool_info) = pool {
 		Some(pool_info.provider.clone()) } else { None };
 
 	tokio::spawn(solution_rx.for_each(move |nonces: Arc<(WinningNonce, Sha256dHash)>| {
@@ -155,19 +160,21 @@ impl WorkGetter {
 		tokio::spawn(MultiJobProvider::create(job_provider_hosts).for_each(move |work_update| {
 			let mut cur_work = job_work_rc.lock().unwrap();
 			cur_work.cur_work = Some(work_update);
-			if let Some(work) = merge_job_pool(&cur_work.payout_script, cur_work.cur_work.as_ref().unwrap(), &cur_work.cur_pool) {
+			let cur_pool = if let &Some(ref pool) = &cur_work.cur_pool { Some(&pool.payout_info) } else { None };
+			let cur_user = if let &Some(ref user) = &cur_work.cur_pool { Some(&user.user_payout_info) } else { None };
+			if let Some(work) = merge_job_pool(&cur_work.payout_script, cur_work.cur_work.as_ref().unwrap(), cur_pool, cur_user) {
 				job_work_tx.start_send(work).unwrap();
 			}
 			Ok(())
 		}));
 		tokio::spawn(MultiPoolProvider::create(pool_server).for_each(move |pool_update| {
 			let mut cur_work = cur_work_rc.lock().unwrap();
-			cur_work.cur_pool = Some(pool_update);
 			if let Some(ref work) = cur_work.cur_work {
-				if let Some(work) = merge_job_pool(&cur_work.payout_script, work, &cur_work.cur_pool) {
+				if let Some(work) = merge_job_pool(&cur_work.payout_script, work, Some(&pool_update.payout_info), Some(&pool_update.user_payout_info)) {
 					job_tx.start_send(work).unwrap();
 				}
 			}
+			cur_work.cur_pool = Some(pool_update);
 			Ok(())
 		}));
 
