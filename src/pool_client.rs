@@ -104,7 +104,7 @@ pub enum PoolAuthAction {
 }
 
 impl PoolHandler {
-	fn new(expected_auth_key: Option<PublicKey>, user_auth_requests: mpsc::UnboundedReceiver<PoolAuthAction>) -> (Arc<PoolHandler>, mpsc::Receiver<PoolProviderAction>) {
+	pub fn new(expected_auth_key: Option<PublicKey>, user_auth_requests: mpsc::Receiver<PoolAuthAction>) -> (Arc<PoolHandler>, mpsc::Receiver<PoolProviderAction>) {
 		let (work_sender, work_receiver) = mpsc::channel(25);
 
 		let us = Arc::new(PoolHandler {
@@ -129,6 +129,8 @@ impl PoolHandler {
 		});
 
 		let us_auth = us.clone();
+		// TODO: Ensure that user_auth_requests message sending never interferes with share
+		// submission somehow by blocking it
 		tokio::spawn(user_auth_requests.for_each(move |auth_action| {
 			let mut lock = us_auth.state.write().unwrap();
 			let refs = lock.borrow_mut();
@@ -584,7 +586,7 @@ impl MultiPoolProvider {
 
 		tokio::spawn(future::lazy(move || -> Result<(), ()> {
 			for (idx, pool) in pool_hosts.drain(..).enumerate() {
-				let (mut auth_write, auth_read) = mpsc::unbounded();
+				let (mut auth_write, auth_read) = mpsc::channel(5);
 				let (mut handler, mut pool_rx) = PoolHandler::new(None, auth_read);
 				auth_write.start_send(PoolAuthAction::AuthUser(PoolUserAuth {
 					suggested_target: [0xff; 32],

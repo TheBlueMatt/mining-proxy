@@ -224,7 +224,7 @@ fn main() {
 		}
 
 		if stratum_listen_bind.is_some() && mining_listen_bind.is_none() {
-			bind_and_handle!(stratum_listen_bind, StratumServer::new(job_rx), StratumServer);
+			bind_and_handle!(stratum_listen_bind, StratumServer::new(job_rx, None), StratumServer);
 		} else if stratum_listen_bind.is_none() && mining_listen_bind.is_some() {
 			bind_and_handle!(mining_listen_bind, MiningServer::new(job_rx, mining_auth_key.unwrap()), MiningServer);
 		} else {
@@ -237,7 +237,7 @@ fn main() {
 			}).then(|_| {
 				Ok(())
 			}));
-			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx), StratumServer);
+			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx, None), StratumServer);
 			bind_and_handle!(mining_listen_bind, MiningServer::new(mining_rx, mining_auth_key.unwrap()), MiningServer);
 		}
 
