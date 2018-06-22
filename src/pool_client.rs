@@ -46,6 +46,7 @@ pub enum PoolProviderAction {
 	ProviderDisconnected,
 	PoolUpdate { info: PoolProviderJob },
 	UserUpdate { update: PoolProviderUserJob },
+	UserReject { user_id: Vec<u8> },
 }
 
 struct PoolHandlerState {
@@ -465,9 +466,14 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 					}
 				}
 			},
-			PoolMessage::RejectUserAuth { .. } => {
-				println!("Received RejectUserAuth for single-user connection, pool should have disconnected us, but either way, auth must be bad.");
-				return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+			PoolMessage::RejectUserAuth { user_id } => {
+				match us.job_stream.start_send(PoolProviderAction::UserReject { user_id }) {
+					Ok(_) => {},
+					Err(_) => {
+						println!("Pool updating user rejections too quickly");
+						return Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError));
+					}
+				}
 			},
 			PoolMessage::DropUser { .. } => {
 				println!("Received DropUser?");
@@ -603,32 +609,8 @@ impl MultiPoolProvider {
 				let work_rc = cur_work_rc.clone();
 				tokio::spawn(pool_rx.for_each(move |job| {
 					let mut cur_work = work_rc.lock().unwrap();
-					match job {
-						PoolProviderAction::UserUpdate { update } => {
-							cur_work.pools[idx].is_connected = true;
-							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_job.is_some() {
-								cur_work.cur_pool = idx;
-								let payout_info = cur_work.pools[idx].last_job.as_ref().unwrap().clone();
-								cur_work.job_tx.start_send(PoolProviderUserWork {
-									payout_info,
-									user_payout_info: update.clone(),
-								}).unwrap();
-							}
-							cur_work.pools[idx].last_user_job = Some(update);
-						},
-						PoolProviderAction::PoolUpdate { info } => {
-							cur_work.pools[idx].is_connected = true;
-							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_user_job.is_some() {
-								cur_work.cur_pool = idx;
-								let user_payout_info = cur_work.pools[idx].last_user_job.as_ref().unwrap().clone();
-								cur_work.job_tx.start_send(PoolProviderUserWork {
-									payout_info: info.clone(),
-									user_payout_info,
-								}).unwrap();
-							}
-							cur_work.pools[idx].last_job = Some(info);
-						},
-						PoolProviderAction::ProviderDisconnected => {
+					macro_rules! provider_disconnect {
+						() => {
 							if cur_work.pools[idx].is_connected {
 								cur_work.pools[idx].is_connected = false;
 								if cur_work.cur_pool == idx {
@@ -657,7 +639,35 @@ impl MultiPoolProvider {
 									}
 								}
 							}
+						}
+					}
+					match job {
+						PoolProviderAction::UserUpdate { update } => {
+							cur_work.pools[idx].is_connected = true;
+							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_job.is_some() {
+								cur_work.cur_pool = idx;
+								let payout_info = cur_work.pools[idx].last_job.as_ref().unwrap().clone();
+								cur_work.job_tx.start_send(PoolProviderUserWork {
+									payout_info,
+									user_payout_info: update.clone(),
+								}).unwrap();
+							}
+							cur_work.pools[idx].last_user_job = Some(update);
 						},
+						PoolProviderAction::PoolUpdate { info } => {
+							cur_work.pools[idx].is_connected = true;
+							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_user_job.is_some() {
+								cur_work.cur_pool = idx;
+								let user_payout_info = cur_work.pools[idx].last_user_job.as_ref().unwrap().clone();
+								cur_work.job_tx.start_send(PoolProviderUserWork {
+									payout_info: info.clone(),
+									user_payout_info,
+								}).unwrap();
+							}
+							cur_work.pools[idx].last_job = Some(info);
+						},
+						PoolProviderAction::UserReject { .. } => provider_disconnect!(),
+						PoolProviderAction::ProviderDisconnected => provider_disconnect!(),
 					}
 					Ok(())
 				}).then(|_| {
