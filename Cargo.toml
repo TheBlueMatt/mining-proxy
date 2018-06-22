@@ -8,6 +8,10 @@ name = "mining-proxy"
 path = "src/single_user_proxy.rs"
 
 [[bin]]
+name = "pool-proxy"
+path = "src/multi_user_proxy.rs"
+
+[[bin]]
 name = "sample-pool"
 path = "src/sample_pool.rs"
 
