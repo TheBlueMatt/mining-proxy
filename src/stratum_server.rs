@@ -1,4 +1,4 @@
-use msg_framing::{BlockTemplate,WinningNonce,PoolUserAuth,PoolUserPayoutInfo};
+use msg_framing::{BlockTemplate,WinningNonce,PoolUserAuth};
 use work_getter::WorkInfo;
 use pool_client::{PoolAuthAction, PoolProviderUserJob};
 use utils;
@@ -144,50 +144,66 @@ fn bytes_to_hex_insane_order(bytes: &[u8; 32]) -> String {
 
 const EXTRANONCE2_SIZE: usize = 8;
 const VERSION_MASK: u32 = 0x1fffe000;
-fn job_to_json_string(template: &BlockTemplate, prev_changed: bool, user_coinbase_postfix_len: usize) -> String {
-	let mut coinbase_prev = String::with_capacity(4*2 + 1*2 + 36*2 + 1*2 + template.coinbase_prefix.len()*2);
-	push_le_32_hex(template.coinbase_version, &mut coinbase_prev);
-	coinbase_prev.push_str("01");
-	coinbase_prev.push_str("0000000000000000000000000000000000000000000000000000000000000000ffffffff");
+fn job_to_json_string_prefix(template: &BlockTemplate, user_coinbase_postfix_len: usize) -> String {
+	let mut prefix = String::with_capacity(179 + template.coinbase_prefix.len()*2);
+	prefix.push_str("{\"params\":[\""); // 12 chars
+	prefix.push_str(&template.template_timestamp.to_string()); // ~10 chars
+	prefix.push_str("\",\""); // 3 chars
+	prefix.push_str(&bytes_to_hex_insane_order(&template.header_prevblock)); // 64 chars
+	prefix.push_str("\",\""); // 3 chars
+
+	push_le_32_hex(template.coinbase_version, &mut prefix); // 8 bytes
+	prefix.push_str("01"); // 2 chars
+	prefix.push_str("0000000000000000000000000000000000000000000000000000000000000000ffffffff"); // 72 chars
 	// Add size of extranonce + 8 bytes for client id
 	let coinbase_len = template.coinbase_prefix.len() + 8 + EXTRANONCE2_SIZE + template.coinbase_postfix.len() + user_coinbase_postfix_len;
-	coinbase_prev.push(char::from_digit(((coinbase_len >> 4) & 0x0f) as u32, 16).unwrap());
-	coinbase_prev.push(char::from_digit(((coinbase_len >> 0) & 0x0f) as u32, 16).unwrap());
-	utils::push_bytes_hex(&template.coinbase_prefix[..], &mut coinbase_prev);
+	prefix.push(char::from_digit(((coinbase_len >> 4) & 0x0f) as u32, 16).unwrap()); // 1 char
+	prefix.push(char::from_digit(((coinbase_len >> 0) & 0x0f) as u32, 16).unwrap()); // 1 char
+	prefix.push_str(&utils::bytes_to_hex(&template.coinbase_prefix));
 
-	let mut coinbase_post = String::new();
-	utils::push_bytes_hex(&template.coinbase_postfix[..], &mut coinbase_post);
-	push_le_32_hex(template.coinbase_input_sequence, &mut coinbase_post);
-	coinbase_post.push(char::from_digit(((template.appended_coinbase_outputs.len() >> 4) & 0x0f) as u32, 16).unwrap());
-	coinbase_post.push(char::from_digit(((template.appended_coinbase_outputs.len() >> 0) & 0x0f) as u32, 16).unwrap());
-	for output in template.appended_coinbase_outputs.iter() {
-		push_le_32_hex(output.value as u32, &mut coinbase_post);
-		push_le_32_hex((output.value >> 4*8) as u32, &mut coinbase_post);
-		len_to_compact_size(output.script_pubkey.len() as u32, &mut coinbase_post);
-		utils::push_bytes_hex(&output.script_pubkey[..], &mut coinbase_post);
+	prefix.push_str("\",\""); // 3 chars
+	prefix
+}
+
+fn job_to_json_string_postfix(template: &BlockTemplate, prev_changed: bool) -> String {
+	let mut postfix = String::with_capacity(57 + template.coinbase_postfix.len()*2 + 64*template.appended_coinbase_outputs.len() + 66*template.merkle_rhss.len());
+
+	utils::push_bytes_hex(&template.coinbase_postfix[..], &mut postfix);
+	push_le_32_hex(template.coinbase_input_sequence, &mut postfix); // 8 chars
+	postfix.push(char::from_digit(((template.appended_coinbase_outputs.len() >> 4) & 0x0f) as u32, 16).unwrap()); // 1 char
+	postfix.push(char::from_digit(((template.appended_coinbase_outputs.len() >> 0) & 0x0f) as u32, 16).unwrap()); // 1 char
+	for output in template.appended_coinbase_outputs.iter() { // ~62 chars per entry (rounded up to 64)
+		push_le_32_hex(output.value as u32, &mut postfix); // 8 chars
+		push_le_32_hex((output.value >> 4*8) as u32, &mut postfix); // 8 chars
+		len_to_compact_size(output.script_pubkey.len() as u32, &mut postfix); // ~2 chars
+		utils::push_bytes_hex(&output.script_pubkey[..], &mut postfix); // ~44 chars
 	}
-	push_le_32_hex(template.coinbase_locktime, &mut coinbase_post);
+	push_le_32_hex(template.coinbase_locktime, &mut postfix); // 8 chars
 
-	let mut merkle_rhss = Vec::with_capacity(template.merkle_rhss.len());
-	for rhs in template.merkle_rhss.iter() {
-		merkle_rhss.push(utils::bytes_to_hex(rhs));
+	postfix.push_str("\",["); // 3 chars
+
+	for (idx, rhs) in template.merkle_rhss.iter().enumerate() { // 66 chars per entry + 1
+		postfix.push('"');
+		utils::push_bytes_hex(rhs, &mut postfix);
+		postfix.push('"');
+		if idx != template.merkle_rhss.len() - 1 {
+			postfix.push(',');
+		}
+	}
+	postfix.push_str("],\""); // 3 chars
+	postfix.push_str(&be32_to_hex(template.header_version)); // 8 chars
+	postfix.push_str("\",\""); // 3 chars
+	postfix.push_str(&be32_to_hex(template.header_nbits)); // 8 chars
+	postfix.push_str("\",\""); // 3 chars
+	postfix.push_str(&be32_to_hex(template.header_time)); // 8 chars
+	postfix.push_str("\","); // 2 chars
+	if prev_changed {
+		postfix.push_str("true],\"id\":null,\"method\":\"mining.notify\"}");
+	} else {
+		postfix.push_str("false],\"id\":null,\"method\":\"mining.notify\"}");
 	}
 
-	json!({
-		"params": [
-			template.template_timestamp.to_string(),
-			bytes_to_hex_insane_order(&template.header_prevblock),
-			coinbase_prev,
-			coinbase_post,
-			merkle_rhss,
-			be32_to_hex(template.header_version),
-			be32_to_hex(template.header_nbits),
-			be32_to_hex(template.header_time),
-			prev_changed,
-		],
-		"id": serde_json::Value::Null,
-		"method": "mining.notify",
-	}).to_string()
+	postfix
 }
 
 fn target_to_difficulty_string(target: &[u8; 32]) -> String {
@@ -203,21 +219,6 @@ fn job_to_difficulty_string(template: &BlockTemplate) -> String {
 	target_to_difficulty_string(&template.target)
 }
 
-fn job_to_extranonce_string(user_job: &PoolUserPayoutInfo, client_id: u64) -> String {
-	let mut client_id_str = String::with_capacity(16 + user_job.coinbase_postfix.len()*2);
-	push_le_32_hex(client_id as u32, &mut client_id_str);
-	push_le_32_hex((client_id >> 32) as u32, &mut client_id_str);
-	utils::push_bytes_hex(&user_job.coinbase_postfix, &mut client_id_str);
-	json!({
-		"params": [
-			client_id_str,
-			EXTRANONCE2_SIZE,
-		],
-		"id": serde_json::Value::Null,
-		"method": "mining.set_extranonce",
-	}).to_string()
-}
-
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
 const ERR: () = "You need at least 32 bit pointers (well, usize, but we'll assume they're the same) to use any of this stuff";
 
@@ -228,16 +229,19 @@ struct StratumClient {
 	last_send: Mutex<Instant>,
 	/// mining.subscribe has been received
 	subscribed: AtomicBool,
+	/// mining.authorize has been received
 	user_id: Mutex<Option<Vec<u8>>>,
-	/// We've received everything we need for this client to mine, and are now sending them job
-	/// updates and exect to receive shares from them.
-	/// Note that user_id and subscribed may be set without this if we're waiting on the upstream
-	/// auth provider to respond.
+	/// User has subscribed and authed (or we're not doing upstream auth). We may not have received
+	/// work for this user from the upstream auth provider, but we're ready to send this client
+	/// jobs.
 	mining: AtomicBool,
 	cur_coinbase_postfix: Mutex<Vec<u8>>,
 }
 impl StratumClient {
 	fn attempt_send(&self, item: String) -> bool {
+		if self.needs_close.load(Ordering::Acquire) {
+			return false;
+		}
 		let mut stream = self.stream.lock().unwrap();
 		if match stream.start_send(item) {
 			Ok(sink) => sink.is_ready(),
@@ -249,6 +253,7 @@ impl StratumClient {
 	}
 }
 
+#[derive(Clone)]
 struct StratumUser {
 	clients: Vec<Arc<StratumClient>>,
 	cur_job: Option<PoolProviderUserJob>,
@@ -264,7 +269,10 @@ pub struct StratumServer {
 }
 
 pub enum UserUpdate {
-	WorkUpdate(PoolProviderUserJob),
+	WorkUpdate {
+		user_id: Vec<u8>,
+		user_info: PoolProviderUserJob,
+	},
 	DropUser {
 		user_id: Vec<u8>
 	},
@@ -300,22 +308,37 @@ impl StratumServer {
 				last_prevblock = job.template.header_prevblock;
 			}
 			let diff_changed = need_work_diff && last_diff != job.template.target;
-			let mut diff_str = String::new();
-			if diff_changed {
+			let diff_str = if diff_changed {
 				last_diff = job.template.target;
-				diff_str = job_to_difficulty_string(&job.template);
-			}
+				job_to_difficulty_string(&job.template)
+			} else { String::new() };
 			let user_coinbase_postfix_len = if need_work_diff { 0 } else { us_cp.user_coinbase_postfix_len.load(Ordering::Acquire) };
-			let job_json = job_to_json_string(&job.template, prev_changed, user_coinbase_postfix_len);
+			let job_json_prefix = job_to_json_string_prefix(&job.template, user_coinbase_postfix_len);
+			let job_json_postfix = job_to_json_string_postfix(&job.template, prev_changed);
 
-			let clients = us_cp.clients.lock().unwrap().0.clone();
-			for client in clients {
-				if !client.mining.load(Ordering::Acquire) { continue; }
-				if diff_changed {
-					client.attempt_send(diff_str.clone());
+			if need_work_diff {
+				let job_json = job_json_prefix + &job_json_postfix;
+				let clients = us_cp.clients.lock().unwrap().0.clone();
+				for client in clients {
+					if !client.mining.load(Ordering::Acquire) { continue; }
+					if diff_changed {
+						client.attempt_send(diff_str.clone());
+					}
+					client.attempt_send(job_json.clone());
+					*client.last_send.lock().unwrap() = Instant::now();
 				}
-				client.attempt_send(job_json.clone());
-				*client.last_send.lock().unwrap() = Instant::now();
+			} else {
+				let users: Vec<StratumUser> = us_cp.users.lock().unwrap().values().map(|user| (*user).clone()).collect();
+				for user in users {
+					if let &Some(ref job) = &user.cur_job {
+						let job_json = job_json_prefix.clone() + &utils::bytes_to_hex(&job.coinbase_postfix) + &job_json_postfix;
+						for client in user.clients.iter() {
+							if !client.mining.load(Ordering::Acquire) { continue; }
+							client.attempt_send(job_json.clone());
+							*client.last_send.lock().unwrap() = Instant::now();
+						}
+					}
+				}
 			}
 
 			future::result(Ok(()))
@@ -325,32 +348,22 @@ impl StratumServer {
 		if let Some(users) = user_job_stream {
 			tokio::spawn(users.for_each(move |user_update| {
 				match user_update {
-					UserUpdate::WorkUpdate(user_info) => {
-						us_cp.user_coinbase_postfix_len.store(user_info.user_payout_info.coinbase_postfix.len(), Ordering::Release);
+					UserUpdate::WorkUpdate{ user_id, user_info } => {
+						us_cp.user_coinbase_postfix_len.store(user_info.coinbase_postfix.len(), Ordering::Release);
 						let (need_postfix_update, need_diff_update, clients) = {
 							let mut users = us_cp.users.lock().unwrap();
-							if let Some(user) = users.get_mut(&user_info.user_payout_info.user_id) {
+							if let Some(user) = users.get_mut(&user_id) {
 								let postfix_update =  user.cur_job.is_none() ||
-									user.cur_job.as_ref().unwrap().user_payout_info.coinbase_postfix != user_info.user_payout_info.coinbase_postfix;
+									user.cur_job.as_ref().unwrap().coinbase_postfix != user_info.coinbase_postfix;
 								let diff_update = user.cur_job.is_none() ||
-									user.cur_job.as_ref().unwrap().difficulty.share_target != user_info.difficulty.share_target ||
-									user.cur_job.as_ref().unwrap().difficulty.weak_block_target != user_info.difficulty.weak_block_target;
+									user.cur_job.as_ref().unwrap().target != user_info.target;
 								user.cur_job = Some(user_info.clone());
 								(postfix_update, diff_update, user.clients.clone())
 							} else { (false, false, Vec::new()) }
 						};
 
-						if need_postfix_update {
-							for client in clients.iter() {
-								if client.subscribed.load(Ordering::Acquire) {
-									*client.cur_coinbase_postfix.lock().unwrap() = user_info.user_payout_info.coinbase_postfix.clone();
-									client.attempt_send(job_to_extranonce_string(&user_info.user_payout_info, client.client_id));
-									client.mining.store(true, Ordering::Release);
-								}
-							}
-						}
 						if need_diff_update {
-							let diff_string = target_to_difficulty_string(&utils::max_le(user_info.difficulty.share_target, user_info.difficulty.weak_block_target));
+							let diff_string = target_to_difficulty_string(&user_info.target);
 							for client in clients.iter() {
 								if client.mining.load(Ordering::Acquire) {
 									client.attempt_send(diff_string.clone());
@@ -358,7 +371,7 @@ impl StratumServer {
 							}
 						}
 
-						if need_postfix_update || need_diff_update {
+						if need_diff_update || need_postfix_update {
 							let last_job = {
 								let jobs = us_cp.jobs.read().unwrap();
 								if let Some((_, v)) = jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
@@ -366,11 +379,15 @@ impl StratumServer {
 								} else { return Ok(()); }
 							};
 							let now = Instant::now();
-							let job_string = job_to_json_string(&last_job.template, false, user_info.user_payout_info.coinbase_postfix.len());
+							let job_prefix = job_to_json_string_prefix(&last_job.template, user_info.coinbase_postfix.len());
+							let job_postfix = job_to_json_string_postfix(&last_job.template, true);
+							let job_string = job_prefix + &utils::bytes_to_hex(&user_info.coinbase_postfix) + &job_postfix;
+
 							for client in clients.iter() {
 								if client.mining.load(Ordering::Acquire) {
 									client.attempt_send(job_string.clone());
 									*client.last_send.lock().unwrap() = now;
+									*client.cur_coinbase_postfix.lock().unwrap() = user_info.coinbase_postfix.clone();
 								}
 							}
 						}
@@ -437,12 +454,30 @@ impl StratumServer {
 				Some(job) => {
 					let now = Instant::now();
 					let send_target = now - Duration::from_secs(29);
-					let job_string = job_to_json_string(&job.template, false, us_timer.user_coinbase_postfix_len.load(Ordering::Acquire));
-					let mut clients = us_timer.clients.lock().unwrap().0.clone();
-					for client in clients.iter() {
-						if client.mining.load(Ordering::Acquire) && *client.last_send.lock().unwrap() < send_target {
-							client.attempt_send(job_string.clone());
-							*client.last_send.lock().unwrap() = now;
+					let job_json_prefix = job_to_json_string_prefix(&job.template, us_timer.user_coinbase_postfix_len.load(Ordering::Acquire));
+					let job_json_postfix = job_to_json_string_postfix(&job.template, false);
+
+					if need_work_diff {
+						let job_json = job_json_prefix + &job_json_postfix;
+						let clients = us_timer.clients.lock().unwrap().0.clone();
+						for client in clients {
+							if client.mining.load(Ordering::Acquire) && *client.last_send.lock().unwrap() < send_target {
+								client.attempt_send(job_json.clone());
+								*client.last_send.lock().unwrap() = Instant::now();
+							}
+						}
+					} else {
+						let users: Vec<StratumUser> = us_timer.users.lock().unwrap().values().map(|user| (*user).clone()).collect();
+						for user in users {
+							if let &Some(ref job) = &user.cur_job {
+								let job_json = job_json_prefix.clone() + &utils::bytes_to_hex(&job.coinbase_postfix) + &job_json_postfix;
+								for client in user.clients.iter() {
+									if client.mining.load(Ordering::Acquire) && *client.last_send.lock().unwrap() < send_target {
+										client.attempt_send(job_json.clone());
+										*client.last_send.lock().unwrap() = Instant::now();
+									}
+								}
+							}
 						}
 					}
 				}, None => {}
@@ -547,20 +582,20 @@ impl StratumServer {
 							EXTRANONCE2_SIZE,
 						]);
 
-					let mining = us.user_auth_requests.is_none() || client.user_id.lock().unwrap().is_some();
-					if mining {
+					client.subscribed.store(true, Ordering::Release);
+
+					if us.user_auth_requests.is_none() {
 						let jobs = us.jobs.read().unwrap();
 						if let Some(job) = jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 							let diff_string = job_to_difficulty_string(&job.1.template);
 							send_message!(diff_string);
-							let job_string = job_to_json_string(&job.1.template, true, 0);
-							send_message!(job_string);
+							send_message!(job_to_json_string_prefix(&job.1.template, 0) + &job_to_json_string_postfix(&job.1.template, true));
+							*client.last_send.lock().unwrap() = Instant::now();
 						}
 					}
-
-					*client.last_send.lock().unwrap() = Instant::now();
-					client.subscribed.store(true, Ordering::Release);
-					if mining {
+					if us.user_auth_requests.is_none() || client.user_id.lock().unwrap().is_some() {
+						// If user_id is_some we'll send this client work within a second on the
+						// timer event.
 						client.mining.store(true, Ordering::Release);
 					}
 				},
@@ -716,16 +751,15 @@ impl StratumServer {
 								*registered_id = Some(user_id.clone());
 							}
 
-							let job_user_coinbase_postfix_len = {
+							let job_user_coinbase_postfix = {
 								let mut users = us.users.lock().unwrap();
 								match users.entry(user_id.clone()) {
 									hash_map::Entry::Occupied(mut e) => {
 										e.get_mut().clients.push(client.clone());
 										if let &Some(ref job) = &e.get().cur_job {
 											send_response!(serde_json::Value::Null, true);
-											send_message!(job_to_extranonce_string(&job.user_payout_info, client.client_id));
-											send_message!(target_to_difficulty_string(&utils::max_le(job.difficulty.share_target, job.difficulty.weak_block_target)));
-											Some(job.user_payout_info.coinbase_postfix.len())
+											send_message!(target_to_difficulty_string(&job.target));
+											Some(job.coinbase_postfix.clone())
 										} else {
 											None
 										}
@@ -756,14 +790,23 @@ impl StratumServer {
 								}
 							};
 
-							if let Some(user_coinbase_postfix_len) = job_user_coinbase_postfix_len {
-								let jobs = us.jobs.read().unwrap();
-								if let Some(job) = jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
-									let job_string = job_to_json_string(&job.1.template, true, user_coinbase_postfix_len);
-									send_message!(job_string);
-									*client.last_send.lock().unwrap() = Instant::now();
-								}
+							let should_notify = if client.subscribed.load(Ordering::Acquire) {
 								client.mining.store(true, Ordering::Release);
+								true
+							} else { false };
+
+							if let Some(user_coinbase_postfix) = job_user_coinbase_postfix {
+								if should_notify {
+									let jobs = us.jobs.read().unwrap();
+									if let Some(job) = jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
+										let job_prefix = job_to_json_string_prefix(&job.1.template, user_coinbase_postfix.len());
+										let job_postfix = job_to_json_string_postfix(&job.1.template, true);
+										let job_string = job_prefix + &utils::bytes_to_hex(&user_coinbase_postfix) + &job_postfix;
+										send_message!(job_string);
+										*client.last_send.lock().unwrap() = Instant::now();
+									}
+								}
+								*client.cur_coinbase_postfix.lock().unwrap() = user_coinbase_postfix;
 							}
 						},
 						&None => {

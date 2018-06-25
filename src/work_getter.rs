@@ -84,12 +84,11 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 			outputs.extend_from_slice(&payout_info.appended_outputs[..]);
 
 			match user {
-				Some(&PoolProviderUserJob { ref user_payout_info, ref difficulty }) => {
-					template.target = utils::max_le(template.target, difficulty.share_target);
-					template.target = utils::max_le(template.target, difficulty.weak_block_target);
+				Some(&PoolProviderUserJob { ref coinbase_postfix, ref target }) => {
+					template.target = utils::max_le(template.target, *target);
 
 					if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
-					template.coinbase_postfix.extend_from_slice(&user_payout_info.coinbase_postfix[..]);
+					template.coinbase_postfix.extend_from_slice(coinbase_postfix);
 				},
 				None => {}
 			}

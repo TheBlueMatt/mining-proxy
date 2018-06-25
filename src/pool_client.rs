@@ -38,14 +38,14 @@ pub struct PoolProviderJob {
 
 #[derive(Clone)]
 pub struct PoolProviderUserJob {
-	pub user_payout_info: PoolUserPayoutInfo,
-	pub difficulty: PoolDifficulty,
+	pub coinbase_postfix: Vec<u8>,
+	pub target: [u8; 32],
 }
 
 pub enum PoolProviderAction {
 	ProviderDisconnected,
 	PoolUpdate { info: PoolProviderJob },
-	UserUpdate { update: PoolProviderUserJob },
+	UserUpdate { user_id: Vec<u8>, update: PoolProviderUserJob },
 	UserReject { user_id: Vec<u8> },
 }
 
@@ -438,11 +438,12 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 							let cur_difficulty = if *last_timestamp != 0 {
 								refs.coinbase_postfix_to_difficulty.remove(last_postfix)
 							} else { None };
-							if cur_difficulty.is_some() {
+							if let &Some(ref difficulty) = &cur_difficulty {
 								match refs.job_stream.start_send(PoolProviderAction::UserUpdate {
+									user_id: info.user_id.clone(),
 									update: PoolProviderUserJob {
-										user_payout_info: info.clone(),
-										difficulty: cur_difficulty.clone().unwrap(),
+										coinbase_postfix: info.coinbase_postfix.clone(),
+										target: utils::max_le(difficulty.share_target.clone(), difficulty.weak_block_target.clone()),
 									}
 								}) {
 									Ok(_) => {},
@@ -455,8 +456,8 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 							println!("Received new user payout info!");
 							*last_timestamp = info.timestamp;
 							*last_postfix = info.coinbase_postfix.clone();
-							if cur_difficulty.is_some() {
-								refs.coinbase_postfix_to_difficulty.insert(info.coinbase_postfix, cur_difficulty.unwrap());
+							if let Some(difficulty) = cur_difficulty {
+								refs.coinbase_postfix_to_difficulty.insert(info.coinbase_postfix, difficulty);
 							}
 						}
 					},
@@ -494,13 +495,10 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 								hash_map::Entry::Vacant(_) => {},
 							}
 							match refs.job_stream.start_send(PoolProviderAction::UserUpdate {
+								user_id: difficulty.user_id.clone(),
 								update: PoolProviderUserJob {
-									user_payout_info: PoolUserPayoutInfo {
-										user_id: difficulty.user_id.clone(),
-										timestamp: *last_timestamp,
-										coinbase_postfix: last_postfix.clone(),
-									},
-									difficulty: difficulty.clone(),
+									coinbase_postfix: last_postfix.clone(),
+									target: utils::max_le(difficulty.share_target.clone(), difficulty.weak_block_target.clone()),
 								}
 							}) {
 								Ok(_) => {},
@@ -642,7 +640,7 @@ impl MultiPoolProvider {
 						}
 					}
 					match job {
-						PoolProviderAction::UserUpdate { update } => {
+						PoolProviderAction::UserUpdate { update, .. } => {
 							cur_work.pools[idx].is_connected = true;
 							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_job.is_some() {
 								cur_work.cur_pool = idx;
