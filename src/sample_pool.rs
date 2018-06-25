@@ -400,12 +400,13 @@ fn main() {
 										let mut client_coinbase_postfix = server_id_vec.clone();
 										client_coinbase_postfix.extend_from_slice(&utils::le64_to_array(client_id));
 
+										let initial_target = cmp::min(MAX_TARGET_LEADING_0S, cmp::max(MIN_TARGET_LEADING_0S, cmp::max(utils::count_leading_zeros(&info.suggested_target) + 1, utils::count_leading_zeros(&info.minimum_target) + 1)));
 										let user = Arc::new(PerUserClientRef {
 											send_stream: send_sink.clone(),
 											client_id,
 											user_id: info.user_id.clone(),
 											min_target: utils::count_leading_zeros(&info.minimum_target) + 1,
-											cur_target: AtomicUsize::new(cmp::min(MAX_TARGET_LEADING_0S, cmp::max(MIN_TARGET_LEADING_0S, utils::count_leading_zeros(&info.suggested_target) + 1)) as usize),
+											cur_target: AtomicUsize::new(initial_target as usize),
 											accepted_shares: AtomicUsize::new(0),
 										});
 										client_ids.insert(client_id, info.user_id.clone());
@@ -426,8 +427,8 @@ fn main() {
 											difficulty: PoolDifficulty {
 												user_id: info.user_id.clone(),
 												timestamp,
-												share_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8),
-												weak_block_target: utils::leading_0s_to_target(user.cur_target.load(Ordering::Acquire) as u8 + WEAK_BLOCK_RATIO_0S),
+												share_target: utils::leading_0s_to_target(initial_target),
+												weak_block_target: utils::leading_0s_to_target(initial_target + WEAK_BLOCK_RATIO_0S),
 											},
 										});
 										false
