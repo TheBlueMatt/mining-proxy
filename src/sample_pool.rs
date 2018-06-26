@@ -1,19 +1,25 @@
 // Simple sample pool server that implements most of what you need, note that it does NOT currently
 // check for duplicate shares...
 
+extern crate base64;
 extern crate bitcoin;
 extern crate bytes;
 extern crate crypto;
 extern crate futures;
+extern crate hyper;
 extern crate tokio;
 extern crate tokio_io;
 extern crate tokio_codec;
 extern crate secp256k1;
+extern crate serde_json;
 
 mod msg_framing;
 use msg_framing::*;
 
 mod utils;
+
+mod rpc_client;
+use rpc_client::*;
 
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::blockdata::block::BlockHeader;
@@ -79,15 +85,18 @@ struct PerUserClientRef {
 }
 
 fn main() {
-	println!("USAGE: sample-pool --listen_bind=IP:port --auth_key=base58privkey --payout_address=addr [--server_id=up_to_36_byte_string_for_coinbase]");
+	println!("USAGE: sample-pool --listen_bind=IP:port --auth_key=base58privkey --payout_address=addr [--server_id=up_to_36_byte_string_for_coinbase] --bitcoind_rpc_path=user:pass@host:port");
 	println!("--listen_bind - the address to bind to");
 	println!("--auth_key - the auth key to use to authenticate to clients");
 	println!("--payout_address - the Bitcoin address on which to receive payment");
+	println!("--bitcoind_rpc_path - the bitcoind RPC server for checking weak block validity");
+	println!("                      and header submission");
 
 	let mut listen_bind = None;
 	let mut auth_key = None;
 	let mut payout_addr = None;
 	let mut server_id = None;
+	let mut rpc_path = None;
 
 	for arg in env::args().skip(1) {
 		if arg.starts_with("--listen_bind") {
@@ -143,15 +152,41 @@ fn main() {
 				println!("server_id cannot be longer than 36 bytes");
 				return;
 			}
+		} else if arg.starts_with("--bitcoind_rpc_path") {
+			if rpc_path.is_some() {
+				println!("Cannot specify multiple bitcoinds");
+				return;
+			}
+			rpc_path = Some(arg.split_at(20).1.to_string());
 		} else {
 			println!("Unkown arg: {}", arg);
 			return;
 		}
 	}
 
-	if listen_bind.is_none() || auth_key.is_none() || payout_addr.is_none() {
+	if listen_bind.is_none() || auth_key.is_none() || payout_addr.is_none() || rpc_path.is_none() {
 		println!("Need to specify all but server_id parameters");
 		return;
+	}
+
+	let rpc_client = {
+		let path = rpc_path.unwrap();
+		let path_parts: Vec<&str> = path.split('@').collect();
+		if path_parts.len() != 2 {
+			println!("Bad RPC URL provided");
+			return;
+		}
+		RPCClient::new(path_parts[0], path_parts[1])
+	};
+
+	{
+		println!("Checking validity of RPC URL");
+		let mut thread_rt = tokio::runtime::current_thread::Runtime::new().unwrap();
+		match thread_rt.block_on(rpc_client.make_rpc_call("getnetworkinfo")) {
+			Ok(v) => v,
+			Err(_) => { panic!("Bad RPC URL"); },
+		};
+		println!("Success! Starting up...");
 	}
 
 	let mut rt = tokio::runtime::Builder::new().build().unwrap();
