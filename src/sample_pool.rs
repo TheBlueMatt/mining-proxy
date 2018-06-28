@@ -44,10 +44,10 @@ use secp256k1::Secp256k1;
 
 use std::{cmp, env, io, mem};
 use std::str::FromStr;
-use std::sync::{Arc, Weak, Mutex};
+use std::sync::{Arc, Weak, Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
-use std::collections::{hash_map, HashMap};
+use std::collections::{hash_map, HashMap, HashSet};
 
 // These are useful to plug in business logic into:
 fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
@@ -82,6 +82,101 @@ struct PerUserClientRef {
 	min_target: u8,
 	cur_target: AtomicUsize,
 	accepted_shares: AtomicUsize,
+}
+
+struct AllowedBlocksInfo {
+	/// hash -> chainwork
+	allowed_prev_blocks: HashMap<[u8; 32], [u8; 32]>,
+	best_chainwork: [u8; 32],
+	cur_target: [u8; 32],
+	old_prev_blocks: HashSet<[u8; 32]>,
+	tentative_submitted_prev_blocks: HashSet<[u8; 32]>,
+}
+enum HeaderStatus {
+	TentativeAccept,
+	TentativeReject,
+	Absurd,
+}
+impl AllowedBlocksInfo {
+	fn update_chainwork(&mut self, chainwork: [u8; 32]) {
+		println!("New best-seen-block, rejecting old blocks now!");
+		let old_prev_blocks = &mut self.old_prev_blocks;
+		self.allowed_prev_blocks.retain(|prev_hash, old_chainwork| {
+			if !utils::does_hash_meet_target(&chainwork, old_chainwork) { // !(chainwork <= old_chainwork) ie old_chainwork < chainwork
+				old_prev_blocks.insert(prev_hash.clone());
+				false
+			} else { true }
+		});
+		self.best_chainwork = chainwork;
+	}
+
+	fn check_block(&mut self, header: &serde_json::Value) {
+		if let Some(serde_json::Value::String(chainwork_v)) = header.get("chainwork") {
+			if let Some(serde_json::Value::String(hash_v)) = header.get("hash") {
+				if let Some(serde_json::Value::Number(confs_v)) = header.get("confirmations") {
+					if let Some(confs) = confs_v.as_i64() {
+						if let Some(chainwork) = utils::hex_to_u256_rev(&chainwork_v) {
+							if let Some(hash) = utils::hex_to_u256_rev(&hash_v) {
+								let equal_or_better = utils::does_hash_meet_target(&self.best_chainwork, &chainwork);
+								if self.best_chainwork == chainwork {
+									println!("New header tied with current tip!");
+									self.allowed_prev_blocks.insert(hash, chainwork);
+								} else if confs >= 0 && equal_or_better {
+									self.update_chainwork(chainwork.clone());
+									self.allowed_prev_blocks.insert(hash, chainwork);
+								} else if equal_or_better {
+									println!("Got new header with more work, waiting on block validation to reject stale shares");
+									self.allowed_prev_blocks.insert(hash, chainwork);
+								} else {
+									self.old_prev_blocks.insert(hash);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fn submit_header(us: &Arc<RwLock<Self>>, header: BlockHeader, client: &Arc<RPCClient>) -> HeaderStatus {
+		let blockhash = header.bitcoin_hash();
+		let mut hash_arr = [0; 32];
+		hash_arr[..].copy_from_slice(&blockhash[..]);
+		if utils::count_leading_zeros(&hash_arr) < 32 {
+			// They can't even be mining after genesis, kick them
+			return HeaderStatus::Absurd;
+		}
+
+		let mut us_lock = us.write().unwrap();
+		if !utils::does_hash_meet_target_div4(&hash_arr, &us_lock.cur_target) {
+			// They are definitely out-of-date, but may not be trying to DoS us (or we're
+			// out-of-date and still syncing)
+			return HeaderStatus::TentativeReject;
+		}
+
+		// We'd really like to only use div4 here, since that is actually the consensus-rule, but
+		// BCash might conceivably get 25% of Bitcoin's hashrate, allowing someone to (very briefly)
+		// mine BCash-based shares. Once BCash dies off we should just remove this check.
+		let res = if utils::does_hash_meet_target_div2(&hash_arr, &us_lock.cur_target) {
+			us_lock.tentative_submitted_prev_blocks.insert(hash_arr);
+			HeaderStatus::TentativeAccept
+		} else { HeaderStatus::TentativeReject };
+
+		let us_clone = us.clone();
+		let client_clone = client.clone();
+		tokio::spawn(client.make_rpc_call("submitblockheader", &vec![&("\"".to_string() + &network::serialize::serialize_hex(&header).unwrap() + "\"")]).then(move |_| {
+			client_clone.make_rpc_call("getblockheader", &vec![&("\"".to_string() + &blockhash.be_hex_string() + "\"")]).then(move |header_data_option| {
+				let mut us_lock = us_clone.write().unwrap();
+				if let Ok(header_data) = header_data_option {
+					us_lock.check_block(&header_data);
+				}
+				us_lock.tentative_submitted_prev_blocks.remove(&hash_arr);
+				Ok(())
+			})
+		}));
+
+		res
+	}
 }
 
 fn main() {
@@ -169,6 +264,14 @@ fn main() {
 		return;
 	}
 
+	let block_info = Arc::new(RwLock::new(AllowedBlocksInfo {
+		allowed_prev_blocks: HashMap::new(),
+		best_chainwork: [0; 32],
+		cur_target: [0xff; 32],
+		old_prev_blocks: HashSet::new(),
+		tentative_submitted_prev_blocks: HashSet::new(),
+	}));
+
 	let rpc_client = {
 		let path = rpc_path.unwrap();
 		let path_parts: Vec<&str> = path.split('@').collect();
@@ -176,20 +279,77 @@ fn main() {
 			println!("Bad RPC URL provided");
 			return;
 		}
-		RPCClient::new(path_parts[0], path_parts[1])
+		Arc::new(RPCClient::new(path_parts[0], path_parts[1]))
 	};
 
 	{
 		println!("Checking validity of RPC URL");
 		let mut thread_rt = tokio::runtime::current_thread::Runtime::new().unwrap();
-		match thread_rt.block_on(rpc_client.make_rpc_call("getnetworkinfo", &vec![])) {
-			Ok(v) => v,
-			Err(_) => { panic!("Bad RPC URL"); },
-		};
+		let block_info_clone = block_info.clone();
+		let rpc_client = rpc_client.clone();
+		if let Err(_) = thread_rt.block_on(rpc_client.make_rpc_call("getblockcount", &Vec::new()).and_then(move |block_count| {
+			let min_height = block_count.as_i64().unwrap();
+			rpc_client.make_rpc_call("getchaintips", &Vec::new()).and_then(move |chaintips| {
+				let mut all_futures = Vec::new();
+				for entry in chaintips.as_array().unwrap() {
+					if entry.get("height").unwrap().as_i64().unwrap() >= min_height {
+						let status = entry.get("status").unwrap().as_str().unwrap();
+						if status != "invalid" {
+							let block_info = block_info_clone.clone();
+							all_futures.push(rpc_client.make_rpc_call("getblockheader", &vec![&("\"".to_string() + entry.get("hash").unwrap().as_str().unwrap() + "\"")]).and_then(move |header| {
+								block_info.write().unwrap().check_block(&header);
+								Ok(())
+							}));
+						}
+					}
+				}
+				future::join_all(all_futures)
+			})
+		})) {
+			println!("Failed");
+			return;
+		}
 		println!("Success! Starting up...");
 	}
 
 	let mut rt = tokio::runtime::Builder::new().build().unwrap();
+
+	let block_info_clone = block_info.clone();
+	let rpc_client_clone = rpc_client.clone();
+	let best_block_hash = Arc::new(Mutex::new(String::new()));
+	rt.spawn(timer::Interval::new(Instant::now() + Duration::from_secs(1), Duration::from_millis(50)).for_each(move |_| {
+		let best_block_hash_clone = best_block_hash.clone();
+		let block_info = block_info_clone.clone();
+		rpc_client_clone.make_rpc_call("getblockchaininfo", &Vec::new()).and_then(move |chain_info| {
+			if let Some(serde_json::Value::String(besthash_v)) = chain_info.get("bestblockhash") {
+				if *besthash_v != *best_block_hash_clone.lock().unwrap() {
+					if let Some(serde_json::Value::String(targethash_v)) = chain_info.get("target") {
+						if let Some(serde_json::Value::String(chainwork_v)) = chain_info.get("chainwork") {
+							if let Some(targethash) = utils::hex_to_u256_rev(&targethash_v) {
+								if let Some(chainwork) = utils::hex_to_u256_rev(&chainwork_v) {
+									if let Some(besthash) = utils::hex_to_u256_rev(&besthash_v) {
+										*best_block_hash_clone.lock().unwrap() = besthash_v.to_string();
+										let mut info_lock = block_info.write().unwrap();
+										info_lock.cur_target = targethash;
+										info_lock.update_chainwork(chainwork.clone());
+										info_lock.allowed_prev_blocks.insert(besthash, chainwork);
+									}
+								}
+							}
+						}
+					} else {
+						println!("WARNING: RPC server is incompatible (not providing a getblockchaininfo target)!");
+					}
+				}
+			}
+			future::result(Ok(()))
+		}).then(|_| {
+			future::result(Ok(()))
+		})
+	}).then(|_| {
+		future::result(Ok(()))
+	}));
+
 	rt.spawn(futures::lazy(move || -> Result<(), ()> {
 		match net::TcpListener::bind(&listen_bind.unwrap()) {
 			Ok(listener) => {
@@ -283,6 +443,9 @@ fn main() {
 					let mut client_version = None;
 					let mut last_weak_block = None;
 
+					let block_info_clone = block_info.clone();
+					let rpc_client_clone = rpc_client.clone();
+
 					tokio::spawn(rx.for_each(move |msg| {
 						macro_rules! send_response {
 							($msg: expr) => {
@@ -301,6 +464,46 @@ fn main() {
 										user_tag_2: $share_msg.user_tag_2.clone(),
 										reason: $reason,
 									});
+								}
+							}
+						}
+
+						macro_rules! check_prev_hash {
+							($msg: expr, $header_option: expr, $extra_fail_cmd: expr) => {
+								let need_submit = {
+									let allowed_lock = block_info_clone.read().unwrap();
+									if !allowed_lock.allowed_prev_blocks.contains_key(&$msg.header_prevblock) {
+										if !allowed_lock.tentative_submitted_prev_blocks.contains(&$msg.header_prevblock) {
+											if allowed_lock.old_prev_blocks.contains(&$msg.header_prevblock) {
+												reject_share!($msg, ShareRejectedReason::StalePrevBlock);
+												$extra_fail_cmd;
+												return future::result(Ok(()));
+											} else {
+												if $header_option.is_some() {
+													true
+												} else {
+													reject_share!($msg, ShareRejectedReason::StalePrevBlock);
+													$extra_fail_cmd;
+													return future::result(Ok(()));
+												}
+											}
+										} else { false }
+									} else { false }
+								};
+								if need_submit {
+									let header = $header_option.unwrap();
+									match AllowedBlocksInfo::submit_header(&block_info_clone, header, &rpc_client_clone) {
+										HeaderStatus::TentativeAccept => {},
+										HeaderStatus::TentativeReject => {
+											reject_share!($msg, ShareRejectedReason::StalePrevBlock);
+											$extra_fail_cmd;
+											return future::result(Ok(()));
+										},
+										HeaderStatus::Absurd => {
+											println!("Got absurd previous header from client!");
+											return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
+										}
+									}
 								}
 							}
 						}
@@ -507,6 +710,8 @@ fn main() {
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
 
+								check_prev_hash!(share, share.previous_header, {});
+
 								let (our_payout, client_id) = check_coinbase_tx!(share.coinbase_tx, share, {});
 
 								let mut merkle_lhs = [0; 32];
@@ -553,6 +758,13 @@ fn main() {
 									println!("Client sent WeakBlock with no transactions");
 									return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 								}
+
+								// We reset the weak block state and just return early
+								// here...shouldn't be much loss in doing so as all the
+								// transactions they included are going to be useless once they get
+								// the new block anyway.
+								let dummy_header: Option<BlockHeader> = None;
+								check_prev_hash!(sketch, dummy_header, send_response!(PoolMessage::WeakBlockStateReset {}));
 
 								let (coinbase_txid, (our_payout, client_id)) = match &sketch.txn[0] {
 									&WeakBlockAction::TakeTx { .. } => {

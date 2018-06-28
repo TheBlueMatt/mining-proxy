@@ -14,7 +14,8 @@ pub fn does_hash_meet_target(hash: &[u8], target: &[u8]) -> bool {
 	true
 }
 
-pub fn does_hash_meet_target_div4(hash: &[u8], target: &[u8]) -> bool {
+#[inline]
+fn does_hash_meet_target_div(hash: &[u8], target: &[u8], shift: u8) -> bool {
 	assert_eq!(hash.len(), 32);
 	assert_eq!(target.len(), 32);
 
@@ -26,12 +27,20 @@ pub fn does_hash_meet_target_div4(hash: &[u8], target: &[u8]) -> bool {
 				hashval = ((hash[i - 1] as u16) << 8) | hashval;
 				targetval = ((target[i - 1] as u16) << 8) | targetval;
 			}
-			return targetval > hashval / 4;
+			return targetval > (hashval >> shift);
 		} else if target[i] > hash[i] {
 			return true;
 		}
 	}
 	true
+}
+
+pub fn does_hash_meet_target_div2(hash: &[u8], target: &[u8]) -> bool {
+	does_hash_meet_target_div(hash, target, 1)
+}
+
+pub fn does_hash_meet_target_div4(hash: &[u8], target: &[u8]) -> bool {
+	does_hash_meet_target_div(hash, target, 2)
 }
 
 pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
@@ -152,29 +161,65 @@ impl std::error::Error for HandleError {
 	}
 }
 
+pub fn hex_to_u256(hex: &str) -> Option<[u8; 32]> {
+	if hex.len() != 64 { return None; }
+
+	let mut out = [0; 32];
+
+	let mut b = 0;
+	let mut outpos = 0;
+	for (idx, c) in hex.as_bytes().iter().enumerate() {
+		b <<= 4;
+		match *c {
+			b'A'...b'F' => b |= c - b'A' + 10,
+			b'a'...b'f' => b |= c - b'a' + 10,
+			b'0'...b'9' => b |= c - b'0',
+			_ => return None,
+		}
+		if (idx & 1) == 1 {
+			out[outpos] = b;
+			outpos += 1;
+			b = 0;
+		}
+	}
+
+	Some(out)
+}
+
+pub fn hex_to_u256_rev(hex: &str) -> Option<[u8; 32]> {
+	if hex.len() != 64 { return None; }
+
+	let mut out = [0; 32];
+
+	let mut b = 0;
+	let mut outpos = 32;
+	for (idx, c) in hex.as_bytes().iter().enumerate() {
+		b <<= 4;
+		match *c {
+			b'A'...b'F' => b |= c - b'A' + 10,
+			b'a'...b'f' => b |= c - b'a' + 10,
+			b'0'...b'9' => b |= c - b'0',
+			_ => return None,
+		}
+		if (idx & 1) == 1 {
+			outpos -= 1;
+			out[outpos] = b;
+			b = 0;
+		}
+	}
+
+	Some(out)
+}
+
+
+
 #[cfg(test)]
 mod tests {
 	use utils;
 
 	fn hex_to_u256(hex: &str, out: &mut [u8; 32]) {
 		assert_eq!(hex.len(), 64);
-
-		let mut b = 0;
-		let mut outpos = 0;
-		for (idx, c) in hex.as_bytes().iter().enumerate() {
-			b <<= 4;
-			match *c {
-				b'A'...b'F' => b |= c - b'A' + 10,
-				b'a'...b'f' => b |= c - b'a' + 10,
-				b'0'...b'9' => b |= c - b'0',
-				_ => panic!("Bad hex"),
-			}
-			if (idx & 1) == 1 {
-				out[outpos] = b;
-				outpos += 1;
-				b = 0;
-			}
-		}
+		*out = utils::hex_to_u256(hex).unwrap();
 	}
 
 	#[test]
