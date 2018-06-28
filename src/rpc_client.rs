@@ -23,11 +23,19 @@ impl RPCClient {
 		}
 	}
 
-	pub fn make_rpc_call(&self, method: &str) -> impl Future<Item=serde_json::Value> {
+	/// params entries must be pre-quoted if appropriate
+	pub fn make_rpc_call(&self, method: &str, params: &Vec<&str>) -> impl Future<Item=serde_json::Value, Error=()> {
 		let mut request = hyper::Request::post(&self.uri);
 		let auth: &str = &self.basic_auth;
 		request.header("Authorization", auth);
-		self.client.request(request.body(hyper::Body::from("{\"method\":\"".to_string() + method + "\",\"params\":[],\"id\":" + &self.id.fetch_add(1, Ordering::AcqRel).to_string() + "}")).unwrap()).map_err(|_| {
+		let mut param_str = String::new();
+		for (idx, param) in params.iter().enumerate() {
+			param_str += param;
+			if idx != params.len() - 1 {
+				param_str += ",";
+			}
+		}
+		self.client.request(request.body(hyper::Body::from("{\"method\":\"".to_string() + method + "\",\"params\":[" + &param_str + "],\"id\":" + &self.id.fetch_add(1, Ordering::AcqRel).to_string() + "}")).unwrap()).map_err(|_| {
 			println!("Failed to connect to RPC server!");
 			()
 		}).and_then(|res| {

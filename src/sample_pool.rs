@@ -182,7 +182,7 @@ fn main() {
 	{
 		println!("Checking validity of RPC URL");
 		let mut thread_rt = tokio::runtime::current_thread::Runtime::new().unwrap();
-		match thread_rt.block_on(rpc_client.make_rpc_call("getnetworkinfo")) {
+		match thread_rt.block_on(rpc_client.make_rpc_call("getnetworkinfo", &vec![])) {
 			Ok(v) => v,
 			Err(_) => { panic!("Bad RPC URL"); },
 		};
