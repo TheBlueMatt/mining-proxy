@@ -539,8 +539,15 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				println!("Share ACCEPTED!");
 				return Ok(());
 			},
-			PoolMessage::ShareRejected { .. } => {
-				println!("Share REJECTED!");
+			PoolMessage::ShareRejected { reason, .. } => {
+				match reason {
+					ShareRejectedReason::StalePrevBlock => println!("Share REJECTED (stale prev block)!"),
+					ShareRejectedReason::BadHash => println!("Share REJECTED (bad hash)!"),
+					ShareRejectedReason::Duplicate => println!("Share REJECTED (duplicate)!"),
+					ShareRejectedReason::BadPayoutInfo => println!("Share REJECTED (bad payout info)!"),
+					ShareRejectedReason::BadWork => println!("Share REJECTED (bad work)!"),
+					ShareRejectedReason::Other(_) => println!("Share REJECTED (other)!"),
+				}
 				return Ok(());
 			},
 			PoolMessage::NewPoolServer { .. } => {
