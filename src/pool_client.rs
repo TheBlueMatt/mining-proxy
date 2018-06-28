@@ -173,11 +173,6 @@ impl PoolHandler {
 		let mut us_lock = self.state.write().unwrap();
 		let us = us_lock.borrow_mut();
 
-		let previous_header = if *us.last_header_sent == template.header_prevblock { None } else {
-			*us.last_header_sent = template.header_prevblock.clone();
-			Some(prev_header.clone())
-		};
-
 		if let Some(coinbase_postfix_match_len) = *us.coinbase_postfix_len {
 			let coinbase_postfix = if work.0.coinbase_tx.input.len() == 1 {
 				let coinbase = &work.0.coinbase_tx.input[0].script_sig;
@@ -187,6 +182,10 @@ impl PoolHandler {
 
 			if let Some(ref difficulty) = us.coinbase_postfix_to_difficulty.get(&coinbase_postfix) {
 				if utils::does_hash_meet_target(&work.1[..], &difficulty.share_target[..]) {
+					let previous_header = if *us.last_header_sent == template.header_prevblock { None } else {
+						*us.last_header_sent = template.header_prevblock.clone();
+						Some(prev_header.clone())
+					};
 					match us.stream {
 						&mut Some(ref stream) => {
 							match stream.unbounded_send(PoolMessage::Share {
