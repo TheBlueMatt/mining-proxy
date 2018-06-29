@@ -142,12 +142,18 @@ fn bytes_to_hex_insane_order(bytes: &[u8; 32]) -> String {
 	out
 }
 
+#[inline]
+fn template_timestamp_to_job_id(template_timestamp: u64) -> u32 {
+	((template_timestamp & 0xffffffff00000000) >> 32) as u32 ^ (template_timestamp & 0xffffffff) as u32
+}
+
 const EXTRANONCE2_SIZE: usize = 8;
 const VERSION_MASK: u32 = 0x1fffe000;
-fn job_to_json_string_prefix(template: &BlockTemplate, user_coinbase_postfix_len: usize) -> String {
-	let mut prefix = String::with_capacity(179 + template.coinbase_prefix.len()*2);
+fn job_to_json_string_prefix(template: &BlockTemplate, update_id: u32, user_coinbase_postfix_len: usize) -> String {
+	let mut prefix = String::with_capacity(197 + template.coinbase_prefix.len()*2);
 	prefix.push_str("{\"params\":[\""); // 12 chars
-	prefix.push_str(&template.template_timestamp.to_string()); // ~10 chars
+	let job_id = (template_timestamp_to_job_id(template.template_timestamp) as u64) << 32 | (update_id as u64);
+	prefix.push_str(&job_id.to_string()); // ~20 chars
 	prefix.push_str("\",\""); // 3 chars
 	prefix.push_str(&bytes_to_hex_insane_order(&template.header_prevblock)); // 64 chars
 	prefix.push_str("\",\""); // 3 chars
@@ -155,11 +161,12 @@ fn job_to_json_string_prefix(template: &BlockTemplate, user_coinbase_postfix_len
 	push_le_32_hex(template.coinbase_version, &mut prefix); // 8 bytes
 	prefix.push_str("01"); // 2 chars
 	prefix.push_str("0000000000000000000000000000000000000000000000000000000000000000ffffffff"); // 72 chars
-	// Add size of extranonce + 8 bytes for client id
-	let coinbase_len = template.coinbase_prefix.len() + 8 + EXTRANONCE2_SIZE + template.coinbase_postfix.len() + user_coinbase_postfix_len;
+	// Add size of extranonce + 8 bytes for client id + 4 bytes for update id
+	let coinbase_len = template.coinbase_prefix.len() + 12 + EXTRANONCE2_SIZE + template.coinbase_postfix.len() + user_coinbase_postfix_len;
 	prefix.push(char::from_digit(((coinbase_len >> 4) & 0x0f) as u32, 16).unwrap()); // 1 char
 	prefix.push(char::from_digit(((coinbase_len >> 0) & 0x0f) as u32, 16).unwrap()); // 1 char
 	prefix.push_str(&utils::bytes_to_hex(&template.coinbase_prefix));
+	push_le_32_hex(update_id, &mut prefix); // 8 chars
 
 	prefix.push_str("\",\""); // 3 chars
 	prefix
@@ -266,11 +273,12 @@ struct StratumUser {
 
 pub struct StratumServer {
 	clients: Mutex<(Vec<Arc<StratumClient>>, u64)>,
-	jobs: RwLock<BTreeMap<u64, WorkInfo>>,
+	jobs: RwLock<BTreeMap<u32, WorkInfo>>,
 	users: Mutex<HashMap<Vec<u8>, StratumUser>>,
 	/// Locked concurrently (after) users
 	user_auth_requests: Option<Mutex<mpsc::Sender<PoolAuthAction>>>,
 	user_coinbase_postfix_len: AtomicUsize,
+	job_update_id: AtomicUsize,
 }
 
 pub enum UserUpdate {
@@ -295,6 +303,7 @@ impl StratumServer {
 			users: Mutex::new(HashMap::new()),
 			user_auth_requests,
 			user_coinbase_postfix_len: AtomicUsize::new(0),
+			job_update_id: AtomicUsize::new(0),
 		});
 
 		let us_cp = us.clone();
@@ -305,7 +314,7 @@ impl StratumServer {
 			{
 				let new_job = job.clone();
 				let mut jobs = us_cp.jobs.write().unwrap();
-				jobs.insert(job.template.template_timestamp, new_job);
+				jobs.insert(template_timestamp_to_job_id(job.template.template_timestamp), new_job);
 			}
 
 			let prev_changed = last_prevblock != job.template.header_prevblock;
@@ -318,7 +327,8 @@ impl StratumServer {
 				job_to_difficulty_string(&job.template)
 			} else { String::new() };
 			let user_coinbase_postfix_len = if need_work_diff { 0 } else { us_cp.user_coinbase_postfix_len.load(Ordering::Acquire) };
-			let job_json_prefix = job_to_json_string_prefix(&job.template, user_coinbase_postfix_len);
+			let job_update_id = (us_cp.job_update_id.fetch_add(1, Ordering::AcqRel) & 0xffffffff) as u32;
+			let job_json_prefix = job_to_json_string_prefix(&job.template, job_update_id, user_coinbase_postfix_len);
 			let job_json_postfix = job_to_json_string_postfix(&job.template, prev_changed);
 
 			if need_work_diff {
@@ -384,7 +394,8 @@ impl StratumServer {
 								} else { return Ok(()); }
 							};
 							let now = Instant::now();
-							let job_prefix = job_to_json_string_prefix(&last_job.template, user_info.coinbase_postfix.len());
+							let job_update_id = (us_cp.job_update_id.fetch_add(1, Ordering::AcqRel) & 0xffffffff) as u32;
+							let job_prefix = job_to_json_string_prefix(&last_job.template, job_update_id, user_info.coinbase_postfix.len());
 							let job_postfix = job_to_json_string_postfix(&last_job.template, true);
 							let job_string = job_prefix + &utils::bytes_to_hex(&user_info.coinbase_postfix) + &job_postfix;
 
@@ -431,8 +442,8 @@ impl StratumServer {
 						if jobs.len() > 1 {
 							let mut iter = jobs.iter();
 							iter.next(); // We have to keep a job until the next one is 30 seconds old
-							if let Some((k, _)) = iter.next() {
-								*k < timestamp
+							if let Some((_, v)) = iter.next() {
+								v.template.template_timestamp < timestamp
 							} else { false }
 						} else { false }
 					};
@@ -442,12 +453,12 @@ impl StratumServer {
 					let mut jobs = us_timer.jobs.write().unwrap();
 					while jobs.len() > 1 {
 						// There should be a much easier way to implement this...
-						let (first_timestamp, second_timestamp) = {
+						let (first_id, second_timestamp) = {
 							let mut iter = jobs.iter();
-							(*iter.next().unwrap().0, *iter.next().unwrap().0)
+							(*iter.next().unwrap().0, iter.next().unwrap().1.template.template_timestamp)
 						};
 						if second_timestamp < timestamp {
-							jobs.remove(&first_timestamp);
+							jobs.remove(&first_id);
 						} else { break; }
 					}
 				}
@@ -459,7 +470,8 @@ impl StratumServer {
 				Some(job) => {
 					let now = Instant::now();
 					let send_target = now - Duration::from_secs(29);
-					let job_json_prefix = job_to_json_string_prefix(&job.template, us_timer.user_coinbase_postfix_len.load(Ordering::Acquire));
+					let job_update_id = (us_timer.job_update_id.fetch_add(1, Ordering::AcqRel) & 0xffffffff) as u32;
+					let job_json_prefix = job_to_json_string_prefix(&job.template, job_update_id, us_timer.user_coinbase_postfix_len.load(Ordering::Acquire));
 					let job_json_postfix = job_to_json_string_postfix(&job.template, false);
 
 					if need_work_diff {
@@ -601,7 +613,8 @@ impl StratumServer {
 						if let Some(job) = jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
 							let diff_string = job_to_difficulty_string(&job.1.template);
 							send_message!(diff_string);
-							send_message!(job_to_json_string_prefix(&job.1.template, 0) + &job_to_json_string_postfix(&job.1.template, true));
+							let job_update_id = (us.job_update_id.fetch_add(1, Ordering::AcqRel) & 0xffffffff) as u32;
+							send_message!(job_to_json_string_prefix(&job.1.template, job_update_id, 0) + &job_to_json_string_postfix(&job.1.template, true));
 							*client.last_send.lock().unwrap() = Instant::now();
 						}
 					}
@@ -628,9 +641,12 @@ impl StratumServer {
 						}
 					}
 
-					let job_id = match params[1].as_str().unwrap().parse() {
+					let (job_id, update_id) = match params[1].as_str().unwrap().parse() {
 						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
-						Ok(id) => id,
+						Ok(parsed) => {
+							let stratum_id: u64 = parsed;
+							(((stratum_id & 0xffffffff00000000) >> 32) as u32, (stratum_id & 0xffffffff) as u32)
+						},
 					};
 					let time = match hex_to_be32(params[3].as_str().unwrap()) {
 						Err(_) => return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError))),
@@ -652,6 +668,7 @@ impl StratumServer {
 							} else { job.template.header_version };
 
 							let mut script_sig = job.template.coinbase_prefix.clone();
+							script_sig.extend_from_slice(&utils::le32_to_array(update_id));
 							script_sig.extend_from_slice(&utils::le64_to_array(client.client_id));
 							match extend_vec_from_hex(params[2].as_str().unwrap(), &mut script_sig) {
 								Ok(_) => {},
@@ -850,7 +867,8 @@ impl StratumServer {
 								if should_notify {
 									let jobs = us.jobs.read().unwrap();
 									if let Some(job) = jobs.iter().last() { //TODO: This is ineffecient, map should have a last()
-										let job_prefix = job_to_json_string_prefix(&job.1.template, user_coinbase_postfix.len());
+										let job_update_id = (us.job_update_id.fetch_add(1, Ordering::AcqRel) & 0xffffffff) as u32;
+										let job_prefix = job_to_json_string_prefix(&job.1.template, job_update_id, user_coinbase_postfix.len());
 										let job_postfix = job_to_json_string_postfix(&job.1.template, true);
 										let job_string = job_prefix + &utils::bytes_to_hex(&user_coinbase_postfix) + &job_postfix;
 										send_message!(job_string);

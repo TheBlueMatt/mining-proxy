@@ -110,6 +110,16 @@ pub fn le64_to_array(u: u64) -> [u8; 8] {
 }
 
 #[inline]
+pub fn le32_to_array(u: u32) -> [u8; 4] {
+	let mut v = [0; 4];
+	v[0] = ((u >> 8*0) & 0xff) as u8;
+	v[1] = ((u >> 8*1) & 0xff) as u8;
+	v[2] = ((u >> 8*2) & 0xff) as u8;
+	v[3] = ((u >> 8*3) & 0xff) as u8;
+	v
+}
+
+#[inline]
 pub fn slice_to_le16(v: &[u8]) -> u16 {
 	((v[1] as u16) << 8*1) |
 	((v[0] as u16) << 8*0)
