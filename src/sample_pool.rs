@@ -21,6 +21,9 @@ mod utils;
 mod rpc_client;
 use rpc_client::*;
 
+mod generational_hash_sets;
+use generational_hash_sets::*;
+
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::network::serialize::BitcoinHash;
@@ -82,6 +85,7 @@ struct PerUserClientRef {
 	min_target: u8,
 	cur_target: AtomicUsize,
 	accepted_shares: AtomicUsize,
+	submitted_header_hashes: GenerationalHashSets,
 }
 
 struct AllowedBlocksInfo {
@@ -91,6 +95,7 @@ struct AllowedBlocksInfo {
 	cur_target: [u8; 32],
 	old_prev_blocks: HashSet<[u8; 32]>,
 	tentative_submitted_prev_blocks: HashSet<[u8; 32]>,
+	users_ref: Arc<Mutex<Vec<Weak<PerUserClientRef>>>>,
 }
 enum HeaderStatus {
 	TentativeAccept,
@@ -101,13 +106,27 @@ impl AllowedBlocksInfo {
 	fn update_chainwork(&mut self, chainwork: [u8; 32]) {
 		println!("New best-seen-block, rejecting old blocks now!");
 		let old_prev_blocks = &mut self.old_prev_blocks;
+		let mut blocks_wiped = Vec::with_capacity(2);
 		self.allowed_prev_blocks.retain(|prev_hash, old_chainwork| {
 			if !utils::does_hash_meet_target(&chainwork, old_chainwork) { // !(chainwork <= old_chainwork) ie old_chainwork < chainwork
 				old_prev_blocks.insert(prev_hash.clone());
+				blocks_wiped.push(prev_hash.clone());
 				false
 			} else { true }
 		});
 		self.best_chainwork = chainwork;
+		let users_ref = self.users_ref.clone();
+		tokio::spawn(future::lazy(move || {
+			let users = users_ref.lock().unwrap().clone();
+			for user_ref in users {
+				if let Some(user) = user_ref.upgrade() {
+					for block_hash in blocks_wiped.iter() {
+						user.submitted_header_hashes.wipe_generation(block_hash);
+					}
+				}
+			}
+			Ok(())
+		}));
 	}
 
 	fn check_block(&mut self, header: &serde_json::Value) {
@@ -264,12 +283,14 @@ fn main() {
 		return;
 	}
 
+	let users: Arc<Mutex<Vec<Weak<PerUserClientRef>>>> = Arc::new(Mutex::new(Vec::new()));
 	let block_info = Arc::new(RwLock::new(AllowedBlocksInfo {
 		allowed_prev_blocks: HashMap::new(),
 		best_chainwork: [0; 32],
 		cur_target: [0xff; 32],
 		old_prev_blocks: HashSet::new(),
 		tentative_submitted_prev_blocks: HashSet::new(),
+		users_ref: users.clone(),
 	}));
 
 	let rpc_client = {
@@ -354,7 +375,6 @@ fn main() {
 		match net::TcpListener::bind(&listen_bind.unwrap()) {
 			Ok(listener) => {
 				let mut max_client_id = 0;
-				let mut users: Arc<Mutex<Vec<Weak<PerUserClientRef>>>> = Arc::new(Mutex::new(Vec::new()));
 
 				let users_timer_ref = users.clone();
 				tokio::spawn(timer::Interval::new(Instant::now() + Duration::from_secs(10), Duration::from_secs(30)).for_each(move |_| {
@@ -646,6 +666,7 @@ fn main() {
 											min_target: utils::count_leading_zeros(&info.minimum_target) + 1,
 											cur_target: AtomicUsize::new(initial_target as usize),
 											accepted_shares: AtomicUsize::new(0),
+											submitted_header_hashes: GenerationalHashSets::new(),
 										});
 										client_ids.insert(client_id, info.user_id.clone());
 										connection_entry.or_insert(user.clone());
@@ -743,8 +764,12 @@ fn main() {
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									println!("Got share that met weak block target, ignored as we'll check the weak block");
 								} else if leading_zeros >= client_target {
-									share_submitted(client_id, &share.user_tag_1, our_payout);
-									share_received!(client, client_target, share);
+									if client.submitted_header_hashes.try_insert(&share.header_prevblock, block_hash) {
+										share_submitted(client_id, &share.user_tag_1, our_payout);
+										share_received!(client, client_target, share);
+									} else {
+										reject_share!(share, ShareRejectedReason::Duplicate);
+									}
 								} else {
 									reject_share!(share, ShareRejectedReason::BadHash);
 								}
@@ -841,8 +866,12 @@ fn main() {
 								let client_target = client.cur_target.load(Ordering::Acquire) as u8;
 
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
-									weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data);
-									share_received!(client, client_target, sketch);
+									if client.submitted_header_hashes.try_insert(&sketch.header_prevblock, block_hash) {
+										weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data);
+										share_received!(client, client_target, sketch);
+									} else {
+										reject_share!(sketch, ShareRejectedReason::Duplicate);
+									}
 								} else {
 									reject_share!(sketch, ShareRejectedReason::BadHash);
 								}
