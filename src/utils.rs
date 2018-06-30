@@ -35,6 +35,7 @@ fn does_hash_meet_target_div(hash: &[u8], target: &[u8], shift: u8) -> bool {
 	true
 }
 
+#[allow(dead_code)]
 pub fn does_hash_meet_target_div2(hash: &[u8], target: &[u8]) -> bool {
 	does_hash_meet_target_div(hash, target, 1)
 }
@@ -43,6 +44,7 @@ pub fn does_hash_meet_target_div4(hash: &[u8], target: &[u8]) -> bool {
 	does_hash_meet_target_div(hash, target, 2)
 }
 
+#[allow(dead_code)]
 pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 	for i in (0..32).rev() {
 		if a[i] > b[i] {
@@ -55,6 +57,7 @@ pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 }
 
 /// Returns the highest value with the given number of leading 0s
+#[allow(dead_code)]
 #[inline]
 pub fn leading_0s_to_target(zeros: u8) -> [u8; 32] {
 	let mut res = [0xff; 32];
@@ -78,7 +81,9 @@ pub fn count_leading_zeros(target: &[u8]) -> u8 {
 	return 255;
 }
 
+#[allow(dead_code)]
 pub const MILLION_DIFF_TARGET: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0];
+#[allow(dead_code)]
 #[inline]
 pub fn target_to_diff_lb(target: &[u8; 32]) -> f64 {
 	// We use a shitty approximation for a lower-bound on difficulty by simply calculating the
@@ -109,6 +114,7 @@ pub fn le64_to_array(u: u64) -> [u8; 8] {
 	v
 }
 
+#[allow(dead_code)]
 #[inline]
 pub fn le32_to_array(u: u32) -> [u8; 4] {
 	let mut v = [0; 4];
@@ -171,6 +177,7 @@ impl std::error::Error for HandleError {
 	}
 }
 
+#[allow(dead_code)]
 pub fn hex_to_u256(hex: &str) -> Option<[u8; 32]> {
 	if hex.len() != 64 { return None; }
 
@@ -196,6 +203,7 @@ pub fn hex_to_u256(hex: &str) -> Option<[u8; 32]> {
 	Some(out)
 }
 
+#[allow(dead_code)]
 pub fn hex_to_u256_rev(hex: &str) -> Option<[u8; 32]> {
 	if hex.len() != 64 { return None; }
 
@@ -220,8 +228,6 @@ pub fn hex_to_u256_rev(hex: &str) -> Option<[u8; 32]> {
 
 	Some(out)
 }
-
-
 
 #[cfg(test)]
 mod tests {

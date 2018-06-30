@@ -11,8 +11,7 @@ use bitcoin::util::hash::Sha256dHash;
 use bytes;
 use bytes::BufMut;
 
-use future;
-use futures::{Future, Stream, Sink};
+use futures::{Stream, Sink};
 
 use tokio;
 
@@ -23,11 +22,10 @@ use secp256k1;
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
 
-use std;
 use std::collections::HashMap;
 use std::collections::hash_map;
-use std::{cmp, io};
-use std::sync::{Arc, Mutex, RwLock};
+use std::io;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -559,130 +557,5 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 			},
 		}
 		Ok(())
-	}
-}
-
-struct PoolProviderHolder {
-	is_connected: bool,
-	last_job: Option<PoolProviderJob>,
-	last_user_job: Option<PoolProviderUserJob>,
-}
-
-pub struct MultiPoolProvider {
-	cur_pool: usize,
-	pools: Vec<PoolProviderHolder>,
-	job_tx: mpsc::UnboundedSender<PoolProviderUserWork>,
-}
-
-pub struct PoolInfo {
-	pub host_port: String,
-	pub user_id: Vec<u8>,
-	pub user_auth: Vec<u8>,
-}
-
-pub struct PoolProviderUserWork {
-	pub payout_info: PoolProviderJob,
-	pub user_payout_info: PoolProviderUserJob,
-}
-
-impl MultiPoolProvider {
-	pub fn create(mut pool_hosts: Vec<PoolInfo>) -> mpsc::UnboundedReceiver<PoolProviderUserWork> {
-		let (job_tx, job_rx) = mpsc::unbounded();
-		let cur_work_rc = Arc::new(Mutex::new(MultiPoolProvider {
-			cur_pool: std::usize::MAX,
-			pools: Vec::with_capacity(pool_hosts.len()),
-			job_tx: job_tx,
-		}));
-
-		tokio::spawn(future::lazy(move || -> Result<(), ()> {
-			for (idx, pool) in pool_hosts.drain(..).enumerate() {
-				let (mut auth_write, auth_read) = mpsc::channel(5);
-				let (mut handler, mut pool_rx) = PoolHandler::new(None, auth_read);
-				auth_write.start_send(PoolAuthAction::AuthUser(PoolUserAuth {
-					suggested_target: [0xff; 32],
-					minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
-					user_id: pool.user_id,
-					user_auth: pool.user_auth,
-				})).unwrap();
-				cur_work_rc.lock().unwrap().pools.push(PoolProviderHolder {
-					is_connected: false,
-					last_job: None,
-					last_user_job: None,
-				});
-
-				let work_rc = cur_work_rc.clone();
-				tokio::spawn(pool_rx.for_each(move |job| {
-					let mut cur_work = work_rc.lock().unwrap();
-					macro_rules! provider_disconnect {
-						() => {
-							if cur_work.pools[idx].is_connected {
-								cur_work.pools[idx].is_connected = false;
-								if cur_work.cur_pool == idx {
-									// Prefer pools which are connected, then follow the order they
-									// were provided in...
-									let mut lowest_with_work = std::usize::MAX;
-									for (iter_idx, pool) in cur_work.pools.iter().enumerate() {
-										if pool.last_job.is_some() && pool.last_user_job.is_some() {
-											if pool.is_connected {
-												lowest_with_work = iter_idx;
-												break;
-											} else {
-												lowest_with_work = cmp::min(lowest_with_work, iter_idx);
-											}
-										}
-									}
-									if lowest_with_work != std::usize::MAX {
-										let msg = {
-											let new_pool = &cur_work.pools[lowest_with_work];
-											PoolProviderUserWork {
-												payout_info: new_pool.last_job.as_ref().unwrap().clone(),
-												user_payout_info: new_pool.last_user_job.as_ref().unwrap().clone(),
-											}
-										};
-										cur_work.job_tx.start_send(msg).unwrap();
-									}
-								}
-							}
-						}
-					}
-					match job {
-						PoolProviderAction::UserUpdate { update, .. } => {
-							cur_work.pools[idx].is_connected = true;
-							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_job.is_some() {
-								cur_work.cur_pool = idx;
-								let payout_info = cur_work.pools[idx].last_job.as_ref().unwrap().clone();
-								cur_work.job_tx.start_send(PoolProviderUserWork {
-									payout_info,
-									user_payout_info: update.clone(),
-								}).unwrap();
-							}
-							cur_work.pools[idx].last_user_job = Some(update);
-						},
-						PoolProviderAction::PoolUpdate { info } => {
-							cur_work.pools[idx].is_connected = true;
-							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_user_job.is_some() {
-								cur_work.cur_pool = idx;
-								let user_payout_info = cur_work.pools[idx].last_user_job.as_ref().unwrap().clone();
-								cur_work.job_tx.start_send(PoolProviderUserWork {
-									payout_info: info.clone(),
-									user_payout_info,
-								}).unwrap();
-							}
-							cur_work.pools[idx].last_job = Some(info);
-						},
-						PoolProviderAction::UserReject { .. } => provider_disconnect!(),
-						PoolProviderAction::ProviderDisconnected => provider_disconnect!(),
-					}
-					Ok(())
-				}).then(|_| {
-					Ok(())
-				}));
-				ConnectionMaintainer::new(pool.host_port, handler).make_connection();
-			}
-
-			Ok(())
-		}));
-
-		job_rx
 	}
 }

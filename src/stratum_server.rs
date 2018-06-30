@@ -1,5 +1,5 @@
 use msg_framing::{BlockTemplate,WinningNonce,PoolUserAuth};
-use work_getter::WorkInfo;
+use work_info::WorkInfo;
 use pool_client::{PoolAuthAction, PoolProviderUserJob};
 use utils;
 
@@ -282,10 +282,14 @@ pub struct StratumServer {
 }
 
 pub enum UserUpdate {
+	// We never construct this in single_user_pool
+	#[allow(dead_code)]
 	WorkUpdate {
 		user_id: Vec<u8>,
 		user_info: PoolProviderUserJob,
 	},
+	// We never construct this in single_user_pool
+	#[allow(dead_code)]
 	DropUser {
 		user_id: Vec<u8>
 	},

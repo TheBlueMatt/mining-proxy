@@ -1,148 +1,155 @@
 // This module is useful for anything that needs to speak pool+work protocols to get remote work
 // (eg for a mining client, or a proxy). Simpler clients may wish to only speak work protocol.
 
-use msg_framing::*;
+use connection_maintainer::*;
 use pool_client::*;
 use work_client::*;
+use work_info::*;
 
-use utils;
+use msg_framing::PoolUserAuth;
 
 use futures::sync::mpsc;
 
-
-use bitcoin::blockdata::transaction::TxOut;
 use bitcoin::blockdata::script::Script;
-use bitcoin::util::hash::Sha256dHash;
 
 use futures::future;
 use futures::{Future,Stream,Sink};
 
 use tokio;
 
+use std;
+use std::cmp;
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone)]
-pub struct WorkInfo {
-	pub template: Arc<BlockTemplate>,
-	pub solutions: mpsc::UnboundedSender<Arc<(WinningNonce, Sha256dHash)>>,
+struct PoolProviderHolder {
+	is_connected: bool,
+	last_job: Option<PoolProviderJob>,
+	last_user_job: Option<PoolProviderUserJob>,
+}
+
+pub struct MultiPoolProvider {
+	cur_pool: usize,
+	pools: Vec<PoolProviderHolder>,
+	job_tx: mpsc::UnboundedSender<PoolProviderUserWork>,
+}
+
+pub struct PoolInfo {
+	pub host_port: String,
+	pub user_id: Vec<u8>,
+	pub user_auth: Vec<u8>,
+}
+
+pub struct PoolProviderUserWork {
+	pub payout_info: PoolProviderJob,
+	pub user_payout_info: PoolProviderUserJob,
+}
+
+impl MultiPoolProvider {
+	pub fn create(mut pool_hosts: Vec<PoolInfo>) -> mpsc::UnboundedReceiver<PoolProviderUserWork> {
+		let (job_tx, job_rx) = mpsc::unbounded();
+		let cur_work_rc = Arc::new(Mutex::new(MultiPoolProvider {
+			cur_pool: std::usize::MAX,
+			pools: Vec::with_capacity(pool_hosts.len()),
+			job_tx: job_tx,
+		}));
+
+		tokio::spawn(future::lazy(move || -> Result<(), ()> {
+			for (idx, pool) in pool_hosts.drain(..).enumerate() {
+				let (mut auth_write, auth_read) = mpsc::channel(5);
+				let (mut handler, mut pool_rx) = PoolHandler::new(None, auth_read);
+				auth_write.start_send(PoolAuthAction::AuthUser(PoolUserAuth {
+					suggested_target: [0xff; 32],
+					minimum_target: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], // Diff 1
+					user_id: pool.user_id,
+					user_auth: pool.user_auth,
+				})).unwrap();
+				cur_work_rc.lock().unwrap().pools.push(PoolProviderHolder {
+					is_connected: false,
+					last_job: None,
+					last_user_job: None,
+				});
+
+				let work_rc = cur_work_rc.clone();
+				tokio::spawn(pool_rx.for_each(move |job| {
+					let mut cur_work = work_rc.lock().unwrap();
+					macro_rules! provider_disconnect {
+						() => {
+							if cur_work.pools[idx].is_connected {
+								cur_work.pools[idx].is_connected = false;
+								if cur_work.cur_pool == idx {
+									// Prefer pools which are connected, then follow the order they
+									// were provided in...
+									let mut lowest_with_work = std::usize::MAX;
+									for (iter_idx, pool) in cur_work.pools.iter().enumerate() {
+										if pool.last_job.is_some() && pool.last_user_job.is_some() {
+											if pool.is_connected {
+												lowest_with_work = iter_idx;
+												break;
+											} else {
+												lowest_with_work = cmp::min(lowest_with_work, iter_idx);
+											}
+										}
+									}
+									if lowest_with_work != std::usize::MAX {
+										let msg = {
+											let new_pool = &cur_work.pools[lowest_with_work];
+											PoolProviderUserWork {
+												payout_info: new_pool.last_job.as_ref().unwrap().clone(),
+												user_payout_info: new_pool.last_user_job.as_ref().unwrap().clone(),
+											}
+										};
+										cur_work.job_tx.start_send(msg).unwrap();
+									}
+								}
+							}
+						}
+					}
+					match job {
+						PoolProviderAction::UserUpdate { update, .. } => {
+							cur_work.pools[idx].is_connected = true;
+							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_job.is_some() {
+								cur_work.cur_pool = idx;
+								let payout_info = cur_work.pools[idx].last_job.as_ref().unwrap().clone();
+								cur_work.job_tx.start_send(PoolProviderUserWork {
+									payout_info,
+									user_payout_info: update.clone(),
+								}).unwrap();
+							}
+							cur_work.pools[idx].last_user_job = Some(update);
+						},
+						PoolProviderAction::PoolUpdate { info } => {
+							cur_work.pools[idx].is_connected = true;
+							if cur_work.cur_pool >= idx && cur_work.pools[idx].last_user_job.is_some() {
+								cur_work.cur_pool = idx;
+								let user_payout_info = cur_work.pools[idx].last_user_job.as_ref().unwrap().clone();
+								cur_work.job_tx.start_send(PoolProviderUserWork {
+									payout_info: info.clone(),
+									user_payout_info,
+								}).unwrap();
+							}
+							cur_work.pools[idx].last_job = Some(info);
+						},
+						PoolProviderAction::UserReject { .. } => provider_disconnect!(),
+						PoolProviderAction::ProviderDisconnected => provider_disconnect!(),
+					}
+					Ok(())
+				}).then(|_| {
+					Ok(())
+				}));
+				ConnectionMaintainer::new(pool.host_port, handler).make_connection();
+			}
+
+			Ok(())
+		}));
+
+		job_rx
+	}
 }
 
 pub struct WorkGetter {
 	payout_script: Option<Script>,
 	cur_work: Option<WorkProviderJob>,
 	cur_pool: Option<PoolProviderUserWork>,
-}
-
-/// Merges some work and some pool payout information to build a job to mine on.
-/// If both pool and our_payout_script are None we can't build a job.
-/// If pool or work are invalid, None will sometimes be returned, but invalid work may also be
-/// generated. Generally, pool and work are trusted to be well-formed and compatible.
-pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob, pool: Option<&PoolProviderJob>, user: Option<&PoolProviderUserJob>) -> Option<WorkInfo> {
-	let mut template = work.template.clone();
-
-	let mut outputs = Vec::with_capacity(template.appended_coinbase_outputs.len() + 1);
-	for output in template.appended_coinbase_outputs.iter() {
-		if output.value != 0 { panic!("We should have checked this on the recv end!"); }
-	}
-
-	match &work.coinbase_prefix_postfix {
-		&Some(ref postfix) => {
-			template.coinbase_prefix.extend_from_slice(&postfix.coinbase_prefix_postfix[..]);
-		},
-		&None => {}
-	}
-
-	if template.coinbase_value_remaining <= 0 {
-		println!("Work provider returning 0-value work! Can't mine!");
-		return None;
-	}
-
-	let work_target = template.target.clone();
-
-	match pool {
-		Some(&PoolProviderJob { ref payout_info, .. }) => {
-			let mut constant_value_output = 0;
-			for output in payout_info.appended_outputs.iter() {
-				if output.value > 21000000*100000000 || output.value + constant_value_output > 21000000*100000000 {
-					println!("Pool trying to claim > 21 million BTC in value! Can't mine!");
-					return None;
-				}
-				constant_value_output += output.value;
-			}
-
-			let value_remaining = (template.coinbase_value_remaining as i64) - (constant_value_output as i64);
-			if value_remaining <= 0 {
-				println!("Pool requiring {} in output value, work provider only finding {}! Can't mine!", constant_value_output, template.coinbase_value_remaining);
-				return None;
-			}
-
-			outputs.push(TxOut {
-				value: value_remaining as u64,
-				script_pubkey: payout_info.remaining_payout.clone(),
-			});
-
-			outputs.extend_from_slice(&payout_info.appended_outputs[..]);
-
-			match user {
-				Some(&PoolProviderUserJob { ref coinbase_postfix, ref target }) => {
-					template.target = utils::max_le(template.target, *target);
-
-					if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
-					template.coinbase_postfix.extend_from_slice(coinbase_postfix);
-				},
-				None => {}
-			}
-		},
-		None => {
-			if let &Some(ref script) = our_payout_script {
-				println!("No available pool info! Solo mining!");
-				outputs.push(TxOut {
-					value: template.coinbase_value_remaining,
-					script_pubkey: script.clone(),
-				});
-			} else {
-				return None;
-			}
-		}
-	}
-
-	outputs.extend_from_slice(&template.appended_coinbase_outputs[..]);
-
-	template.appended_coinbase_outputs = outputs;
-
-	let template_rc = Arc::new(template);
-
-	let (solution_tx, solution_rx) = mpsc::unbounded();
-	let tx_data_ref = work.tx_data.clone();
-	let template_ref = template_rc.clone();
-	let work_provider = work.provider.clone();
-	let pool_provider = if let Some(ref pool_info) = pool {
-		Some(pool_info.provider.clone()) } else { None };
-
-	tokio::spawn(solution_rx.for_each(move |nonces: Arc<(WinningNonce, Sha256dHash)>| {
-		if utils::does_hash_meet_target(&nonces.1[..], &work_target[..]) {
-			work_provider.send_nonce(nonces.0.clone());
-		}
-		match pool_provider {
-			Some(ref provider) => {
-				let provider_ref = provider.clone();
-				let template_ref_2 = template_ref.clone();
-				tx_data_ref.get_and(move |txn, prev_header, extra_block_data| {
-					let source_clone = provider_ref.clone();
-					source_clone.send_nonce(&nonces, &template_ref_2, &txn, &prev_header, &extra_block_data);
-				});
-			},
-			None => {}
-		}
-		future::result(Ok(()))
-	}).then(|_| {
-		future::result(Ok(()))
-	}));
-
-	Some(WorkInfo {
-		template: template_rc,
-		solutions: solution_tx
-	})
 }
 
 impl WorkGetter {

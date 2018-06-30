@@ -246,6 +246,8 @@ pub enum WorkMessage {
 		signature: Signature,
 		new_host_port: String,
 	},
+	// We never bother deserializing to VendorMessages
+	#[allow(dead_code)]
 	VendorMessage {
 		signature: Option<Signature>,
 		vendor: Vec<u8>,
@@ -253,6 +255,8 @@ pub enum WorkMessage {
 	},
 }
 
+// We never construct this in sample-pool
+#[allow(dead_code)]
 /// Decoder for work messages, not that we simply skip decoding Vendor messages to avoid creating a
 /// 16MB read buffer for them.
 pub struct WorkMsgFramer {
@@ -262,6 +266,8 @@ pub struct WorkMsgFramer {
 }
 
 impl WorkMsgFramer {
+	// We never construct this in sample-pool
+	#[allow(dead_code)]
 	pub fn new() -> WorkMsgFramer {
 		WorkMsgFramer {
 			secp_ctx: Secp256k1::new(),
@@ -996,6 +1002,8 @@ pub enum PoolMessage {
 		signature: Signature,
 		new_host_port: String,
 	},
+	// We never bother deserializing to VendorMessages
+	#[allow(dead_code)]
 	VendorMessage {
 		signature: Option<Signature>,
 		vendor: Vec<u8>,

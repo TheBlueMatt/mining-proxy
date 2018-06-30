@@ -3,7 +3,6 @@ extern crate bytes;
 extern crate futures;
 extern crate tokio;
 extern crate tokio_io;
-extern crate tokio_codec;
 extern crate crypto;
 extern crate secp256k1;
 
@@ -23,11 +22,11 @@ mod utils;
 mod work_getter;
 use work_getter::*;
 
-mod work_info;
-
 mod connection_maintainer;
 
 mod pool_client;
+use pool_client::PoolInfo;
+
 mod work_client;
 
 use bitcoin::util::address::Address;
@@ -44,9 +43,7 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 
 fn main() {
-	println!("USAGE: mining-proxy (--job_provider=host:port)* (--pool_server=host:port)* --stratum_listen_bind=IP:port --mining_listen_bind=IP:port --mining_auth_key=base58privkey --payout_address=addr");
-	println!("A stratum/work protocol proxy for a number of ASICs mining on a single user");
-	println!("account on a pool or for a solo miner.");
+	println!("USAGE: stratum-proxy (--job_provider=host:port)* (--pool_server=host:port)* --stratum_listen_bind=IP:port --mining_listen_bind=IP:port --mining_auth_key=base58privkey --payout_address=addr");
 	println!("--job_provider - bitcoind(s) running as mining server(s) to get work from");
 	println!("--pool_server - pool server(s) to get payout address from/submit shares to");
 	println!("--pool_user_id - user id (eg username) on pool");
@@ -224,7 +221,7 @@ fn main() {
 		}
 
 		if stratum_listen_bind.is_some() && mining_listen_bind.is_none() {
-			bind_and_handle!(stratum_listen_bind, StratumServer::new(job_rx, None), StratumServer);
+			bind_and_handle!(stratum_listen_bind, StratumServer::new(job_rx), StratumServer);
 		} else if stratum_listen_bind.is_none() && mining_listen_bind.is_some() {
 			bind_and_handle!(mining_listen_bind, MiningServer::new(job_rx, mining_auth_key.unwrap()), MiningServer);
 		} else {
@@ -237,7 +234,7 @@ fn main() {
 			}).then(|_| {
 				Ok(())
 			}));
-			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx, None), StratumServer);
+			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx), StratumServer);
 			bind_and_handle!(mining_listen_bind, MiningServer::new(mining_rx, mining_auth_key.unwrap()), MiningServer);
 		}
 

@@ -17,8 +17,8 @@ use stratum_server::*;
 
 mod utils;
 
-mod work_getter;
-use work_getter::*;
+mod work_info;
+use work_info::*;
 
 mod connection_maintainer;
 use connection_maintainer::*;
