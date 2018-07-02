@@ -29,6 +29,8 @@ use pool_client::*;
 mod work_client;
 use work_client::*;
 
+mod timeout_stream;
+
 use futures::future;
 use futures::sync::mpsc;
 use futures::{Future,Stream,Sink};

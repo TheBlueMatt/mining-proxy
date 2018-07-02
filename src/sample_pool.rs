@@ -24,6 +24,9 @@ use rpc_client::*;
 mod generational_hash_sets;
 use generational_hash_sets::*;
 
+mod timeout_stream;
+use timeout_stream::TimeoutStream;
+
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::network::serialize::BitcoinHash;
@@ -73,7 +76,7 @@ fn weak_block_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _he
 const MIN_TARGET_LEADING_0S: u8 = 47; // Diff ~16384
 const WEAK_BLOCK_RATIO_0S: u8 = 8; // 2**8x harder to mine weak blocks
 const MAX_USER_SHARES_PER_30_SEC: usize = 30;
-const MIN_USER_SHARES_PER_30_SEC: usize = 1;
+const MIN_USER_SHARES_PER_30_SEC: usize = 2;
 
 // Dont change anything below...
 const MAX_TARGET_LEADING_0S: u8 = 71 - WEAK_BLOCK_RATIO_0S; // Roughly network diff/16 at the time of writing, should be more than sufficiently high for any use-case
@@ -466,7 +469,7 @@ fn main() {
 					let block_info_clone = block_info.clone();
 					let rpc_client_clone = rpc_client.clone();
 
-					tokio::spawn(rx.for_each(move |msg| {
+					tokio::spawn(TimeoutStream::new(rx, Duration::from_secs(60*10)).for_each(move |msg| {
 						macro_rules! send_response {
 							($msg: expr) => {
 								match send_sink.start_send($msg) {

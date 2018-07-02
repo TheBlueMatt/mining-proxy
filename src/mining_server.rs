@@ -23,6 +23,8 @@ use tokio::{net, timer};
 
 use tokio_codec;
 
+use timeout_stream::TimeoutStream;
+
 use secp256k1::key::{SecretKey,PublicKey};
 use secp256k1::Secp256k1;
 use secp256k1;
@@ -220,7 +222,7 @@ impl MiningServer {
 		//TODO: Set a timer for the client to always push *something* to them every 30 seconds or
 		//so, as otherwise stratum clients time out.
 
-		tokio::spawn(rx.for_each(move |msg| -> future::FutureResult<(), io::Error> {
+		tokio::spawn(TimeoutStream::new(rx, Duration::from_secs(60*10)).for_each(move |msg| -> future::FutureResult<(), io::Error> {
 			macro_rules! send_response {
 				($msg: expr) => {
 					match send_sink.start_send($msg) {

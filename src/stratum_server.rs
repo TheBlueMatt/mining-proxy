@@ -21,6 +21,8 @@ use tokio::{net, timer};
 
 use tokio_codec;
 
+use timeout_stream::TimeoutStream;
+
 use serde_json;
 
 use std::{char, cmp, fmt, io, mem};
@@ -548,7 +550,7 @@ impl StratumServer {
 		let client_close = client.clone();
 		let us_close = us.clone();
 
-		tokio::spawn(rx.for_each(move |line| -> future::FutureResult<(), io::Error> {
+		tokio::spawn(TimeoutStream::new(rx, Duration::from_secs(60*10)).for_each(move |line| -> future::FutureResult<(), io::Error> {
 			if client.needs_close.load(Ordering::Acquire) {
 				return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, BadMessageError)));
 			}

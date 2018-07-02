@@ -30,6 +30,8 @@ mod connection_maintainer;
 mod pool_client;
 mod work_client;
 
+mod timeout_stream;
+
 use bitcoin::util::address::Address;
 use bitcoin::util::privkey;
 
