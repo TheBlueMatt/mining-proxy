@@ -94,7 +94,6 @@ const MAX_TARGET_LEADING_0S: u8 = 71 - WEAK_BLOCK_RATIO_0S; // Roughly network d
 
 // Kafka topics for shares and weak_block;
 static KAFKA_SHARES_TOPIC: &'static str = "BetterHash-Shares-Topic";
-static KAFKA_WEAK_BLOCKS_TOPIC: &'static str = "BetterHash-Weak-Blocks-Topic";
 
 struct PerUserClientRef {
 	send_stream: mpsc::Sender<PoolMessage>,
@@ -110,7 +109,7 @@ struct PerUserClientRef {
 #[derive(Serialize)]
 struct ShareMessage {
 	user: String,       // miner username 
-	miner: String,      // miner workername
+	worker: String,     // miner workername
 	payout: u64,        // our payout
 	client_target: u8,  // client target
 	leading_zeros: u8,  // share target
@@ -118,12 +117,7 @@ struct ShareMessage {
 	nbits: u32,         // nbits
 	time: u32,          // share tsp
 	nonce: u32,         // share nonce
-}
-
-// Serialize pool weak block
-#[derive(Serialize)]
-struct WeakBlockMessage {
-	client_id: Vec<u8>
+	is_weak_block: bool,// weak block tag
 }
 
 struct AllowedBlocksInfo {
@@ -411,7 +405,6 @@ fn main() {
 	}
 
 	let kafka_shares_topic = format!("{}{}", topic_prefix, KAFKA_SHARES_TOPIC);
-	let kafka_weak_block_topic = format!("{}{}", topic_prefix, KAFKA_WEAK_BLOCKS_TOPIC);
 
 	// Use current thread to send record
     let io_thread = current_thread::CurrentThread::new();
@@ -547,7 +540,6 @@ fn main() {
 					let kafka_producer_clone = kafka_producer.clone();
 					let io_thread_handle = io_thread_handle.clone();
 					let kafka_shares_topic = kafka_shares_topic.clone();
-					let kafka_weak_block_topic = kafka_weak_block_topic.clone();
 
 					let server_id_vec = match server_id {
 						Some(ref id) => id.as_bytes().to_vec(),
@@ -695,10 +687,10 @@ fn main() {
 
 						macro_rules! send_share {
 							($client_id: expr, $share: expr, $payout: expr, $client_target: expr,
-							 	$leading_zeros: expr) => {
+							 	$leading_zeros: expr, $is_weak_block: expr) => {
 								let mut share_message = ShareMessage{
 									user: String::from_utf8_lossy($client_id).to_string(),
-									miner: String::from_utf8_lossy(&$share.user_tag_1).to_string(),
+									worker: String::from_utf8_lossy(&$share.user_tag_1).to_string(),
 									payout: $payout,
 									client_target: $client_target,
 									leading_zeros: $leading_zeros,
@@ -706,19 +698,10 @@ fn main() {
 									nbits: $share.header_nbits,
 									time: $share.header_time,
 									nonce: $share.header_nonce,
+									is_weak_block: $is_weak_block,
 									};
 								match serde_json::to_string(&share_message) {
 									Ok(message) => kafka_send!(&kafka_shares_topic, message),
-									Err(e) => println!("Error: {:?}", e),
-								};
-							}
-						}
-
-						macro_rules! send_weak_block {
-							($client_id: expr) => {
-								let mut weak_block_message = WeakBlockMessage{client_id: $client_id};
-								match serde_json::to_string(&weak_block_message) {
-									Ok(message) => { kafka_send!(&kafka_weak_block_topic, message)},
 									Err(e) => println!("Error: {:?}", e),
 								};
 							}
@@ -917,7 +900,7 @@ fn main() {
 								} else if leading_zeros >= client_target {
 									if client.submitted_header_hashes.try_insert(&share.header_prevblock, block_hash) {
 										share_submitted(client_id, &share.user_tag_1, our_payout);
-										send_share!(client_id, &share, our_payout, client_target, leading_zeros);
+										send_share!(client_id, &share, our_payout, client_target, leading_zeros, false);
 										share_received!(client, client_target, share);
 									} else {
 										reject_share!(share, ShareRejectedReason::Duplicate);
@@ -1020,8 +1003,7 @@ fn main() {
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									if client.submitted_header_hashes.try_insert(&sketch.header_prevblock, block_hash) {
 										weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data);
-										send_weak_block!(client_id.clone());
-										send_share!(client_id, &sketch, our_payout, client_target, leading_zeros);
+										send_share!(client_id, &sketch, our_payout, client_target, leading_zeros, true);
 										share_received!(client, client_target, sketch);
 									} else {
 										reject_share!(sketch, ShareRejectedReason::Duplicate);
