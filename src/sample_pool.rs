@@ -109,7 +109,15 @@ struct PerUserClientRef {
 // Serialize pool share
 #[derive(Serialize)]
 struct ShareMessage {
-	client_id: Vec<u8>
+	user: String,       // miner username 
+	miner: String,      // miner workername
+	payout: u64,        // our payout
+	client_target: u8,  // client target
+	leading_zeros: u8,  // share target
+	version: u32,       // version
+	nbits: u32,         // nbits
+	time: u32,          // share tsp
+	nonce: u32,         // share nonce
 }
 
 // Serialize pool weak block
@@ -331,7 +339,7 @@ fn main() {
 
 	let thread_pool_size: usize = match thread_pool_size {
 		Some(n) => n,
-		None => 1,
+		None => 2,
 	};
 
 	let users: Arc<Mutex<Vec<Weak<PerUserClientRef>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -666,6 +674,7 @@ fn main() {
 						macro_rules! kafka_send {
 							($topic: expr, $payload: expr) => {
 								if let Some(ref producer) = kafka_producer_clone {
+									println!("Sending to kafka:{}", $payload);
 									let produce_future = producer.send(
 										FutureRecord::to($topic)
 										    .key("")
@@ -685,8 +694,19 @@ fn main() {
 						}
 
 						macro_rules! send_share {
-							($client_id: expr) => {
-								let mut share_message = ShareMessage{client_id: $client_id};
+							($client_id: expr, $share: expr, $payout: expr, $client_target: expr,
+							 	$leading_zeros: expr) => {
+								let mut share_message = ShareMessage{
+									user: String::from_utf8_lossy($client_id).to_string(),
+									miner: String::from_utf8_lossy(&$share.user_tag_1).to_string(),
+									payout: $payout,
+									client_target: $client_target,
+									leading_zeros: $leading_zeros,
+									version: $share.header_version,
+									nbits: $share.header_nbits,
+									time: $share.header_time,
+									nonce: $share.header_nonce,
+									};
 								match serde_json::to_string(&share_message) {
 									Ok(message) => kafka_send!(&kafka_shares_topic, message),
 									Err(e) => println!("Error: {:?}", e),
@@ -897,7 +917,7 @@ fn main() {
 								} else if leading_zeros >= client_target {
 									if client.submitted_header_hashes.try_insert(&share.header_prevblock, block_hash) {
 										share_submitted(client_id, &share.user_tag_1, our_payout);
-										send_share!(client_id.clone());
+										send_share!(client_id, &share, our_payout, client_target, leading_zeros);
 										share_received!(client, client_target, share);
 									} else {
 										reject_share!(share, ShareRejectedReason::Duplicate);
@@ -1001,6 +1021,7 @@ fn main() {
 									if client.submitted_header_hashes.try_insert(&sketch.header_prevblock, block_hash) {
 										weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data);
 										send_weak_block!(client_id.clone());
+										send_share!(client_id, &sketch, our_payout, client_target, leading_zeros);
 										share_received!(client, client_target, sketch);
 									} else {
 										reject_share!(sketch, ShareRejectedReason::Duplicate);
