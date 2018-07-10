@@ -11,7 +11,13 @@ extern crate tokio;
 extern crate tokio_io;
 extern crate tokio_codec;
 extern crate secp256k1;
+extern crate serde;
 extern crate serde_json;
+extern crate rdkafka;
+
+#[macro_use]
+extern crate serde_derive;
+
 
 mod msg_framing;
 use msg_framing::*;
@@ -44,6 +50,7 @@ use futures::{future,Stream,Sink,Future};
 use futures::sync::mpsc;
 
 use tokio::{net, timer};
+use tokio::executor::{thread_pool, current_thread};
 
 use secp256k1::key::PublicKey;
 use secp256k1::Secp256k1;
@@ -55,6 +62,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::collections::{hash_map, HashMap, HashSet};
 
+use rdkafka::config::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+
+
 // These are useful to plug in business logic into:
 fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
 	println!("User {} authed with pass {}", String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_auth));
@@ -62,7 +73,7 @@ fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
 }
 
 fn share_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64) {
-	println!("Got valid share with value {} from \"{}\" from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag_1));
+	println!("Got valid share with value {} from \"{}\" from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag_1));		
 }
 
 fn weak_block_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>) {
@@ -81,6 +92,9 @@ const MIN_USER_SHARES_PER_30_SEC: usize = 2;
 // Dont change anything below...
 const MAX_TARGET_LEADING_0S: u8 = 71 - WEAK_BLOCK_RATIO_0S; // Roughly network diff/16 at the time of writing, should be more than sufficiently high for any use-case
 
+// Kafka topics for shares and weak_block;
+static KAFKA_SHARES_TOPIC: &'static str = "BetterHash-Shares-Topic";
+
 struct PerUserClientRef {
 	send_stream: mpsc::Sender<PoolMessage>,
 	client_id: u64,
@@ -89,6 +103,21 @@ struct PerUserClientRef {
 	cur_target: AtomicUsize,
 	accepted_shares: AtomicUsize,
 	submitted_header_hashes: GenerationalHashSets,
+}
+
+// Serialize pool share
+#[derive(Serialize)]
+struct ShareMessage {
+	user: String,       // miner username 
+	worker: String,     // miner workername
+	payout: u64,        // our payout
+	client_target: u8,  // client target
+	leading_zeros: u8,  // share target
+	version: u32,       // version
+	nbits: u32,         // nbits
+	time: u32,          // share tsp
+	nonce: u32,         // share nonce
+	is_weak_block: bool,// weak block tag
 }
 
 struct AllowedBlocksInfo {
@@ -208,12 +237,18 @@ fn main() {
 	println!("--payout_address - the Bitcoin address on which to receive payment");
 	println!("--bitcoind_rpc_path - the bitcoind RPC server for checking weak block validity");
 	println!("                      and header submission");
+	println!("--threads - thread pool size(Default: 2)");
+	println!("--kafka_brokers - kafka brokers(Optional)");
+	println!("--kafka_topic_prefix - kafka topic prefix for shares");
 
 	let mut listen_bind = None;
 	let mut auth_key = None;
 	let mut payout_addr = None;
 	let mut server_id = None;
 	let mut rpc_path = None;
+	let mut thread_pool_size = None;
+	let mut kafka_brokers = None;
+	let mut kafka_topic_prefix = None;
 
 	for arg in env::args().skip(1) {
 		if arg.starts_with("--listen_bind") {
@@ -275,6 +310,16 @@ fn main() {
 				return;
 			}
 			rpc_path = Some(arg.split_at(20).1.to_string());
+		} else if arg.starts_with("--threads") {
+			let size: usize = arg.split_at(10).1.parse().expect("Thread pool size should be integer");
+			thread_pool_size = Some(size);
+		} else if arg.starts_with("--kafka_brokers") {
+			if kafka_brokers.is_some() {
+				println!("Cannot specify multiple kafka_brokers, specify brokers togather instead");
+			}
+			kafka_brokers = Some(arg.split_at(16).1.to_string());
+		} else if arg.starts_with("--kafka_topic_prefix") {
+			kafka_topic_prefix = Some(arg.split_at(21).1.to_string());
 		} else {
 			println!("Unkown arg: {}", arg);
 			return;
@@ -285,6 +330,11 @@ fn main() {
 		println!("Need to specify all but server_id parameters");
 		return;
 	}
+
+	let thread_pool_size: usize = match thread_pool_size {
+		Some(n) => n,
+		None => 2,
+	};
 
 	let users: Arc<Mutex<Vec<Weak<PerUserClientRef>>>> = Arc::new(Mutex::new(Vec::new()));
 	let block_info = Arc::new(RwLock::new(AllowedBlocksInfo {
@@ -335,8 +385,41 @@ fn main() {
 		}
 		println!("Success! Starting up...");
 	}
+    
+	let mut kafka_producer = None;
 
-	let mut rt = tokio::runtime::Builder::new().build().unwrap();
+	// Setup optional kafka producer to send shares
+	if kafka_brokers.is_some() {
+		let new_kakfa_producer: FutureProducer = ClientConfig::new()
+			.set("bootstrap.servers", kafka_brokers.as_ref().unwrap())
+			.set("produce.offset.report", "true")
+			.set("message.timeout.ms", "5000")
+			.create()
+			.expect("Kafka Producer creation error");
+		kafka_producer = Some(new_kakfa_producer);
+	}
+
+    let mut topic_prefix: &str = "";
+	if let Some(ref prefix) = kafka_topic_prefix {
+		topic_prefix = prefix;
+	}
+
+	let kafka_shares_topic = format!("{}{}", topic_prefix, KAFKA_SHARES_TOPIC);
+
+	// Use current thread to send record
+    let io_thread = current_thread::CurrentThread::new();
+	let io_thread_handle = io_thread.handle();
+
+    // Setup tokio thread pool for runtime
+	let mut thread_pool_builder = thread_pool::Builder::new();
+	thread_pool_builder
+        .name_prefix("pool-")
+        .pool_size(thread_pool_size)
+        .build();
+
+	let mut rt = tokio::runtime::Builder::new()
+	    .threadpool_builder(thread_pool_builder)
+		.build().unwrap();
 
 	let block_info_clone = block_info.clone();
 	let rpc_client_clone = rpc_client.clone();
@@ -454,6 +537,10 @@ fn main() {
 					}
 
 					let users_ref = users.clone();
+					let kafka_producer_clone = kafka_producer.clone();
+					let io_thread_handle = io_thread_handle.clone();
+					let kafka_shares_topic = kafka_shares_topic.clone();
+
 					let server_id_vec = match server_id {
 						Some(ref id) => id.as_bytes().to_vec(),
 						None => vec![],
@@ -573,6 +660,50 @@ fn main() {
 
 									(our_payout, client_id)
 								}
+							}
+						}
+
+						macro_rules! kafka_send {
+							($topic: expr, $payload: expr) => {
+								if let Some(ref producer) = kafka_producer_clone {
+									println!("Sending to kafka:{}", $payload);
+									let produce_future = producer.send(
+										FutureRecord::to($topic)
+										    .key("")
+											.payload(&$payload),
+										0)
+										.then(|result| {
+											match result {
+												Ok(Ok(_)) => {},
+												Ok(Err((e, _))) => println!("Error: {:?}", e),
+												Err(_) => println!("Produce future cancelled"),
+											}
+											Ok((()))
+										});
+									let _ = io_thread_handle.spawn(produce_future);
+								}
+							}
+						}
+
+						macro_rules! send_share {
+							($client_id: expr, $share: expr, $payout: expr, $client_target: expr,
+							 	$leading_zeros: expr, $is_weak_block: expr) => {
+								let mut share_message = ShareMessage{
+									user: String::from_utf8_lossy($client_id).to_string(),
+									worker: String::from_utf8_lossy(&$share.user_tag_1).to_string(),
+									payout: $payout,
+									client_target: $client_target,
+									leading_zeros: $leading_zeros,
+									version: $share.header_version,
+									nbits: $share.header_nbits,
+									time: $share.header_time,
+									nonce: $share.header_nonce,
+									is_weak_block: $is_weak_block,
+									};
+								match serde_json::to_string(&share_message) {
+									Ok(message) => kafka_send!(&kafka_shares_topic, message),
+									Err(e) => println!("Error: {:?}", e),
+								};
 							}
 						}
 
@@ -769,6 +900,7 @@ fn main() {
 								} else if leading_zeros >= client_target {
 									if client.submitted_header_hashes.try_insert(&share.header_prevblock, block_hash) {
 										share_submitted(client_id, &share.user_tag_1, our_payout);
+										send_share!(client_id, &share, our_payout, client_target, leading_zeros, false);
 										share_received!(client, client_target, share);
 									} else {
 										reject_share!(share, ShareRejectedReason::Duplicate);
@@ -871,6 +1003,7 @@ fn main() {
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									if client.submitted_header_hashes.try_insert(&sketch.header_prevblock, block_hash) {
 										weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data);
+										send_share!(client_id, &sketch, our_payout, client_target, leading_zeros, true);
 										share_received!(client, client_target, sketch);
 									} else {
 										reject_share!(sketch, ShareRejectedReason::Duplicate);
