@@ -55,19 +55,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::collections::{hash_map, HashMap, HashSet};
 
-// These are useful to plug in business logic into:
-fn check_user_auth(user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
-	println!("User {} authed with pass {}", String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_auth));
-	true
-}
 
-fn share_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64) {
-	println!("Got valid share with value {} from \"{}\" from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag_1));
-}
 
-fn weak_block_submitted(user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>) {
-	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag_1));
-}
+mod generic_submitter;
+use generic_submitter::*;
+
+// You can change these consts as settings:
 
 // Note that because leading_0s_to_target gets the *largest* number with the given number of
 // leading 0s, we offset by 1 higher than we really want (this limits stratum false-positives
@@ -208,12 +201,15 @@ fn main() {
 	println!("--payout_address - the Bitcoin address on which to receive payment");
 	println!("--bitcoind_rpc_path - the bitcoind RPC server for checking weak block validity");
 	println!("                      and header submission");
+	print_submitter_parameters();
 
 	let mut listen_bind = None;
 	let mut auth_key = None;
 	let mut payout_addr = None;
 	let mut server_id = None;
 	let mut rpc_path = None;
+
+	let mut submitter_settings = init_submitter_settings();
 
 	for arg in env::args().skip(1) {
 		if arg.starts_with("--listen_bind") {
@@ -275,11 +271,15 @@ fn main() {
 				return;
 			}
 			rpc_path = Some(arg.split_at(20).1.to_string());
+		} else if parse_submitter_parameter(&mut submitter_settings, &arg) {
+			// Submitter did something useful!
 		} else {
 			println!("Unkown arg: {}", arg);
 			return;
 		}
 	}
+
+	let submitter_state = Arc::new(setup_submitter(submitter_settings));
 
 	if listen_bind.is_none() || auth_key.is_none() || payout_addr.is_none() || rpc_path.is_none() {
 		println!("Need to specify all but server_id parameters");
@@ -468,6 +468,7 @@ fn main() {
 
 					let block_info_clone = block_info.clone();
 					let rpc_client_clone = rpc_client.clone();
+					let submitter_state = submitter_state.clone();
 
 					tokio::spawn(TimeoutStream::new(rx, Duration::from_secs(60*10)).for_each(move |msg| {
 						macro_rules! send_response {
@@ -652,7 +653,7 @@ fn main() {
 										println!("Got a UserAuth for an already-registered client, disconencting proxy!");
 										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 									}
-									if check_user_auth(&info.user_id, &info.user_auth) {
+									if check_user_auth(&*submitter_state, &info.user_id, &info.user_auth) {
 										let client_id = max_client_id;
 										max_client_id += 1;
 
@@ -751,14 +752,15 @@ fn main() {
 									sha.result(&mut merkle_lhs);
 								}
 
-								let block_hash = BlockHeader {
+								let block_header = BlockHeader {
 									version: share.header_version,
 									prev_blockhash: Sha256dHash::from(&share.header_prevblock[..]),
 									merkle_root: Sha256dHash::from(&merkle_lhs[..]),
 									time: share.header_time,
 									bits: share.header_nbits,
 									nonce: share.header_nonce,
-								}.bitcoin_hash();
+								};
+								let block_hash = block_header.bitcoin_hash();
 								let leading_zeros = utils::count_leading_zeros(&block_hash[..]);
 
 								let client = connection_clients.get(client_id).unwrap();
@@ -768,7 +770,7 @@ fn main() {
 									println!("Got share that met weak block target, ignored as we'll check the weak block");
 								} else if leading_zeros >= client_target {
 									if client.submitted_header_hashes.try_insert(&share.header_prevblock, block_hash) {
-										share_submitted(client_id, &share.user_tag_1, our_payout);
+										share_submitted(&*submitter_state, client_id, &share.user_tag_1, our_payout, &block_header, leading_zeros, client_target);
 										share_received!(client, client_target, share);
 									} else {
 										reject_share!(share, ShareRejectedReason::Duplicate);
@@ -870,7 +872,7 @@ fn main() {
 
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									if client.submitted_header_hashes.try_insert(&sketch.header_prevblock, block_hash) {
-										weak_block_submitted(client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data);
+										weak_block_submitted(&*submitter_state, client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data, leading_zeros, client_target);
 										share_received!(client, client_target, sketch);
 									} else {
 										reject_share!(sketch, ShareRejectedReason::Duplicate);
