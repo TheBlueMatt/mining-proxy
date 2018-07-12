@@ -15,6 +15,9 @@ path = "src/multi_user_proxy.rs"
 name = "sample-pool"
 path = "src/sample_pool.rs"
 
+[features]
+kafka_submitter = [ "rdkafka", "serde", "serde_derive" ]
+
 [dependencies]
 secp256k1 = "0.9"
 base64 = "0.9"
@@ -27,3 +30,7 @@ tokio-codec = "0.1"
 rust-crypto = "0.2"
 serde_json = "1.0"
 hyper = "0.12"
+
+serde = { version = "1.0.70", optional = true }
+serde_derive = { version = "1.0", optional = true }
+rdkafka = { version = "0.17.0", optional = true }
