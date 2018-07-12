@@ -56,8 +56,22 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::collections::{hash_map, HashMap, HashSet};
 
 
+#[cfg(feature = "kafka_submitter")]
+extern crate serde;
+#[cfg(feature = "kafka_submitter")]
+extern crate rdkafka;
+#[cfg(feature = "kafka_submitter")]
+#[macro_use]
+extern crate serde_derive;
 
+#[cfg(feature = "kafka_submitter")]
+mod kafka_submitter;
+#[cfg(feature = "kafka_submitter")]
+use kafka_submitter::*;
+
+#[cfg(not(feature = "kafka_submitter"))]
 mod generic_submitter;
+#[cfg(not(feature = "kafka_submitter"))]
 use generic_submitter::*;
 
 // You can change these consts as settings:
