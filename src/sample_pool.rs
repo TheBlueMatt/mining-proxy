@@ -82,7 +82,7 @@ use generic_submitter::*;
 #[cfg(not(feature = "redis_authenticator"))]
 mod generic_authenticator;
 #[cfg(not(feature = "redis_authenticator"))]
-use generic_authenticator::*;
+use generic_authenticator;
 
 // You can change these consts as settings:
 

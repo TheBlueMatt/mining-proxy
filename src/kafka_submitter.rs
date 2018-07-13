@@ -1,3 +1,6 @@
+// With this mod, shares and weak blocks will be sent to kafka message queue,
+// with information in json format with attributes of type `ShareMessage`.
+
 use bitcoin::blockdata::block::BlockHeader;
 
 use rdkafka::config::ClientConfig;

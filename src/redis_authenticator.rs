@@ -1,4 +1,7 @@
-// We use simple_redis here,for we only need a simple redis command for authentication now.
+// We will need a simple redis command for authentication now.
+// Set "BetterHash:AuthorizedUsers" should be created in redis database, and fill with 
+// authorized users. We use `sismember` command to check if connected user is authorized.
+
 extern crate simple_redis;
 
 use std::sync::Mutex;
@@ -70,6 +73,8 @@ pub fn setup_authenticator(settings: RedisAuthenticatorSettings) -> RedisAuthent
 /// user_auth, but there probably isnt any reason to ever anyway...
 pub fn check_user_auth(state: &RedisAuthenticatorState, user_id: &Vec<u8>, _user_auth: &Vec<u8>) -> bool {
 	let user_id_string = String::from_utf8_lossy(user_id);
+
+	// Maybe convert to future for authentication process?
 	let mut client = state.client.lock().unwrap();
 	match client.sismember(&state.users_key, &user_id_string) {
 		Ok(value) => value,
