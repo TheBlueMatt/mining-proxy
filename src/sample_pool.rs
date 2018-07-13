@@ -64,16 +64,19 @@ extern crate rdkafka;
 #[macro_use]
 extern crate serde_derive;
 
+// Kafka submitter
 #[cfg(feature = "kafka_submitter")]
 mod kafka_submitter;
 #[cfg(feature = "kafka_submitter")]
 use kafka_submitter::*;
 
+// Redis authenticator
 #[cfg(feature = "redis_authenticator")]
 mod redis_authenticator;
 #[cfg(feature = "redis_authenticator")]
 use redis_authenticator::*;
 
+// Generic submitter and authenticator
 #[cfg(not(feature = "kafka_submitter"))]
 mod generic_submitter;
 #[cfg(not(feature = "kafka_submitter"))]
@@ -82,7 +85,7 @@ use generic_submitter::*;
 #[cfg(not(feature = "redis_authenticator"))]
 mod generic_authenticator;
 #[cfg(not(feature = "redis_authenticator"))]
-use generic_authenticator;
+use generic_authenticator::*;
 
 // You can change these consts as settings:
 
