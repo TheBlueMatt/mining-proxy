@@ -9,7 +9,7 @@ use serde_json;
 
 use tokio;
 
-// Kafka topics for shares and weak_block;
+// Kafka topics for shares and weak_blocks;
 const KAFKA_SHARES_TOPIC_POSTFIX: &'static str = "BetterHash-Shares-Topic";
 
 pub struct KafkaSubmitterSettings {
@@ -29,8 +29,8 @@ pub fn init_submitter_settings() -> KafkaSubmitterSettings {
 }
 
 pub fn print_submitter_parameters() {
-	println!("--kafka_brokers - kafka brokers(Optional)");
-	println!("--kafka_topic_prefix - kafka topic prefix for shares");
+	println!("--kafka_brokers - kafka brokers");
+	println!("--kafka_topic_prefix - kafka topic prefix for shares(Optional)");
 }
 
 /// Returns true if the given parameter could be parsed into a setting this submitter understands
@@ -79,19 +79,6 @@ pub fn setup_submitter(settings: KafkaSubmitterSettings) -> KafkaSubmitterState 
 	KafkaSubmitterState {
 		topic,
 		kafka_producer,
-	}
-}
-
-/// Returns true if the given user_id/auth pair is valid for this pool. Note that the pool_proxy
-/// stuff doesn't really bother with auth, so if you use it you probably can't reliably check
-/// user_auth, but there probably isnt any reason to ever anyway...
-pub fn check_user_auth(_state: &KafkaSubmitterState, user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
-	if String::from_utf8_lossy(user_id).as_bytes() == &user_id[..] {
-		println!("User {} authed with pass {}", String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_auth));
-		true
-	} else {
-		// We at least require user_id is valid utf-8
-		false
 	}
 }
 

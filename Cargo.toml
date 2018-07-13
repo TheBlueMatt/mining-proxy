@@ -17,6 +17,7 @@ path = "src/sample_pool.rs"
 
 [features]
 kafka_submitter = [ "rdkafka", "serde", "serde_derive" ]
+redis_authenticator = [ "simple_redis" ]
 
 [dependencies]
 secp256k1 = "0.9"
@@ -34,3 +35,4 @@ hyper = "0.12"
 serde = { version = "1.0.70", optional = true }
 serde_derive = { version = "1.0", optional = true }
 rdkafka = { version = "0.17.0", optional = true }
+simple_redis = { version = "0.3.43", optional = true }
