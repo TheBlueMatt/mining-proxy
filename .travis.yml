@@ -8,5 +8,5 @@ cache: cargo
 script:
   - cargo build --verbose
   - cargo test --verbose
-  - cargo build --verbose --features=kafka_submitter
-  - cargo test --verbose --features=kafka_submitter
+  - cargo build --verbose --features 'kafka_submitter redis_authenticator'
+  - cargo test --verbose --features 'kafka_submitter redis_authenticator'
