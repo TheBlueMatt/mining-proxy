@@ -77,7 +77,10 @@ pub fn check_user_auth(state: &RedisAuthenticatorState, user_id: &Vec<u8>, _user
 	// Maybe convert to future for authentication process?
 	let mut client = state.client.lock().unwrap();
 	match client.sismember(&state.users_key, &user_id_string) {
-		Ok(value) => value,
+		Ok(authorized) => {
+			println!("Authentication of user {} {}", &user_id_string, if authorized { "succeeded" } else { "failed" });
+			authorized
+		},
 		Err(e) => {
 			println!("Failed to interact with redis: {:?}", e);
 			false
