@@ -5,6 +5,7 @@
 extern crate simple_redis;
 
 use std::sync::Mutex;
+use std::str;
 
 // Redis set which includes all valid miner usernames.
 const REDIS_AUTHORIZED_USERS_KEY: &'static str = "BetterHash:AuthorizedUsers";
@@ -72,18 +73,21 @@ pub fn setup_authenticator(settings: RedisAuthenticatorSettings) -> RedisAuthent
 /// stuff doesn't really bother with auth, so if you use it you probably can't reliably check
 /// user_auth, but there probably isnt any reason to ever anyway...
 pub fn check_user_auth(state: &RedisAuthenticatorState, user_id: &Vec<u8>, _user_auth: &Vec<u8>) -> bool {
-	let user_id_string = String::from_utf8_lossy(user_id);
-
-	// Maybe convert to future for authentication process?
-	let mut client = state.client.lock().unwrap();
-	match client.sismember(&state.users_key, &user_id_string) {
-		Ok(authorized) => {
-			println!("Authentication of user {} {}", &user_id_string, if authorized { "succeeded" } else { "failed" });
-			authorized
-		},
-		Err(e) => {
-			println!("Failed to interact with redis: {:?}", e);
-			false
-		},
+	if let Ok(user_id_str) = str::from_utf8(user_id) {
+		// Maybe convert to future for authentication process?
+		let mut client = state.client.lock().unwrap();
+		match client.sismember(&state.users_key, user_id_str) {
+			Ok(authorized) => {
+				println!("Authentication of user {} {}", user_id_str, if authorized { "succeeded" } else { "failed" });
+				authorized
+			},
+			Err(e) => {
+				println!("Failed to interact with redis: {:?}", e);
+				false
+			},
+		}
+	} else {
+		println!("Encountered non-utf8 username bytes: {:?}", user_id);
+		false
 	}
 }
