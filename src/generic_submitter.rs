@@ -21,14 +21,6 @@ pub fn setup_submitter(_settings: GenericSubmitterSettings) -> GenericSubmitterS
 	GenericSubmitterState { }
 }
 
-/// Returns true if the given user_id/auth pair is valid for this pool. Note that the pool_proxy
-/// stuff doesn't really bother with auth, so if you use it you probably can't reliably check
-/// user_auth, but there probably isnt any reason to ever anyway...
-pub fn check_user_auth(_state: &GenericSubmitterState, user_id: &Vec<u8>, user_auth: &Vec<u8>) -> bool {
-	println!("User {} authed with pass {}", String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_auth));
-	true
-}
-
 pub fn share_submitted(_state: &GenericSubmitterState, user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, _header: &BlockHeader, _leading_zeros: u8, _required_leading_zeros: u8) {
 	println!("Got valid share with value {} from \"{}\" from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), String::from_utf8_lossy(user_tag_1));
 }

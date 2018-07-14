@@ -64,15 +64,28 @@ extern crate rdkafka;
 #[macro_use]
 extern crate serde_derive;
 
+// Kafka submitter
 #[cfg(feature = "kafka_submitter")]
 mod kafka_submitter;
 #[cfg(feature = "kafka_submitter")]
 use kafka_submitter::*;
 
+// Redis authenticator
+#[cfg(feature = "redis_authenticator")]
+mod redis_authenticator;
+#[cfg(feature = "redis_authenticator")]
+use redis_authenticator::*;
+
+// Generic submitter and authenticator
 #[cfg(not(feature = "kafka_submitter"))]
 mod generic_submitter;
 #[cfg(not(feature = "kafka_submitter"))]
 use generic_submitter::*;
+
+#[cfg(not(feature = "redis_authenticator"))]
+mod generic_authenticator;
+#[cfg(not(feature = "redis_authenticator"))]
+use generic_authenticator::*;
 
 // You can change these consts as settings:
 
@@ -216,6 +229,7 @@ fn main() {
 	println!("--bitcoind_rpc_path - the bitcoind RPC server for checking weak block validity");
 	println!("                      and header submission");
 	print_submitter_parameters();
+	print_authenticator_parameters();
 
 	let mut listen_bind = None;
 	let mut auth_key = None;
@@ -224,6 +238,7 @@ fn main() {
 	let mut rpc_path = None;
 
 	let mut submitter_settings = init_submitter_settings();
+	let mut authenticator_settings = init_authenticator_settings();
 
 	for arg in env::args().skip(1) {
 		if arg.starts_with("--listen_bind") {
@@ -287,6 +302,8 @@ fn main() {
 			rpc_path = Some(arg.split_at(20).1.to_string());
 		} else if parse_submitter_parameter(&mut submitter_settings, &arg) {
 			// Submitter did something useful!
+		} else if parse_authenticator_parameter(&mut authenticator_settings, &arg) {
+			// So as Authenticator!
 		} else {
 			println!("Unkown arg: {}", arg);
 			return;
@@ -294,6 +311,7 @@ fn main() {
 	}
 
 	let submitter_state = Arc::new(setup_submitter(submitter_settings));
+	let authenticator_state = Arc::new(setup_authenticator(authenticator_settings));
 
 	if listen_bind.is_none() || auth_key.is_none() || payout_addr.is_none() || rpc_path.is_none() {
 		println!("Need to specify all but server_id parameters");
@@ -483,6 +501,7 @@ fn main() {
 					let block_info_clone = block_info.clone();
 					let rpc_client_clone = rpc_client.clone();
 					let submitter_state = submitter_state.clone();
+					let authenticator_state = authenticator_state.clone();
 
 					tokio::spawn(TimeoutStream::new(rx, Duration::from_secs(60*10)).for_each(move |msg| {
 						macro_rules! send_response {
@@ -667,7 +686,7 @@ fn main() {
 										println!("Got a UserAuth for an already-registered client, disconencting proxy!");
 										return future::result(Err(io::Error::new(io::ErrorKind::InvalidData, utils::HandleError)));
 									}
-									if check_user_auth(&*submitter_state, &info.user_id, &info.user_auth) {
+									if check_user_auth(&*authenticator_state, &info.user_id, &info.user_auth) {
 										let client_id = max_client_id;
 										max_client_id += 1;
 
