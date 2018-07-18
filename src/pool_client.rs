@@ -465,6 +465,7 @@ impl ConnectionHandler<PoolMessage> for Arc<PoolHandler> {
 				}
 			},
 			PoolMessage::RejectUserAuth { user_id } => {
+				us.borrow_mut().user_id_to_postfix.remove(&user_id);
 				match us.job_stream.start_send(PoolProviderAction::UserReject { user_id }) {
 					Ok(_) => {},
 					Err(_) => {

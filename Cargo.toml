@@ -15,6 +15,11 @@ path = "src/multi_user_proxy.rs"
 name = "sample-pool"
 path = "src/sample_pool.rs"
 
+[profile.release]
+panic = "abort"
+[profile.dev]
+panic = "abort"
+
 [features]
 kafka_submitter = [ "rdkafka", "serde", "serde_derive" ]
 redis_authenticator = [ "simple_redis" ]
