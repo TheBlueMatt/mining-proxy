@@ -8,5 +8,5 @@ cache: cargo
 script:
   - cargo build --verbose
   - cargo test --verbose
-  - cargo build --verbose --features 'kafka_submitter redis_authenticator'
-  - cargo test --verbose --features 'kafka_submitter redis_authenticator'
+  - if [ "$(rustup show | grep default | grep stable)" != "" ]; then cargo build --verbose --features 'kafka_submitter redis_authenticator'; fi
+  - if [ "$(rustup show | grep default | grep stable)" != "" ]; then cargo test --verbose --features 'kafka_submitter redis_authenticator'; fi
