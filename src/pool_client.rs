@@ -136,7 +136,11 @@ impl PoolHandler {
 			match auth_action {
 				PoolAuthAction::AuthUser(user_id_auth) => {
 					let mut val = match refs.user_id_to_postfix.entry(user_id_auth.user_id.clone()) {
-						hash_map::Entry::Occupied(_) => panic!("Duplicate user auth request!"),
+						hash_map::Entry::Occupied(_) => {
+                            println!("Duplicate user auth request!"); 
+                            // Duplicate auth request is ignored here, or should be handled properly?
+                            return Ok(());
+                        },
 						hash_map::Entry::Vacant(e) => e.insert((0, Vec::new(), 0)),
 					};
 

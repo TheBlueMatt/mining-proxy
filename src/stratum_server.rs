@@ -522,7 +522,7 @@ impl StratumServer {
 		let client = {
 			let (send_sink, send_stream) = mpsc::channel(5);
 			tokio::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
-				unreachable!();
+				io::Error::new(io::ErrorKind::Other, "mpsc streams error!")
 			})).then(|_| {
 				future::result(Ok(()))
 			}));
@@ -739,7 +739,7 @@ impl StratumServer {
 									user_tag: user_tag,
 								}, block_hash))) {
 									Ok(_) => {},
-									Err(_) => { unreachable!(); },
+									Err(e) => println!("Unexpected sending nonce failure! {:?}", e),
 								};
 								send_response!(serde_json::Value::Null, true);
 							} else if us.user_auth_requests.is_none() && utils::does_hash_meet_target_div4(&block_hash[..], &job.template.target[..]) {
