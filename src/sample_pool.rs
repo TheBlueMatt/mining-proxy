@@ -460,7 +460,7 @@ fn main() {
 					let (tx, rx) = tokio_codec::Framed::new(sock, PoolMsgFramer::new()).split();
 					let (mut send_sink, send_stream) = mpsc::channel(5);
 					tokio::spawn(tx.send_all(send_stream.map_err(|_| -> io::Error {
-						panic!("mpsc streams cant generate errors!");
+						io::Error::new(io::ErrorKind::Other, "mpsc streams errors!")
 					})).then(|_| {
 						future::result(Ok(()))
 					}));

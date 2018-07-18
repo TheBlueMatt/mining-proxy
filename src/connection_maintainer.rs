@@ -80,7 +80,7 @@ impl<MessageType : Send + Sync, HandlerProvider : 'static + ConnectionHandler<Me
 							let (framer, tx_stream) = self.handler.new_connection();
 							let (tx, rx) = tokio_codec::Framed::new(stream, framer).split();
 							let stream = tx_stream.map_err(|_| -> io::Error {
-								panic!("mpsc streams cant generate errors!");
+								io::Error::new(io::ErrorKind::Other, "mpsc streams cant generate errors!")
 							});
 							tokio::spawn(tx.send_all(stream).then(|_| {
 								println!("Disconnected on send side, will reconnect...");

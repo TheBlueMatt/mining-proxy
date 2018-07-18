@@ -32,7 +32,10 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 
 	let mut outputs = Vec::with_capacity(template.appended_coinbase_outputs.len() + 1);
 	for output in template.appended_coinbase_outputs.iter() {
-		if output.value != 0 { panic!("We should have checked this on the recv end!"); }
+		if output.value != 0 {
+			println!("Output value is not zero. We should have checked this on the recv end!");
+            return None;
+		}
 	}
 
 	match &work.coinbase_prefix_postfix {
@@ -77,7 +80,10 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 				Some(&PoolProviderUserJob { ref coinbase_postfix, ref target }) => {
 					template.target = utils::max_le(template.target, *target);
 
-					if !template.coinbase_postfix.is_empty() { panic!("We should have checked this on the recv end!"); }
+					if !template.coinbase_postfix.is_empty() {
+						println!("Template coinbase postfix is not empty. We should have checked this on the recv end!");
+                        return None;
+					}
 					template.coinbase_postfix.extend_from_slice(coinbase_postfix);
 				},
 				None => {}
