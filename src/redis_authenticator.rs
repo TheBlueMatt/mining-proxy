@@ -55,7 +55,7 @@ pub fn setup_authenticator(settings: RedisAuthenticatorSettings) -> RedisAuthent
 		panic!();
 	}
 
-    // Redis connection resiliency will be handled by simple-redis
+	// Redis connection resiliency will be handled by simple-redis
 	let client = match simple_redis::create(&settings.redis_url.unwrap()) {
 		Ok(client) => client,
 		Err(e) => {
@@ -66,7 +66,7 @@ pub fn setup_authenticator(settings: RedisAuthenticatorSettings) -> RedisAuthent
 	RedisAuthenticatorState {
 		client: Mutex::new(client),
 		users_key: REDIS_AUTHORIZED_USERS_KEY.to_string(),
-	}	
+	}
 }
 
 /// Returns true if the given user_id/auth pair is valid for this pool. Note that the pool_proxy
