@@ -6,6 +6,7 @@ extern crate tokio_io;
 extern crate tokio_codec;
 extern crate crypto;
 extern crate secp256k1;
+extern crate clap;
 
 #[macro_use]
 extern crate serde_json;
@@ -41,164 +42,204 @@ use futures::{Future,Stream,Sink};
 
 use tokio::net;
 
-use std::{env};
 use std::net::ToSocketAddrs;
 use std::str::FromStr;
 
-fn main() {
-	println!("USAGE: mining-proxy (--job_provider=host:port)* (--pool_server=host:port)* --stratum_listen_bind=IP:port --mining_listen_bind=IP:port --mining_auth_key=base58privkey --payout_address=addr");
-	println!("A stratum/work protocol proxy for a number of ASICs mining on a single user");
-	println!("account on a pool or for a solo miner.");
-	println!("--job_provider - bitcoind(s) running as mining server(s) to get work from");
-	println!("--pool_server - pool server(s) to get payout address from/submit shares to");
-	println!("--pool_user_id - user id (eg username) on pool");
-	println!("--pool_user_auth - user auth (eg password) on pool");
-	println!("--stratum_listen_bind - the address to bind to to announce stratum jobs on");
-	println!("--mining_listen_bind - the address to bind to to announce jobs on natively");
-	println!("--mining_auth_key - the auth key to use to authenticate to native clients");
-	println!("--payout_address - the Bitcoin address on which to receive payment");
-	println!("We always try to keep exactly one connection open per argument, no matter how");
-	println!("many hosts a DNS name may resolve to. We try each hostname until one works.");
-	println!("Job providers are not prioritized (the latest job is always used), pools are");
-	println!("prioritized in the order they appear on the command line.");
-	println!("--payout_address is used whenever no pools are available but does not affect");
-	println!("pool payout information (only --pool_user_id does so).");
+fn clap_parser_config<'a, 'b>() -> clap::App<'a, 'b> {
+	let about = "A stratum/work protocol proxy for a number of ASICs mining on a single user account on a pool or for a solo miner.
 
-	let mut job_provider_hosts = Vec::new();
-	let mut pool_server_hosts = Vec::new();
-	let mut user_id = None;
-	let mut user_auth = None;
-	let mut stratum_listen_bind = None;
-	let mut mining_listen_bind = None;
-	let mut mining_auth_key = None;
-	let mut payout_addr = None;
+We always try to keep exactly one connection open per argument, no matter how many hosts a DNS name may resolve to. \
+We try each hostname until one works. Job providers are not prioritized (the latest job is always used), pools are \
+prioritized in the order they appear on the command line. --payout_address is used whenever no pools are available \
+but does not affect pool payout information (only --pool_user_id does so).";
 
-	for arg in env::args().skip(1) {
-		if arg.starts_with("--job_provider") {
-			match arg.split_at(15).1.to_socket_addrs() {
-				Err(_) => {
-					println!("Bad address resolution: {}", arg);
-					return;
-				},
-				Ok(_) => job_provider_hosts.push(arg.split_at(15).1.to_string())
-			}
-		} else if arg.starts_with("--pool_server") {
-			match arg.split_at(14).1.to_socket_addrs() {
-				Err(_) => {
-					println!("Bad address resolution: {}", arg);
-					return;
-				},
-				Ok(_) => pool_server_hosts.push(arg.split_at(14).1.to_string())
-			}
-		} else if arg.starts_with("--stratum_listen_bind") {
-			if stratum_listen_bind.is_some() {
-				println!("Cannot specify multiple listen binds");
-				return;
-			}
-			stratum_listen_bind = Some(match arg.split_at(22).1.parse() {
-				Ok(sockaddr) => sockaddr,
-				Err(_) =>{
-					println!("Failed to parse stratum_listen_bind into a socket address");
-					return;
-				}
-			});
-		} else if arg.starts_with("--mining_listen_bind") {
-			if mining_listen_bind.is_some() {
-				println!("Cannot specify multiple listen binds");
-				return;
-			}
-			mining_listen_bind = Some(match arg.split_at(21).1.parse() {
-				Ok(sockaddr) => sockaddr,
-				Err(_) =>{
-					println!("Failed to parse mining_listen_bind into a socket address");
-					return;
-				}
-			});
-		} else if arg.starts_with("--mining_auth_key") {
-			if mining_auth_key.is_some() {
-				println!("Cannot specify multiple auth keys");
-				return;
-			}
-			mining_auth_key = Some(match privkey::Privkey::from_str(arg.split_at(18).1) {
-				Ok(privkey) => {
-					if !privkey.compressed {
-						println!("Private key must represent a compressed key!");
-						return;
-					}
-					privkey.key
-				},
-				Err(_) =>{
-					println!("Failed to parse mining_auth_key into a private key");
-					return;
-				}
-			});
-		} else if arg.starts_with("--payout_address") {
-			if payout_addr.is_some() {
-				println!("Cannot specify multiple payout addresses");
-				return;
-			}
-			//TODO: check network magic byte? We're allowed to mine on any net, though...
-			payout_addr = Some(match Address::from_str(arg.split_at(17).1) {
-				Ok(addr) => addr,
-				Err(_) => {
-					println!("Failed to parse payout_address into a Bitcoin address");
-					return;
-				}
-			});
-		} else if arg.starts_with("--pool_user_id") {
-			if user_id.is_some() {
-				println!("Cannot specify multiple pool_user_ids");
-				return;
-			}
-			user_id = Some(arg.split_at(15).1.as_bytes().to_vec());
-		} else if arg.starts_with("--pool_user_auth") {
-			if user_auth.is_some() {
-				println!("Cannot specify multiple pool_user_auths");
-				return;
-			}
-			user_auth = Some(arg.split_at(17).1.as_bytes().to_vec());
-		} else {
-			println!("Unkown arg: {}", arg);
-			return;
-		}
+	clap::App::new("mining-proxy")
+		.author("Matt Corallo")
+		.about(about)
+
+		.arg(clap::Arg::with_name("job_provider")
+			.help("bitcoind(s) running as mining server(s) to get work from")
+			.long("job-provider")
+			.value_name("HOST:PORT")
+			.required(true)
+			.takes_value(true)
+			.multiple(true))
+
+		.arg(clap::Arg::with_name("pool_server")
+			.help("pool server(s) to get payout address from/submit shares to")
+			.long("pool-server")
+			.value_name("HOST:PORT")
+			.required(true)
+			.takes_value(true)
+			.multiple(true))
+
+		.arg(clap::Arg::with_name("pool_user_id")
+			.help("user id (eg username) on pool")
+			.long("pool-user-id")
+			.value_name("POOLID")
+			.required(true)
+			.takes_value(true))
+
+		.arg(clap::Arg::with_name("pool_user_auth")
+			.help("user auth (eg password) on pool")
+			.long("pool-user-auth")
+			.value_name("POOLAUTH")
+			.required(true)
+			.takes_value(true))
+
+		.arg(clap::Arg::with_name("stratum_listen_bind")
+			.help("Stratum job announcement binding address.")
+			.long("stratum-listen-bind")
+			.value_name("IP:PORT")
+			.required(false)
+			.takes_value(true))
+
+		.arg(clap::Arg::with_name("mining_listen_bind")
+			.help("the address to bind to to announce jobs on natively")
+			.long("mining-listen-bind")
+			.value_name("IP:PORT")
+			.required(true)
+			.takes_value(true))
+
+		.arg(clap::Arg::with_name("mining_auth_key")
+			.help("the auth key to use to authenticate to native clients")
+			.long("mining-auth-key")
+			.value_name("BASE58PRIVKEY")
+			.required(false)
+			.takes_value(true))
+
+		.arg(clap::Arg::with_name("payout_address")
+			.help("the Bitcoin address on which to receive payment")
+			.long("payout-address")
+			.value_name("ADDR")
+			.required(true)
+			.takes_value(true))
+}
+
+struct CommandLineArgs {
+	job_provider_hosts: Vec<String>,
+	pools: Vec<PoolInfo>,
+	stratum_listen_bind: Option<std::net::SocketAddr>,
+	mining_listen_bind: Option<std::net::SocketAddr>,
+	mining_auth_key: Option<secp256k1::key::SecretKey>,
+	payout_address: bitcoin::util::address::Address
+}
+
+fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
+	let arg_matches = clap_parser_config().get_matches();
+
+	let job_provider_hosts: Vec<_>= arg_matches
+        .values_of("job_provider")
+        .unwrap()
+        .map(String::from)
+        .collect();
+	if let Err(err) = check_socket_addresses(&job_provider_hosts) {
+		return Err(err);
 	}
 
-	if job_provider_hosts.is_empty() {
-		println!("Need at least some job providers");
-		return;
-	}
-	if stratum_listen_bind.is_none() && mining_listen_bind.is_none() {
-		println!("Need some listen bind");
-		return;
-	}
-	if payout_addr.is_none() {
-		println!("Need some payout address for fallback/solo mining");
-		return;
-	}
-	if mining_listen_bind.is_some() && mining_auth_key.is_none() {
-		println!("Need some mining_auth_key for mining_listen_bind");
-		return;
-	}
+	let pool_user_id = arg_matches.value_of("pool_user_id").unwrap().as_bytes().to_vec();
+	let pool_user_auth = arg_matches.value_of("pool_user_auth").unwrap().as_bytes().to_vec();
 
-	if user_id.is_none() {
-		user_id = Some(Vec::new());
+	let pool_server_hosts: Vec<_>= arg_matches
+		.values_of("pool_server")
+		.unwrap()
+		.map(String::from)
+		.collect();
+	if let Err(err) = check_socket_addresses(&pool_server_hosts) {
+		return Err(err);
 	}
-	if user_auth.is_none() {
-		user_auth = Some(Vec::new());
-	}
-
 	let mut pools = Vec::with_capacity(pool_server_hosts.len());
-	for pool in pool_server_hosts.drain(..) {
+	for pool in &pool_server_hosts {
 		pools.push(PoolInfo {
-			host_port: pool,
-			user_id: user_id.as_ref().unwrap().clone(),
-			user_auth: user_auth.as_ref().unwrap().clone(),
+			host_port: pool.to_string(),
+			user_id: pool_user_id.clone(),
+			user_auth: pool_user_auth.clone(),
 		});
 	}
 
+	let stratum_listen_bind = match arg_matches.value_of("stratum_listen_bind") {
+		Some(v) => match v.to_string().parse() {
+			Ok(sock_address) => Some(sock_address),
+			Err(_) => {
+				return Err("Failed to parse stratum_listen_bind into a socket address".to_string());
+			}
+		},
+		None => None
+	};
+	let mining_listen_bind = match arg_matches.value_of("mining_listen_bind") {
+		Some(v) => match v.to_string().parse() {
+			Ok(sock_address) => Some(sock_address),
+			Err(_) => {
+				return Err("Failed to parse mining_listen_bind into a socket address".to_string());
+			}
+		},
+		None => None
+	};
+
+	if stratum_listen_bind.is_none() && mining_listen_bind.is_none() {
+		return Err("Need some listen bind".to_string());
+	}
+
+	let mining_auth_key = match arg_matches.value_of("mining_auth_key") {
+		Some(v) => {
+			match privkey::Privkey::from_str(&v.to_string()) {
+				Ok(private_key) => {
+					if !private_key.compressed {
+						return Err("Private key must represent a compressed key".to_string());
+					}
+					Some(private_key.key)
+				},
+				Err(_) => {
+					return Err("Failed to parse mining_auth_key into a private key".to_string());
+				}
+			}
+		},
+		None => None
+	};
+
+	if mining_listen_bind.is_some() && mining_auth_key.is_none() {
+		return Err("Need some mining_auth_key for mining_listen_bind".to_string());
+	}
+
+	let payout_address_str = arg_matches.value_of("payout_address").unwrap();
+	let payout_address = match Address::from_str(payout_address_str) {
+		Ok(address) => address,
+		Err(_) => {
+			return Err("Failed to parse payout_address into a Bitcoin address".to_string());
+		}
+	};
+
+	Ok(CommandLineArgs {
+		job_provider_hosts,
+		pools,
+		stratum_listen_bind,
+		mining_listen_bind,
+		mining_auth_key,
+		payout_address
+	})
+}
+
+fn check_socket_addresses(addresses: &Vec<String>) -> Result<(), String> {
+	for address in addresses {
+		if address.to_socket_addrs().is_err() {
+			return Err(format!("Bad socket address resolution: {}", address));
+		}
+	}
+	Ok(())
+}
+
+fn main() {
+	let args = match parse_command_line_arguments() {
+		Ok(args) => args,
+		Err(err) => {
+			println!("Error parsing command line arguments: {}", err);
+			return;
+		}
+	};
+
 	let mut rt = tokio::runtime::Runtime::new().unwrap();
 	rt.spawn(future::lazy(move || -> Result<(), ()> {
-		let job_rx = WorkGetter::create(job_provider_hosts, pools, payout_addr.clone().unwrap().script_pubkey());
+		let job_rx = WorkGetter::create(args.job_provider_hosts, args.pools, args.payout_address.clone().script_pubkey());
 
 		macro_rules! bind_and_handle {
 			($listen_bind_option: expr, $server: expr, $server_type: tt) => {
@@ -225,10 +266,10 @@ fn main() {
 			}
 		}
 
-		if stratum_listen_bind.is_some() && mining_listen_bind.is_none() {
-			bind_and_handle!(stratum_listen_bind, StratumServer::new(job_rx, None), StratumServer);
-		} else if stratum_listen_bind.is_none() && mining_listen_bind.is_some() {
-			bind_and_handle!(mining_listen_bind, MiningServer::new(job_rx, mining_auth_key.unwrap()), MiningServer);
+		if args.stratum_listen_bind.is_some() && args.mining_listen_bind.is_none() {
+			bind_and_handle!(args.stratum_listen_bind, StratumServer::new(job_rx, None), StratumServer);
+		} else if args.stratum_listen_bind.is_none() && args.mining_listen_bind.is_some() {
+			bind_and_handle!(args.mining_listen_bind, MiningServer::new(job_rx, args.mining_auth_key.unwrap()), MiningServer);
 		} else {
 			let (mut stratum_tx, stratum_rx) = mpsc::unbounded();
 			let (mut mining_tx, mining_rx) = mpsc::unbounded();
@@ -239,8 +280,8 @@ fn main() {
 			}).then(|_| {
 				Ok(())
 			}));
-			bind_and_handle!(stratum_listen_bind, StratumServer::new(stratum_rx, None), StratumServer);
-			bind_and_handle!(mining_listen_bind, MiningServer::new(mining_rx, mining_auth_key.unwrap()), MiningServer);
+			bind_and_handle!(args.stratum_listen_bind, StratumServer::new(stratum_rx, None), StratumServer);
+			bind_and_handle!(args.mining_listen_bind, MiningServer::new(mining_rx, args.mining_auth_key.unwrap()), MiningServer);
 		}
 
 		Ok(())
