@@ -56,6 +56,18 @@ pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 	a
 }
 
+/// Convert nbits to target
+#[allow(dead_code)]
+#[inline]
+pub fn nbits_to_target(nbits: u32) -> [u8; 32] {
+	let mut res = [0; 32];
+	let zero_bytes = 32 - (nbits >> 24) & 0xff;
+	res[(31 - zero_bytes) as usize] = ((nbits >> 16) & 0xff) as u8;
+    res[(31 - zero_bytes - 1) as usize] = ((nbits >> 8) & 0xff) as u8;
+	res[(31 - zero_bytes - 2) as usize] = (nbits & 0xff) as u8;
+	res
+}
+
 /// Returns the highest value with the given number of leading 0s
 #[allow(dead_code)]
 #[inline]
@@ -241,6 +253,11 @@ mod tests {
 	#[test]
 	fn test_1mill_target_lower_bound() {
 		assert!(utils::target_to_diff_lb(&utils::MILLION_DIFF_TARGET) >= 1000000.0);
+	}
+
+	#[test]
+	fn test_nbits_to_target() {
+		assert_eq!(utils::nbits_to_target(0x172f4f7b), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123, 79, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 	}
 
 	#[test]

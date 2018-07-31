@@ -12,6 +12,8 @@ use serde_json;
 
 use tokio;
 
+use utils;
+
 // Kafka topics for shares and weak_blocks;
 const KAFKA_SHARES_TOPIC_POSTFIX: &'static str = "BetterHash-Shares-Topic";
 
@@ -96,7 +98,8 @@ struct ShareMessage {
 	version: u32,       // version
 	nbits: u32,         // nbits
 	time: u32,          // share tsp
-	nonce: u32,         // share nonce
+	hash: String,       // share hash
+	is_good_block: bool,// potential good block tag
 	is_weak_block: bool,// weak block tag
 }
 
@@ -115,7 +118,8 @@ pub fn share_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_
 				version: header.version,
 				nbits: header.bits,
 				time: header.time,
-				nonce: header.nonce,
+				hash: String::new(),  // We only include hash for weak block
+				is_good_block: false,
 				is_weak_block: false,
 			}).unwrap()),
 	0).then(|result| {
@@ -128,7 +132,8 @@ pub fn share_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_
 	}));
 }
 
-pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>, leading_zeros: u8, required_leading_zeros: u8) {
+pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>,
+	leading_zeros: u8, required_leading_zeros: u8, is_good_block: bool, block_hash: &[u8]) {
 	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag_1));
 
 	tokio::spawn(state.kafka_producer.send(
@@ -143,7 +148,8 @@ pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user
 				version: header.version,
 				nbits: header.bits,
 				time: header.time,
-				nonce: header.nonce,
+				hash: utils::bytes_to_hex(block_hash),
+				is_good_block,
 				is_weak_block: true,
 			}).unwrap()),
 	0).then(|result| {

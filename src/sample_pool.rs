@@ -905,7 +905,10 @@ fn main() {
 
 								if leading_zeros >= client_target + WEAK_BLOCK_RATIO_0S {
 									if client.submitted_header_hashes.try_insert(&sketch.header_prevblock, block_hash) {
-										weak_block_submitted(&*submitter_state, client_id, &sketch.user_tag_1, our_payout, &header, &new_txn, &sketch.extra_block_data, leading_zeros, client_target);
+										let block_target = utils::nbits_to_target(sketch.header_nbits);
+										let is_good_block = utils::does_hash_meet_target(&block_hash[..], &block_target[..]);
+										weak_block_submitted(&*submitter_state, client_id, &sketch.user_tag_1, our_payout, &header,
+											&new_txn, &sketch.extra_block_data, leading_zeros, client_target, is_good_block, &block_hash[..]);
 										share_received!(client, client_target, sketch);
 									} else {
 										reject_share!(sketch, ShareRejectedReason::Duplicate);
