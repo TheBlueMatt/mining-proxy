@@ -56,6 +56,7 @@ but does not affect pool payout information (only --pool_user_id does so).";
 	clap::App::new("mining-proxy")
 		.author("Matt Corallo")
 		.about(about)
+		.version(env!("CARGO_PKG_VERSION"))
 
 		.arg(clap::Arg::with_name("job_provider")
 			.help("bitcoind(s) running as mining server(s) to get work from")
