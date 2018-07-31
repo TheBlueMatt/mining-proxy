@@ -160,7 +160,7 @@ fn job_to_json_string_prefix(template: &BlockTemplate, update_id: u32, user_coin
 	prefix.push_str(&bytes_to_hex_insane_order(&template.header_prevblock)); // 64 chars
 	prefix.push_str("\",\""); // 3 chars
 
-	push_le_32_hex(template.coinbase_version, &mut prefix); // 8 bytes
+	push_le_32_hex(template.coinbase_version, &mut prefix); // 8 chars
 	prefix.push_str("01"); // 2 chars
 	prefix.push_str("0000000000000000000000000000000000000000000000000000000000000000ffffffff"); // 72 chars
 	// Add size of extranonce + 8 bytes for client id + 4 bytes for update id
