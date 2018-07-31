@@ -291,10 +291,10 @@ fn main() {
 				println!("Cannot specify multiple pool info");
 				return;
 			}
-			// We limit pool info vec length to 30 now.
-			pool_info = Some(arg.split_at(12).1.to_string().into_bytes());
+			// We limit pool info string length to 30 now.
+			pool_info = Some(arg.split_at(12).1.to_string());
 			if pool_info.as_ref().unwrap().len() > 30 {
-				println!("Pool info bytes cannot be longer then 30");
+				println!("Pool info string cannot be longer then 30");
 				return;
 			}
 		} else if arg.starts_with("--server_id") {
@@ -504,7 +504,10 @@ fn main() {
 						None => vec![],
 					};
 					let payout_addr_clone = payout_addr.as_ref().unwrap().clone();
-					let pool_info_clone = pool_info.as_ref().unwrap().clone();
+					let pool_info_vec = match pool_info {
+						Some(ref info) => info.as_bytes().to_vec(),
+						None => vec![],
+					};
 
 					let mut connection_clients = HashMap::new();
 					let mut client_ids = HashMap::new();
@@ -674,7 +677,7 @@ fn main() {
 								let timestamp = time.as_secs() * 1000 + time.subsec_nanos() as u64 / 1_000_000;
 								let payout_info = PoolPayoutInfo {
 									timestamp,
-									pool_info: pool_info_clone.clone(),
+									pool_info: pool_info_vec.clone(),
 									remaining_payout: payout_addr_clone.clone(),
 									appended_outputs: vec![],
 								};
