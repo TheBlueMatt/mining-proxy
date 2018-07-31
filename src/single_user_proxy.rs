@@ -54,7 +54,7 @@ prioritized in the order they appear on the command line. --payout_address is us
 but does not affect pool payout information (only --pool_user_id does so).";
 
 	clap::App::new("mining-proxy")
-		.author("Matt Corallo")
+		.author(env!("CARGO_PKG_AUTHORS"))
 		.about(about)
 		.version(env!("CARGO_PKG_VERSION"))
 
