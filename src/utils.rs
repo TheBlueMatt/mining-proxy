@@ -61,10 +61,16 @@ pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 #[inline]
 pub fn nbits_to_target(nbits: u32) -> [u8; 32] {
 	let mut res = [0; 32];
-	let zero_bytes = 32 - (nbits >> 24) & 0xff;
-	res[(31 - zero_bytes) as usize] = ((nbits >> 16) & 0xff) as u8;
-    res[(31 - zero_bytes - 1) as usize] = ((nbits >> 8) & 0xff) as u8;
-	res[(31 - zero_bytes - 2) as usize] = (nbits & 0xff) as u8;
+	let nshift = (nbits >> 24) & 0xff; // nshift >= 0;
+	if nshift > 0 {
+		res[(nshift - 1) as usize] = ((nbits >> 16) & 0xff) as u8;
+	}
+	if nshift > 1 {
+		res[(nshift - 2) as usize] = ((nbits >> 8) & 0xff) as u8;
+	}
+	if nshift > 2 {
+		res[(nshift - 3) as usize] = (nbits & 0xff) as u8;
+	}
 	res
 }
 
@@ -258,6 +264,9 @@ mod tests {
 	#[test]
 	fn test_nbits_to_target() {
 		assert_eq!(utils::nbits_to_target(0x172f4f7b), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123, 79, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+		assert_eq!(utils::nbits_to_target(0x002f4f7b), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+		assert_eq!(utils::nbits_to_target(0x012f4f7b), [47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+		assert_eq!(utils::nbits_to_target(0x022f4f7b), [79, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 	}
 
 	#[test]
