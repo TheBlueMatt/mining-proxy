@@ -129,14 +129,22 @@ struct CommandLineArgs {
 fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
 	let arg_matches = clap_parser_config().get_matches();
 
+	macro_rules! check_socket_addresses {
+		($addresses: expr) => {
+			for address in $addresses {
+				if address.to_socket_addrs().is_err() {
+					return Err(format!("Bad socket address resolution: {}", address));
+				}
+			}
+		}
+	}
+
 	let job_provider_hosts: Vec<_>= arg_matches
         .values_of("job_provider")
         .unwrap()
         .map(String::from)
         .collect();
-	if let Err(err) = check_socket_addresses(&job_provider_hosts) {
-		return Err(err);
-	}
+	check_socket_addresses!(&job_provider_hosts);
 
 	let pool_user_id = arg_matches.value_of("pool_user_id").unwrap().as_bytes().to_vec();
 	let pool_user_auth = arg_matches.value_of("pool_user_auth").unwrap().as_bytes().to_vec();
@@ -146,9 +154,8 @@ fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
 		.unwrap()
 		.map(String::from)
 		.collect();
-	if let Err(err) = check_socket_addresses(&pool_server_hosts) {
-		return Err(err);
-	}
+	check_socket_addresses!(&pool_server_hosts);
+
 	let mut pools = Vec::with_capacity(pool_server_hosts.len());
 	for pool in &pool_server_hosts {
 		pools.push(PoolInfo {
@@ -218,15 +225,6 @@ fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
 		mining_auth_key,
 		payout_address
 	})
-}
-
-fn check_socket_addresses(addresses: &Vec<String>) -> Result<(), String> {
-	for address in addresses {
-		if address.to_socket_addrs().is_err() {
-			return Err(format!("Bad socket address resolution: {}", address));
-		}
-	}
-	Ok(())
 }
 
 fn main() {
