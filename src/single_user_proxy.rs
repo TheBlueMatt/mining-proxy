@@ -49,9 +49,9 @@ fn clap_parser_config<'a, 'b>() -> clap::App<'a, 'b> {
 	let about = "A stratum/work protocol proxy for a number of ASICs mining on a single user account on a pool or for a solo miner.
 
 We always try to keep exactly one connection open per argument, no matter how many hosts a DNS name may resolve to. \
-We try each hostname until one works. Job providers are not prioritized (the latest job is always used), pools are \
-prioritized in the order they appear on the command line. --payout_address is used whenever no pools are available \
-but does not affect pool payout information (only --pool_user_id does so).";
+We try each hostname until one works. Job providers are not prioritized (the latest job is always used). Pools are \
+prioritized in the order they appear on the command line. --payout-address is used whenever no pools are available \
+but does not affect pool payout information (only --pool-user-id does so).";
 
 	clap::App::new("mining-proxy")
 		.author(env!("CARGO_PKG_AUTHORS"))
@@ -59,7 +59,7 @@ but does not affect pool payout information (only --pool_user_id does so).";
 		.version(env!("CARGO_PKG_VERSION"))
 
 		.arg(clap::Arg::with_name("job_provider")
-			.help("bitcoind(s) running as mining server(s) to get work from")
+			.help("Bitcoind(s) running as mining server(s) which provide work")
 			.long("job-provider")
 			.value_name("HOST:PORT")
 			.required(true)
@@ -67,7 +67,7 @@ but does not affect pool payout information (only --pool_user_id does so).";
 			.multiple(true))
 
 		.arg(clap::Arg::with_name("pool_server")
-			.help("pool server(s) to get payout address from/submit shares to")
+			.help("pool server(s) for payout address and shares submission")
 			.long("pool-server")
 			.value_name("HOST:PORT")
 			.required(true)
@@ -75,44 +75,44 @@ but does not affect pool payout information (only --pool_user_id does so).";
 			.multiple(true))
 
 		.arg(clap::Arg::with_name("pool_user_id")
-			.help("user id (eg username) on pool")
+			.help("pool user id (e.g. username)")
 			.long("pool-user-id")
-			.value_name("POOLID")
+			.value_name("ID")
 			.required(true)
 			.takes_value(true))
 
 		.arg(clap::Arg::with_name("pool_user_auth")
-			.help("user auth (eg password) on pool")
+			.help("pool user auth (e.g. password)")
 			.long("pool-user-auth")
-			.value_name("POOLAUTH")
+			.value_name("PASSWORD")
 			.required(true)
 			.takes_value(true))
 
 		.arg(clap::Arg::with_name("stratum_listen_bind")
-			.help("Stratum job announcement binding address.")
+			.help("Stratum job announcement binding address")
 			.long("stratum-listen-bind")
 			.value_name("IP:PORT")
 			.required(false)
 			.takes_value(true))
 
 		.arg(clap::Arg::with_name("mining_listen_bind")
-			.help("the address to bind to to announce jobs on natively")
+			.help("native job announcement binding address")
 			.long("mining-listen-bind")
 			.value_name("IP:PORT")
 			.required(true)
 			.takes_value(true))
 
 		.arg(clap::Arg::with_name("mining_auth_key")
-			.help("the auth key to use to authenticate to native clients")
+			.help("native clients authentication key")
 			.long("mining-auth-key")
 			.value_name("BASE58PRIVKEY")
 			.required(false)
 			.takes_value(true))
 
 		.arg(clap::Arg::with_name("payout_address")
-			.help("the Bitcoin address on which to receive payment")
+			.help("Bitcoin address for receiving payment")
 			.long("payout-address")
-			.value_name("ADDR")
+			.value_name("BTCADDR")
 			.required(true)
 			.takes_value(true))
 }
@@ -169,7 +169,7 @@ fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
 		Some(v) => match v.to_string().parse() {
 			Ok(sock_address) => Some(sock_address),
 			Err(_) => {
-				return Err("Failed to parse stratum_listen_bind into a socket address".to_string());
+				return Err("Failed to parse stratum-listen-bind into a socket address".to_string());
 			}
 		},
 		None => None
@@ -178,14 +178,14 @@ fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
 		Some(v) => match v.to_string().parse() {
 			Ok(sock_address) => Some(sock_address),
 			Err(_) => {
-				return Err("Failed to parse mining_listen_bind into a socket address".to_string());
+				return Err("Failed to parse mining-listen-bind into a socket address".to_string());
 			}
 		},
 		None => None
 	};
 
 	if stratum_listen_bind.is_none() && mining_listen_bind.is_none() {
-		return Err("Need some listen bind".to_string());
+		return Err("At least one type of listen bind socket address is required".to_string());
 	}
 
 	let mining_auth_key = match arg_matches.value_of("mining_auth_key") {
@@ -198,7 +198,7 @@ fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
 					Some(private_key.key)
 				},
 				Err(_) => {
-					return Err("Failed to parse mining_auth_key into a private key".to_string());
+					return Err("Failed to parse mining-auth-key into a private key".to_string());
 				}
 			}
 		},
@@ -213,7 +213,7 @@ fn parse_command_line_arguments() -> Result<CommandLineArgs, String> {
 	let payout_address = match Address::from_str(payout_address_str) {
 		Ok(address) => address,
 		Err(_) => {
-			return Err("Failed to parse payout_address into a Bitcoin address".to_string());
+			return Err("Failed to parse payout-address into a Bitcoin address".to_string());
 		}
 	};
 
@@ -255,7 +255,7 @@ fn main() {
 								}));
 							},
 							Err(_) => {
-								println!("Failed to bind to listen bind addr");
+								println!("Failed to bind to listen bind address");
 								return Ok(());
 							}
 						};
