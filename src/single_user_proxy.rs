@@ -46,17 +46,11 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 
 fn clap_parser_config<'a, 'b>() -> clap::App<'a, 'b> {
-	let about = "A stratum/work protocol proxy for a number of ASICs mining on a single user account on a pool or for a solo miner.
-
-We always try to keep exactly one connection open per argument, no matter how many hosts a DNS name may resolve to. \
-We try each hostname until one works. Job providers are not prioritized (the latest job is always used). Pools are \
-prioritized in the order they appear on the command line. --payout-address is used whenever no pools are available \
-but does not affect pool payout information (only --pool-user-id does so).";
-
 	clap::App::new("mining-proxy")
 		.author(env!("CARGO_PKG_AUTHORS"))
-		.about(about)
 		.version(env!("CARGO_PKG_VERSION"))
+		.about("A stratum/work protocol proxy for a number of ASICs mining \
+		on a single user account on a pool or for a solo miner.")
 
 		.arg(clap::Arg::with_name("job_provider")
 			.help("Bitcoind(s) running as mining server(s) which provide work")
@@ -115,6 +109,12 @@ but does not affect pool payout information (only --pool-user-id does so).";
 			.value_name("BTCADDR")
 			.required(true)
 			.takes_value(true))
+
+		.after_help("An attempt is made to keep exactly one connection open per argument, \
+	no matter how many hosts correspond to a DNS name. Each hostname is tried until one works. \
+	Job providers are not prioritized (the latest job is always used). Pools are prioritized in \
+	the order that they appear in the command line arguments. --payout-address is used when pools are \
+	unavailable but does not affect pool payout information (only --pool-user-id does so).")
 }
 
 struct CommandLineArgs {
