@@ -2,6 +2,7 @@
 // with information in json format with attributes of type `ShareMessage`.
 
 use bitcoin::blockdata::block::BlockHeader;
+use bitcoin::util::hash::Sha256dHash;
 
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -133,17 +134,15 @@ pub fn share_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_
 }
 
 pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>,
-	leading_zeros: u8, required_leading_zeros: u8, block_hash: &[u8]) {
+	leading_zeros: u8, required_leading_zeros: u8, block_hash: &Sha256dHash) {
 	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag_1));
-	
+	let hash = &block_hash[..];
 	let (block_target, negative, overflow) = utils::nbits_to_target(header.bits);
-	let mut is_good_block = false;
 	if negative || overflow {
-		//TODO: Not sure how to handle this case yet
-		println!("We got block target negative or overflow!");
-	} else {
-		is_good_block = utils::does_hash_meet_target(&block_hash[..], &block_target[..]);
+		println!("We got invalid block target: negative or overflow!");
+		return;
 	}
+	let is_good_block = utils::does_hash_meet_target(hash, &block_target[..]);
 	tokio::spawn(state.kafka_producer.send(
 		FutureRecord::to(&state.topic)
 			.key("")
@@ -156,7 +155,7 @@ pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user
 				version: header.version,
 				nbits: header.bits,
 				time: header.time,
-				hash: utils::bytes_to_hex(block_hash),
+				hash: utils::bytes_to_hex(hash),
 				is_good_block,
 				is_weak_block: true,
 			}).unwrap()),
