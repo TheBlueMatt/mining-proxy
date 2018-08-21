@@ -99,7 +99,22 @@ struct ShareMessage {
 	version: u32,       // version
 	nbits: u32,         // nbits
 	time: u32,          // share tsp
-	hash: String,       // share hash
+	is_good_block: bool,// potential good block tag
+	is_weak_block: bool,// weak block tag
+}
+
+// Serialize pool weak block
+#[derive(Serialize)]
+struct WeakBlockMessage {
+	user: String,       // miner username
+	worker: String,     // miner workername
+	payout: u64,        // claimed value of the share - payout will be min(median share value, this value)
+	client_target: u8,  // client target
+	leading_zeros: u8,  // share target
+	version: u32,       // version
+	nbits: u32,         // nbits
+	time: u32,          // share tsp
+	hash: String,       // weak block header hash
 	is_good_block: bool,// potential good block tag
 	is_weak_block: bool,// weak block tag
 }
@@ -119,7 +134,6 @@ pub fn share_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_
 				version: header.version,
 				nbits: header.bits,
 				time: header.time,
-				hash: String::new(),  // We only include hash for weak block
 				is_good_block: false,
 				is_weak_block: false,
 			}).unwrap()),
@@ -146,7 +160,7 @@ pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user
 	tokio::spawn(state.kafka_producer.send(
 		FutureRecord::to(&state.topic)
 			.key("")
-			.payload(&serde_json::to_string(&ShareMessage {
+			.payload(&serde_json::to_string(&WeakBlockMessage {
 				user: String::from_utf8_lossy(&user_id).to_string(),
 				worker: String::from_utf8_lossy(&user_tag_1).to_string(),
 				payout: value,
