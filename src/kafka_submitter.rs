@@ -2,6 +2,7 @@
 // with information in json format with attributes of type `ShareMessage`.
 
 use bitcoin::blockdata::block::BlockHeader;
+use bitcoin::util::hash::Sha256dHash;
 
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -11,6 +12,8 @@ use futures::Future;
 use serde_json;
 
 use tokio;
+
+use utils;
 
 // Kafka topics for shares and weak_blocks;
 const KAFKA_SHARES_TOPIC_POSTFIX: &'static str = "BetterHash-Shares-Topic";
@@ -96,7 +99,23 @@ struct ShareMessage {
 	version: u32,       // version
 	nbits: u32,         // nbits
 	time: u32,          // share tsp
-	nonce: u32,         // share nonce
+	is_good_block: bool,// potential good block tag
+	is_weak_block: bool,// weak block tag
+}
+
+// Serialize pool weak block
+#[derive(Serialize)]
+struct WeakBlockMessage {
+	user: String,       // miner username
+	worker: String,     // miner workername
+	payout: u64,        // claimed value of the share - payout will be min(median share value, this value)
+	client_target: u8,  // client target
+	leading_zeros: u8,  // share target
+	version: u32,       // version
+	nbits: u32,         // nbits
+	time: u32,          // share tsp
+	hash: String,       // weak block header hash
+	is_good_block: bool,// potential good block tag
 	is_weak_block: bool,// weak block tag
 }
 
@@ -115,7 +134,7 @@ pub fn share_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_
 				version: header.version,
 				nbits: header.bits,
 				time: header.time,
-				nonce: header.nonce,
+				is_good_block: false,
 				is_weak_block: false,
 			}).unwrap()),
 	0).then(|result| {
@@ -128,13 +147,20 @@ pub fn share_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_
 	}));
 }
 
-pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>, leading_zeros: u8, required_leading_zeros: u8) {
+pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user_tag_1: &Vec<u8>, value: u64, header: &BlockHeader, txn: &Vec<Vec<u8>>, _extra_block_data: &Vec<u8>,
+	leading_zeros: u8, required_leading_zeros: u8, block_hash: &Sha256dHash) {
 	println!("Got valid weak block with value {} from \"{}\" with {} txn from machine identified as \"{}\"", value, String::from_utf8_lossy(user_id), txn.len(), String::from_utf8_lossy(user_tag_1));
-
+	let hash = &block_hash[..];
+	let (block_target, negative, overflow) = utils::nbits_to_target(header.bits);
+	if negative || overflow {
+		println!("We got invalid block target: negative or overflow!");
+		return;
+	}
+	let is_good_block = utils::does_hash_meet_target(hash, &block_target[..]);
 	tokio::spawn(state.kafka_producer.send(
 		FutureRecord::to(&state.topic)
 			.key("")
-			.payload(&serde_json::to_string(&ShareMessage {
+			.payload(&serde_json::to_string(&WeakBlockMessage {
 				user: String::from_utf8_lossy(&user_id).to_string(),
 				worker: String::from_utf8_lossy(&user_tag_1).to_string(),
 				payout: value,
@@ -143,7 +169,8 @@ pub fn weak_block_submitted(state: &KafkaSubmitterState, user_id: &Vec<u8>, user
 				version: header.version,
 				nbits: header.bits,
 				time: header.time,
-				nonce: header.nonce,
+				hash: utils::bytes_to_hex(hash),
+				is_good_block,
 				is_weak_block: true,
 			}).unwrap()),
 	0).then(|result| {

@@ -56,6 +56,42 @@ pub fn max_le(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 	a
 }
 
+/// Convert nbits to target returns: target([u8;32]), negative(bool), overflow(bool)
+#[allow(dead_code)]
+#[inline]
+pub fn nbits_to_target(nbits: u32) -> ([u8; 32], bool, bool) {
+	// Compact format: N = (-1^sign) * mantissa * 256^(exponent-3)
+	let mut res = [0; 32];
+	let mut negative = false;
+	let mut overflow = false;
+	let mut word;
+
+	let nshift = (nbits >> 24) & 0xff;
+
+	if nshift > 34 {
+		overflow = true;
+		return (res, negative, overflow);
+	}
+
+	// Fill three byte words
+	for i in 0..3 {
+		if nshift > i {
+			word = ((nbits >> (8 * (2 - i))) & 0xff) as u8;
+			if i == 0 {
+				word &= 0x7f;
+			}
+			if nshift <= 32 + i {
+				res[(nshift - i - 1) as usize] = word;
+			} else if word > 0 {
+				overflow = true;
+			}
+		}
+	}
+
+	negative = res != [0; 32] && nbits & 0x00800000 != 0;
+	(res, negative, overflow)
+}
+
 /// Returns the highest value with the given number of leading 0s
 #[allow(dead_code)]
 #[inline]
@@ -241,6 +277,19 @@ mod tests {
 	#[test]
 	fn test_1mill_target_lower_bound() {
 		assert!(utils::target_to_diff_lb(&utils::MILLION_DIFF_TARGET) >= 1000000.0);
+	}
+
+	#[test]
+	fn test_nbits_to_target() {
+		assert_eq!(utils::nbits_to_target(0x172f4f7b), ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123, 79, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0], false, false));
+		assert_eq!(utils::nbits_to_target(0x002f4f7b), ([0; 32], false, false));
+		assert_eq!(utils::nbits_to_target(0x012f4f7b), ([47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], false, false));
+		assert_eq!(utils::nbits_to_target(0x022f4f7b), ([79, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], false, false));
+		assert_eq!(utils::nbits_to_target(0x202f4f7b), ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123, 79, 47], false, false));
+		assert_eq!(utils::nbits_to_target(0x212f4f7b), ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123, 79], false, true));
+		assert_eq!(utils::nbits_to_target(0x2200007b), ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123], false, false));
+		assert_eq!(utils::nbits_to_target(0x232f4f7b), ([0; 32], false, true));
+		assert_eq!(utils::nbits_to_target(0x17af4f7b), ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123, 79, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0], true, false));
 	}
 
 	#[test]
