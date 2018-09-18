@@ -4,7 +4,7 @@ use utils;
 
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::blockdata::script::Script;
-use bitcoin::blockdata::transaction::{TxIn,Transaction};
+use bitcoin::blockdata::transaction::{OutPoint,TxIn,Transaction};
 use bitcoin::util::hash::Sha256dHash;
 use bitcoin::network::serialize::BitcoinHash;
 
@@ -43,7 +43,7 @@ struct MiningClient {
 }
 
 pub struct MiningServer {
-	secp_ctx: Secp256k1,
+	secp_ctx: Secp256k1<secp256k1::SignOnly>,
 	auth_key: SecretKey,
 
 	clients: Mutex<(Vec<Arc<MiningClient>>, u64)>,
@@ -58,8 +58,10 @@ fn work_to_coinbase_tx(template: &BlockTemplate, client_id: u64) -> Transaction 
 	Transaction {
 		version: template.coinbase_version,
 		input: vec!(TxIn {
-			prev_hash: Default::default(),
-			prev_index: 0xffffffff,
+			previous_output: OutPoint {
+				txid: Default::default(),
+				vout: 0xffffffff,
+			},
 			script_sig: Script::from(script_sig),
 			sequence: template.coinbase_input_sequence,
 			witness: vec!(),
@@ -99,7 +101,7 @@ macro_rules! sign_message_ctx {
 				secp256k1::Message::from_slice(&h).unwrap()
 			};
 
-			$secp_ctx.sign(&hash, &$auth_key).unwrap()
+			$secp_ctx.sign(&hash, &$auth_key)
 		}
 	}
 }
@@ -112,7 +114,7 @@ macro_rules! sign_message {
 impl MiningServer {
 	pub fn new(job_providers: mpsc::UnboundedReceiver<WorkInfo>, auth_key: SecretKey) -> Arc<Self> {
 		let us = Arc::new(Self {
-			secp_ctx: Secp256k1::new(),
+			secp_ctx: Secp256k1::signing_only(),
 			auth_key: auth_key,
 
 			clients: Mutex::new((Vec::new(), 0)),
@@ -243,7 +245,7 @@ impl MiningServer {
 					send_response!(WorkMessage::ProtocolVersion {
 						selected_version: 1,
 						flags: if (flags & 0b11) == 0b11 { 0b11 } else { 0b01 },
-						auth_key: PublicKey::from_secret_key(&us.secp_ctx, &us.auth_key).unwrap(),
+						auth_key: PublicKey::from_secret_key(&us.secp_ctx, &us.auth_key),
 					});
 					if !client.use_header_variants.load(Ordering::Acquire) {
 						let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();

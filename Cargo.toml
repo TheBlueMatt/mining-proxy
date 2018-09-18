@@ -25,9 +25,9 @@ kafka_submitter = [ "rdkafka", "serde", "serde_derive" ]
 redis_authenticator = [ "simple_redis" ]
 
 [dependencies]
-secp256k1 = "0.9"
+secp256k1 = "0.11"
 base64 = "0.9"
-bitcoin = "0.13"
+bitcoin = "0.14"
 bytes = "0.4"
 futures = "0.1"
 tokio = "0.1"

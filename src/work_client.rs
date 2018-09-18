@@ -100,7 +100,7 @@ struct JobProviderState {
 
 pub struct JobProviderHandler {
 	state: Mutex<JobProviderState>,
-	secp_ctx: Secp256k1,
+	secp_ctx: Secp256k1<secp256k1::VerifyOnly>,
 }
 
 impl JobProviderHandler {
@@ -118,7 +118,7 @@ impl JobProviderHandler {
 				pending_tx_data_requests: HashMap::new(),
 				job_stream: work_sender,
 			}),
-			secp_ctx: Secp256k1::new(),
+			secp_ctx: Secp256k1::verification_only(),
 		}), work_receiver)
 	}
 

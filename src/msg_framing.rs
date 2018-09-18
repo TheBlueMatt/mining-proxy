@@ -9,8 +9,8 @@ use bytes::BufMut;
 use tokio_io::codec;
 
 use secp256k1::key::PublicKey;
-use secp256k1::Secp256k1;
-use secp256k1::Signature;
+use secp256k1::{Secp256k1, Signature};
+use secp256k1;
 
 use std::error::Error;
 use std::{cmp, fmt, io};
@@ -260,7 +260,7 @@ pub enum WorkMessage {
 /// Decoder for work messages, not that we simply skip decoding Vendor messages to avoid creating a
 /// 16MB read buffer for them.
 pub struct WorkMsgFramer {
-	secp_ctx: Secp256k1,
+	secp_ctx: Secp256k1<secp256k1::None>,
 	/// Used to avoid reading large useless vendor messages into memory
 	skip_bytes: usize,
 }
@@ -270,7 +270,7 @@ impl WorkMsgFramer {
 	#[allow(dead_code)]
 	pub fn new() -> WorkMsgFramer {
 		WorkMsgFramer {
-			secp_ctx: Secp256k1::new(),
+			secp_ctx: Secp256k1::without_caps(),
 			skip_bytes: 0,
 		}
 	}
@@ -1014,7 +1014,7 @@ pub enum PoolMessage {
 /// Decoder for pool messages, not that we simply skip decoding Vendor messages to avoid creating a
 /// 16MB read buffer for them.
 pub struct PoolMsgFramer {
-	secp_ctx: Secp256k1,
+	secp_ctx: Secp256k1<secp256k1::None>,
 	/// Used to avoid reading large useless vendor messages into memory
 	skip_bytes: usize,
 }
@@ -1022,7 +1022,7 @@ pub struct PoolMsgFramer {
 impl PoolMsgFramer {
 	pub fn new() -> PoolMsgFramer {
 		PoolMsgFramer {
-			secp_ctx: Secp256k1::new(),
+			secp_ctx: Secp256k1::without_caps(),
 			skip_bytes: 0,
 		}
 	}

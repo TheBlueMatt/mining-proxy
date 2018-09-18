@@ -480,7 +480,7 @@ fn main() {
 									secp256k1::Message::from_slice(&h).unwrap()
 								};
 
-								secp_ctx.sign(&hash, &auth_key.unwrap()).unwrap()
+								secp_ctx.sign(&hash, &auth_key.unwrap())
 							}
 						}
 					}
@@ -653,7 +653,7 @@ fn main() {
 								send_response!(PoolMessage::ProtocolVersion {
 									selected_version: 1,
 									flags: 0,
-									auth_key: PublicKey::from_secret_key(&secp_ctx, &auth_key.unwrap()).unwrap(),
+									auth_key: PublicKey::from_secret_key(&secp_ctx, &auth_key.unwrap()),
 								});
 
 								let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();

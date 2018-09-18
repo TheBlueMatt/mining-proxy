@@ -3,7 +3,7 @@ use work_info::WorkInfo;
 use pool_client::{PoolAuthAction, PoolProviderUserJob};
 use utils;
 
-use bitcoin::blockdata::transaction::{TxIn,Transaction};
+use bitcoin::blockdata::transaction::{OutPoint,TxIn,Transaction};
 use bitcoin::blockdata::script::Script;
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::network::serialize::BitcoinHash;
@@ -693,8 +693,10 @@ impl StratumServer {
 							let coinbase_tx = Transaction {
 								version: job.template.coinbase_version,
 								input: vec!(TxIn {
-									prev_hash: Default::default(),
-									prev_index: 0xffffffff,
+									previous_output: OutPoint {
+										txid: Default::default(),
+										vout: 0xffffffff,
+									},
 									script_sig: Script::from(script_sig),
 									sequence: job.template.coinbase_input_sequence,
 									witness: vec!(),

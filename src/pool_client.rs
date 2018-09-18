@@ -94,7 +94,7 @@ impl PoolHandlerState {
 
 pub struct PoolHandler {
 	state: RwLock<PoolHandlerState>,
-	secp_ctx: Secp256k1,
+	secp_ctx: Secp256k1<secp256k1::VerifyOnly>,
 }
 
 pub enum PoolAuthAction {
@@ -124,7 +124,7 @@ impl PoolHandler {
 
 				job_stream: work_sender,
 			}),
-			secp_ctx: Secp256k1::new(),
+			secp_ctx: Secp256k1::verification_only(),
 		});
 
 		let us_auth = us.clone();
