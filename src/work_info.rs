@@ -51,6 +51,8 @@ pub fn merge_job_pool(our_payout_script: &Option<Script>, work: &WorkProviderJob
 
 	match pool {
 		Some(&PoolProviderJob { ref payout_info, .. }) => {
+			template.coinbase_prefix.extend_from_slice(&payout_info.pool_info[..]);
+
 			let mut constant_value_output = 0;
 			for output in payout_info.appended_outputs.iter() {
 				if output.value > 21000000*100000000 || output.value + constant_value_output > 21000000*100000000 {

@@ -823,6 +823,7 @@ impl PoolUserPayoutInfo {
 #[derive(Clone)]
 pub struct PoolPayoutInfo {
 	pub timestamp: u64,
+	pub pool_info: Vec<u8>,
 	pub remaining_payout: Script,
 	pub appended_outputs: Vec<TxOut>,
 }
@@ -830,6 +831,8 @@ impl PoolPayoutInfo {
 	pub fn encode_unsigned(&self, res: &mut bytes::BytesMut) {
 		res.reserve(self.get_unsigned_len());
 		res.put_u64_le(self.timestamp);
+		res.put_u8(self.pool_info.len() as u8);
+		res.put_slice(&self.pool_info[..]);
 		res.put_u8(self.remaining_payout.len() as u8);
 		res.put_slice(&self.remaining_payout[..]);
 
@@ -844,7 +847,7 @@ impl PoolPayoutInfo {
 		}
 	}
 	pub fn get_unsigned_len(&self) -> usize {
-		10 + self.remaining_payout.len()
+		11 + self.pool_info.len() + self.remaining_payout.len()
 	}
 }
 
@@ -1344,6 +1347,8 @@ impl codec::Decoder for PoolMsgFramer {
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, CodecError))
 				};
 				let timestamp = utils::slice_to_le64(get_slice!(8));
+				let pool_info_len = get_slice!(1)[0];
+				let pool_info = get_slice!(pool_info_len).to_vec();
 				let script_len = get_slice!(1)[0];
 				let script = Script::from(get_slice!(script_len).to_vec());
 
@@ -1368,6 +1373,7 @@ impl codec::Decoder for PoolMsgFramer {
 					signature: signature,
 					payout_info: PoolPayoutInfo {
 						timestamp,
+						pool_info,
 						remaining_payout: script,
 						appended_outputs: appended_coinbase_outputs,
 					}
